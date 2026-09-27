@@ -1,0 +1,29 @@
+# 运行时/私有文件：绝不入库
+*.env
+.env
+.env.*
+secrets.env
+secrets/**
+*.local.json
+*.local.jsonc
+
+# 桥接器运行时状态（属于用户机器，不属于仓库）
+.bridge-state/
+bridge-state.json
+last-apply.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 备份与临时
+*.bak
+*.bak.*
+*.orig
+*.tmp
