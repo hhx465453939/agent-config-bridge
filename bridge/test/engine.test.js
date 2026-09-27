@@ -13,6 +13,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import * as api from '../lib/api.js';
 import { withSandbox, write } from './sandbox.js';
+import { listFiles } from '../lib/fs-ops.js';
 import { readState, STATUS, writeState } from '../lib/state.js';
 import { hashFile } from '../lib/fs-ops.js';
 import { loadManifest } from '../lib/manifest.js';
@@ -106,17 +107,48 @@ test('adopt: bridges only the named agent and leaves the other untouched', async
     assert.equal(hashFile(join(sb.home, '.kimi-code', 'mcp.json')), kimiMcpBefore);
 
     // Shared dimensions arrived.
-    assert.ok(existsSync(sb.path('.agents/skills/alpha/SKILL.md')));
-    assert.ok(existsSync(sb.path('.agents/skills/beta/SKILL.md')));
-    assert.ok(existsSync(sb.path('.pi/agent/prompts/review.md')));
+    assert.ok(existsSync(sb.path('.pi/agent/prompts/review.md')), 'commands were copied');
     // pi's rules document lands at the home root: pi loads context files from the
     // working-directory chain as well as its agent dir, and a second copy under
     // ~/.pi would make the model read the same rules twice.
     assert.ok(existsSync(sb.path('AGENTS.md')));
     assert.equal(existsSync(sb.path('.pi/agent/AGENTS.md')), false, 'no duplicate under ~/.pi');
 
-    // Flat duplicate was reported, not bridged.
-    assert.equal(existsSync(sb.path('.agents/skills/alpha.md')), false);
+    // Skills are a DECLARED LINK, not a copy: the source's skills must be
+    // reachable through ~/.agents/skills, the link must still be a link (the
+    // bridge must not have replaced it with a directory), and nothing may have
+    // been duplicated into it.
+    assert.ok(existsSync(sb.path('.agents/skills/beta/SKILL.md')), 'source skills reachable through the link');
+    const { lstatSync, readlinkSync } = require('node:fs');
+    assert.equal(lstatSync(sb.path('.agents/skills')).isSymbolicLink(), true, 'still a link');
+    assert.equal(
+      readlinkSync(sb.path('.agents/skills')),
+      join(sb.home, '.claude', 'skills'),
+      'and still pointing at the source',
+    );
+    assert.deepEqual(
+      listFiles(sb.path('.claude/skills')).filter((p) => p.startsWith('skills/skills/')),
+      [],
+      'nothing was copied into the source through the link',
+    );
+  });
+});
+
+test('skills: flat <name>.md duplicates are reported but never copied', async () => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
+
+    assert.ok(existsSync(sb.path('.kimi-code/skills/alpha/SKILL.md')), 'directory form is bridged');
+    assert.equal(
+      existsSync(sb.path('.kimi-code/skills/alpha.md')),
+      false,
+      'the flat duplicate in the source must not be bridged',
+    );
+
+    // ...but it must not vanish from the report either: silently dropping it
+    // would hide the fact that the source has two competing copies.
+    const plan = api.plan({ repo: sb.repo, home: sb.home, targets: ['kimi'] });
+    assert.ok(plan.targets[0].info.flatDuplicates > 0, 'flat duplicates are reported');
   });
 });
 
@@ -184,22 +216,26 @@ test('apply: converges, then reports no changes on the second pass', async () =>
   });
 });
 
-test('apply: restores a skill that was deleted, and only for the bridged agent', async () => {
-  await withSandbox({}, (sb) => {
-    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+test('apply: restores a deleted skill, and only for the bridged agent', async () => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
     api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
 
-    const kimiSkill = sb.path('.kimi-code/skills/beta/SKILL.md');
-    const kimiSkillHash = hashFile(kimiSkill);
+    // Private configuration sharing the same agent as the damaged skill: this is
+    // the "only what needs changing" half of the assertion.
+    const privatePath = sb.path('.kimi-code/config.toml');
+    const privateHash = hashFile(privatePath);
 
-    // Simulate damage on pi only.
-    const damaged = sb.path('.agents/skills/beta/SKILL.md');
+    const damaged = sb.path('.kimi-code/skills/beta/SKILL.md');
     write(damaged, 'tampered\n');
 
     api.apply({ repo: sb.repo, home: sb.home, log: quiet });
 
-    assert.equal(readFileSync(damaged, 'utf8'), readFileSync(join(sb.home, '.claude', 'skills', 'beta', 'SKILL.md'), 'utf8'));
-    assert.equal(hashFile(kimiSkill), kimiSkillHash, 'the other bridged agent must be untouched');
+    assert.equal(
+      readFileSync(damaged, 'utf8'),
+      readFileSync(join(sb.home, '.claude', 'skills', 'beta', 'SKILL.md'), 'utf8'),
+      'the damaged copy was restored',
+    );
+    assert.equal(hashFile(privatePath), privateHash, 'private configuration was not touched');
   });
 });
 
@@ -257,10 +293,86 @@ test('revoke: refuses to run on an incomplete snapshot', async () => {
 
     assert.throws(
       () => api.revoke({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet }),
-      /snapshot .* is incomplete, refusing to revoke/,
+      (err) => {
+        assert.equal(err.code, 'SNAPSHOT_INCOMPLETE');
+        assert.match(err.message, /cannot reconstruct the pre-adopt state, refusing to revoke/);
+        // The message must name the exact missing file, otherwise the user has
+        // no way to repair the snapshot.
+        assert.match(err.message, /missing stored copy of .+mcp\.json/);
+        return true;
+      },
     );
     // State must not claim it was revoked.
     assert.equal(readState(sb.repo).agents.pi.status, STATUS.BRIDGED);
+  });
+});
+
+// Regression, found while testing on a real machine.
+//
+// `adopt` writes a snapshot and sets state.snapshot_id; every later `apply`
+// writes its OWN snapshot and moves the pointer forward. Revoke used to read
+// only the newest snapshot, so after one apply it knew about the handful of
+// files that apply touched — and would report success while leaving everything
+// else behind, the installed gate included. The state then claimed "revoked",
+// which is the worst outcome of all: a lie in the record.
+test('revoke: still removes everything after intervening applies', async () => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    // The fixture source is part of the same tree, so anything added to it must
+    // be added before the baseline is taken — otherwise the comparison blames
+    // the bridge for a file the test itself put there.
+    write(join(sb.home, '.claude', 'skills', 'gamma', 'SKILL.md'), '---\nname: gamma\n---\n\nnew\n');
+    const before = treeSnapshot(sb.home);
+
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
+    // Syncs, each taking its own snapshot and advancing state.snapshot_id.
+    api.apply({ repo: sb.repo, home: sb.home, log: quiet });
+    api.apply({ repo: sb.repo, home: sb.home, log: quiet });
+
+    assert.ok(existsSync(sb.path('.kimi-code/skills/gamma/SKILL.md')), 'the skill did land');
+
+    api.revoke({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
+
+    assert.deepEqual(
+      treeSnapshot(sb.home),
+      before,
+      'revoke must undo the whole adoption, not just the last apply',
+    );
+    assert.equal(readState(sb.repo).agents.kimi.status, STATUS.REVOKED);
+  });
+});
+
+test('revoke: also removes the installed gate after an intervening apply', async () => {
+  await withSandbox({ install: ['pi'] }, (sb) => {
+    const gateDir = sb.path('.pi/agent/extensions/enforce-rules');
+    const before = treeSnapshot(sb.home);
+
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    assert.ok(existsSync(join(gateDir, 'policy.js')), 'gate installed at adopt time');
+
+    // An apply snapshots only what it changes — here, at most one gate file.
+    // Revoke must still know about the other files from the adopt snapshot.
+    api.apply({ repo: sb.repo, home: sb.home, log: quiet });
+    api.revoke({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+
+    assert.equal(existsSync(gateDir), false, 'the whole gate directory is gone');
+    assert.deepEqual(treeSnapshot(sb.home), before, 'and the tree is exactly as it was');
+  });
+});
+
+test('revoke: keeps one snapshot as the audit trail, releasing the rest', async () => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
+    api.apply({ repo: sb.repo, home: sb.home, log: quiet });
+    api.apply({ repo: sb.repo, home: sb.home, log: quiet });
+
+    const { readdirSync } = require('node:fs');
+    const dir = join(sb.repo, '.bridge', 'snapshots', 'kimi');
+    assert.ok(readdirSync(dir).length >= 3, 'snapshots accumulated during the adoption');
+
+    api.revoke({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
+
+    const left = readdirSync(dir);
+    assert.equal(left.length, 1, `expected one surviving record, got ${JSON.stringify(left)}`);
   });
 });
 
@@ -302,18 +414,19 @@ test('mcp: secrets are expanded from a file outside the repository', async () =>
 });
 
 test('mcp: a referenced but missing variable aborts the whole run', async () => {
-  await withSandbox({}, (sb) => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
     // Remove the secrets file so ${FIXTURE_API_KEY} cannot be resolved.
     const { rmSync } = require('node:fs');
     rmSync(join(sb.home, '.config'), { recursive: true, force: true });
 
+    const before = treeSnapshot(sb.home);
     assert.throws(
-      () => api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet }),
+      () => api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet }),
       /referenced but not provided/,
     );
-    // Fail-closed: nothing was written and the agent stayed native.
-    assert.equal(readState(sb.repo).agents.pi, undefined);
-    assert.equal(existsSync(sb.path('.agents/skills')), false);
+    // Fail-closed: nothing was written, and the agent stayed native.
+    assert.equal(readState(sb.repo).agents.kimi, undefined);
+    assert.deepEqual(treeSnapshot(sb.home), before, 'a failed adopt must leave no trace');
   });
 });
 
@@ -410,17 +523,20 @@ test('doctor: reports a manifest that both manages and protects the same path', 
 });
 
 test('rollback: undoes an apply and keeps a guard backup', async () => {
-  await withSandbox({}, (sb) => {
-    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
 
     // Change the source, then sync.
     write(join(sb.home, '.claude', 'skills', 'beta', 'SKILL.md'), '---\nname: beta\n---\n\nCHANGED\n');
     api.apply({ repo: sb.repo, home: sb.home, log: quiet });
-    assert.match(readFileSync(sb.path('.agents/skills/beta/SKILL.md'), 'utf8'), /CHANGED/);
+    assert.match(readFileSync(sb.path('.kimi-code/skills/beta/SKILL.md'), 'utf8'), /CHANGED/);
 
     const result = api.undo({ repo: sb.repo, home: sb.home, log: quiet });
     assert.ok(result.restored > 0);
-    assert.equal(readFileSync(sb.path('.agents/skills/beta/SKILL.md'), 'utf8').includes('CHANGED'), false);
+    assert.equal(
+      readFileSync(sb.path('.kimi-code/skills/beta/SKILL.md'), 'utf8').includes('CHANGED'),
+      false,
+    );
   });
 });
 
@@ -467,22 +583,29 @@ test('manifest: rejects a destination that escapes home', async () => {
 });
 
 test('prune is off by default and only removes files this bridge created', async () => {
-  await withSandbox({}, (sb) => {
-    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
 
     // A file the user placed there themselves must never be pruned.
-    write(sb.path('.agents/skills/user-made/SKILL.md'), 'user content\n');
+    write(sb.path('.kimi-code/skills/user-made/SKILL.md'), 'user content\n');
     // A file the bridge created, whose source then disappears.
     const { rmSync } = require('node:fs');
     rmSync(join(sb.home, '.claude', 'skills', 'beta'), { recursive: true, force: true });
 
     api.apply({ repo: sb.repo, home: sb.home, log: quiet });
-    assert.ok(existsSync(sb.path('.agents/skills/beta/SKILL.md')), 'default must not remove anything');
-    assert.ok(existsSync(sb.path('.agents/skills/user-made/SKILL.md')));
+    assert.ok(existsSync(sb.path('.kimi-code/skills/beta/SKILL.md')), 'default must not remove anything');
+    assert.ok(existsSync(sb.path('.kimi-code/skills/user-made/SKILL.md')));
 
     api.apply({ repo: sb.repo, home: sb.home, prune: true, log: quiet });
-    assert.equal(existsSync(sb.path('.agents/skills/beta/SKILL.md')), false, 'prune removes the derived file');
-    assert.ok(existsSync(sb.path('.agents/skills/user-made/SKILL.md')), 'prune must not touch user files');
+    assert.equal(
+      existsSync(sb.path('.kimi-code/skills/beta/SKILL.md')),
+      false,
+      'prune removes the derived file',
+    );
+    assert.ok(
+      existsSync(sb.path('.kimi-code/skills/user-made/SKILL.md')),
+      'prune must not touch user files',
+    );
   });
 });
 
@@ -564,6 +687,113 @@ test('gates: a harness without an extension mechanism gets no gate, only a repor
 });
 
 // ---------------------------------------------------------------------------
+// destination guards
+//
+// Found on a real machine: ~/.agents/skills was a symlink to ~/.claude/skills,
+// i.e. the authoritative source itself. Writing "into" it would have edited the
+// source, and the pre-write snapshot would have captured the wrong thing. These
+// tests pin both refusals so the guard cannot be quietly lost in a refactor.
+// ---------------------------------------------------------------------------
+
+test('guard: refuses a managed destination that is a symlink', async () => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    const { mkdirSync, symlinkSync } = require('node:fs');
+    const elsewhere = join(sb.root, 'elsewhere');
+    mkdirSync(elsewhere, { recursive: true });
+    symlinkSync(elsewhere, sb.path('.kimi-code/skills'));
+
+    assert.throws(
+      () => api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet }),
+      (err) => {
+        assert.equal(err.code, 'TARGET_SYMLINK');
+        assert.match(err.message, /refusing to write through a symbolic link/);
+        assert.match(err.message, /elsewhere/, 'the message names where the link points');
+        return true;
+      },
+    );
+    // Nothing may have been written, and the agent must still be native.
+    assert.equal(readState(sb.repo).agents.kimi, undefined);
+    assert.deepEqual(listFiles(elsewhere), []);
+  });
+});
+
+test('guard: refuses a destination whose symlink resolves into the authoritative source', async () => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    const { symlinkSync } = require('node:fs');
+    // The exact shape seen in the wild: a target's skills path linked to the source.
+    symlinkSync(join(sb.home, '.claude', 'skills'), sb.path('.kimi-code/skills'));
+
+    assert.throws(
+      () => api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet }),
+      (err) => {
+        assert.equal(err.code, 'TARGET_INSIDE_SOURCE');
+        assert.match(err.message, /authoritative source/);
+        return true;
+      },
+    );
+    assert.equal(readState(sb.repo).agents.kimi, undefined, 'nothing was adopted');
+  });
+});
+
+test('guard: a manifest pointing straight at the source is refused before anything is written', async () => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    sb.findAndReplaceManifests((m) => {
+      if (m.name !== 'kimi') return null;
+      m.managed = m.managed.map((r) => (r.kind === 'skill' ? { ...r, to: '.claude/skills' } : r));
+      return m;
+    });
+
+    // Refused at adopt time rather than later, so the bad manifest cannot
+    // half-apply: the refusal happens while the plan is being built.
+    assert.throws(
+      () => api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet }),
+      (err) => {
+        assert.equal(err.code, 'TARGET_INSIDE_SOURCE');
+        return true;
+      },
+    );
+    assert.equal(existsSync(sb.path('.claude/skills/kimi-copy')), false);
+  });
+});
+
+test('guard: a destination that merely shares a prefix with the source is allowed', async () => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    // "~/.claude-archive" starts with the string "~/.claude" but is not inside
+    // it. A guard that compared strings instead of paths would reject this.
+    sb.findAndReplaceManifests((m) => {
+      if (m.name !== 'kimi') return null;
+      m.managed = m.managed.map((r) =>
+        r.kind === 'skill' ? { ...r, to: '.claude-archive/skills' } : r,
+      );
+      return m;
+    });
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
+    assert.ok(existsSync(sb.path('.claude-archive/skills/alpha/SKILL.md')));
+  });
+});
+
+test('doctor: a symlinked destination is an error, not a warning', async () => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    const { mkdirSync, symlinkSync } = require('node:fs');
+    const elsewhere = join(sb.root, 'elsewhere');
+    mkdirSync(elsewhere, { recursive: true });
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
+
+    // Break it after the fact, the way a user would.
+    const { rmSync } = require('node:fs');
+    rmSync(sb.path('.kimi-code/skills'), { recursive: true, force: true });
+    symlinkSync(elsewhere, sb.path('.kimi-code/skills'));
+
+    const report = api.doctor({ repo: sb.repo, home: sb.home });
+    assert.equal(report.ok, false);
+    assert.ok(
+      report.findings.some((f) => f.code === 'SYMLINK' && f.level === 'error'),
+      `expected a SYMLINK error, got ${JSON.stringify(report.findings.map((f) => [f.level, f.code]))}`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
@@ -572,12 +802,22 @@ const require = (await import('node:module')).createRequire(import.meta.url);
 const treeSnapshot = (root) => {
   const out = {};
   const walk = (dir) => {
-    const { readdirSync, lstatSync } = require('node:fs');
+    const { readdirSync, lstatSync, readlinkSync } = require('node:fs');
     for (const entry of readdirSync(dir)) {
       const abs = join(dir, entry);
       const st = lstatSync(abs);
-      if (st.isDirectory()) walk(abs);
-      else out[abs.slice(root.length + 1)] = hashFile(abs);
+      const key = abs.slice(root.length + 1);
+      if (st.isSymbolicLink()) {
+        // Record the link itself, not its contents. A tree comparison that
+        // followed links would read a directory (EISDIR) and would also miss
+        // the single most important difference on this project: a link that was
+        // quietly replaced by a real directory.
+        out[key] = `link -> ${readlinkSync(abs)}`;
+      } else if (st.isDirectory()) {
+        walk(abs);
+      } else {
+        out[key] = hashFile(abs);
+      }
     }
   };
   if (existsSync(root)) walk(root);

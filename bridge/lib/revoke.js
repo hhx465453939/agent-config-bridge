@@ -16,7 +16,7 @@ import { dirname, join } from 'node:path';
 import { businessError } from './errors.js';
 import { backupFiles, copyFile, ensureDir, removePath } from './fs-ops.js';
 import { backupsDir } from './paths.js';
-import { SNAPSHOT_ACTIONS, latestSnapshot, readSnapshot, verifySnapshot } from './snapshot.js';
+import { SNAPSHOT_ACTIONS, planRevoke, pruneSnapshots, verifyRevokePlan } from './snapshot.js';
 import { readState, setAgent, STATUS, writeState } from './state.js';
 import { newBackupId } from './apply.js';
 
@@ -27,11 +27,17 @@ export const revokeTargets = ({ repo, home, names, dryRun = false, log }) => {
   for (const name of names) {
     const entry = state.agents[name];
     if (!entry || entry.status !== STATUS.BRIDGED) {
-      outcomes.push({ name, skipped: `not bridged` });
+      outcomes.push({ name, skipped: 'not bridged' });
       continue;
     }
-    const id = entry.snapshot_id ?? latestSnapshot(repo, name);
-    if (!id) {
+
+    // Replay EVERY snapshot for this agent, oldest first. `apply` takes its own
+    // snapshot each run and moves state.snapshot_id forward, so trusting just
+    // the newest pointer would restore only the handful of files the last apply
+    // touched and leave the rest — the installed gate included — on disk while
+    // reporting success. planRevoke returns the union, pre-adopt state winning.
+    const plan = planRevoke(repo, name, home);
+    if (!plan) {
       throw businessError(
         'SNAPSHOT_MISSING',
         `${name}: state says bridged but no snapshot exists.\n` +
@@ -40,35 +46,34 @@ export const revokeTargets = ({ repo, home, names, dryRun = false, log }) => {
       );
     }
 
-    const check = verifySnapshot(repo, name, id, home);
+    const check = verifyRevokePlan(plan);
     if (!check.ok) {
       throw businessError(
         'SNAPSHOT_INCOMPLETE',
-        `${name}: snapshot ${id} is incomplete, refusing to revoke:\n` +
+        `${name}: cannot reconstruct the pre-adopt state, refusing to revoke:\n` +
           check.problems.map((p) => `  - ${p}`).join('\n') +
-          `\n  restore the missing copies (or the whole snapshot) and retry.`,
+          `\n  restore the missing copies (or the whole snapshot set) and retry.`,
       );
     }
 
-    const { dir, manifest } = readSnapshot(repo, name, id);
-    const plan = planRestore({ dir, manifest, home });
+    const actions = planRestore({ entries: plan.entries, home });
 
     if (dryRun) {
-      outcomes.push({ name, snapshotId: id, dryRun: true, actions: plan });
+      outcomes.push({ name, snapshots: plan.snapshots, dryRun: true, actions });
       continue;
     }
 
     // Back up the current state first, so a revoke can itself be undone.
     const backupRoot = ensureDir(`${backupsDir(repo)}/${newBackupId()}-${name}-revoke`);
     backupFiles(
-      plan.filter((a) => existsSync(a.absolute)).map((a) => a.absolute),
+      actions.filter((a) => existsSync(a.absolute)).map((a) => a.absolute),
       home,
       backupRoot,
       { agent: name, reason: 'pre-revoke' },
     );
 
     const applied = { restored: 0, deleted: 0 };
-    for (const action of plan) {
+    for (const action of actions) {
       if (action.kind === 'delete') {
         if (existsSync(action.absolute)) {
           removePath(action.absolute);
@@ -79,9 +84,15 @@ export const revokeTargets = ({ repo, home, names, dryRun = false, log }) => {
         applied.restored += 1;
       }
     }
-    pruneEmptyDirs(plan.map((a) => a.absolute), home);
+    // Removing the files the bridge created can leave directories behind that
+    // nothing else uses. Only empty ones are dropped, and never above `home`.
+    pruneEmptyDirs(actions.map((a) => a.absolute), home);
 
-    outcomes.push({ name, snapshotId: id, backupRoot, applied });
+    // The adoption is over, so the per-apply snapshots have served their
+    // purpose. Keep the most recent one as the audit trail.
+    const pruned = pruneSnapshots(repo, name, 1);
+
+    outcomes.push({ name, snapshots: plan.snapshots, pruned, backupRoot, applied });
     log?.info(`revoke ${name}: restored=${applied.restored} deleted=${applied.deleted}`);
   }
 
@@ -93,7 +104,7 @@ export const revokeTargets = ({ repo, home, names, dryRun = false, log }) => {
     next = setAgent(next, outcome.name, {
       status: STATUS.REVOKED,
       revoked_at: new Date().toISOString(),
-      revoked_snapshot_id: outcome.snapshotId,
+      revoked_snapshots: outcome.snapshots,
       snapshot_id: null,
       tracked: [],
       derivedMcp: [],
@@ -106,9 +117,14 @@ export const revokeTargets = ({ repo, home, names, dryRun = false, log }) => {
   return { mode: 'revoke', targets: outcomes, state: next };
 };
 
-const planRestore = ({ dir, manifest, home }) => {
+/**
+ * One restore plan from the merged entries produced by planRevoke.
+ * `created` entries are the files the bridge added, so they are deleted;
+ * everything else is restored from the snapshot that first recorded it.
+ */
+const planRestore = ({ entries, home }) => {
   const actions = [];
-  for (const entry of manifest.entries) {
+  for (const entry of entries) {
     const absolute = join(home, ...entry.path.split('/'));
     if (entry.action === SNAPSHOT_ACTIONS.CREATED) {
       actions.push({ kind: 'delete', absolute, path: entry.path });
@@ -117,7 +133,7 @@ const planRestore = ({ dir, manifest, home }) => {
         kind: 'restore',
         absolute,
         path: entry.path,
-        from: join(dir, 'files', entry.path),
+        from: join(entry.snapshotDir, 'files', entry.path),
       });
     }
   }

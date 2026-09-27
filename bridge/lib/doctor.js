@@ -12,10 +12,11 @@
  * Exit code is 0 only when there are no errors (and, under --strict, no warnings).
  */
 
-import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { backupsDir, claudeJson, claudeRulesDoc, secretsFile } from './paths.js';
 import { loadAllManifests, detectTarget, ruleDest } from './manifest.js';
+import { findSymlinkedDestinations } from './symlink-guard.js';
 import { buildPlan, summarizePlan } from './plan.js';
 import { readState, STATUS, listBridged } from './state.js';
 import { latestSnapshot, verifySnapshot } from './snapshot.js';
@@ -94,8 +95,17 @@ export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
           add('error', 'SNAPSHOT_INCOMPLETE', `${manifest.name}: snapshot ${snapId} is incomplete`, check.problems.join('; '));
         }
       }
-      for (const action of symlinkedDestinations(manifest, home)) {
-        add('warn', 'SYMLINK', `${manifest.name}: managed path is a symlink: ${action}`, 'a copy-based bridge cannot maintain a symlink target reliably');
+      // A managed destination that is a symlink is an ERROR, not a warning: the
+      // planner refuses to act in that state, so the bridge is effectively
+      // broken for this target until the user resolves it.
+      for (const link of findSymlinkedDestinations({ home, manifest })) {
+        add(
+          'error',
+          'SYMLINK',
+          `${manifest.name}: managed path is a symlink: ${link.path} -> ${link.target}`,
+          `writing through it would edit the link target (possibly the source itself); ` +
+            `remove the link, or drop the "${link.rule.kind}" rule from bridge/targets/${manifest.name}.json`,
+        );
       }
     }
   }
@@ -125,7 +135,13 @@ export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
         }
       }
     } catch (err) {
-      add('error', 'PLAN_FAILED', err.message);
+      // A symlinked destination makes the planner refuse by design; surface it
+      // as its own finding rather than as an opaque PLAN_FAILED.
+      if (err?.code === 'TARGET_SYMLINK') {
+        add('error', 'SYMLINK', err.message.split('\n')[0], 'resolve the symlink before syncing this target');
+      } else {
+        add('error', 'PLAN_FAILED', err.message);
+      }
     }
   } else {
     add('info', 'NO_BRIDGED', 'no agent is bridged — nothing to reconcile (this is the default state)');
@@ -157,22 +173,6 @@ export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
   }
 
   return finish(findings, strict, { installed, bridged, drift });
-};
-
-/** Managed destinations that currently exist as symlinks. */
-const symlinkedDestinations = (manifest, home) => {
-  const out = [];
-  for (const rule of manifest.managed) {
-    if (rule.kind !== 'skill' && rule.kind !== 'command' && rule.kind !== 'agent') continue;
-    const dest = ruleDest(rule, home);
-    if (!existsSync(dest)) continue;
-    try {
-      if (lstatSync(dest).isSymbolicLink()) out.push(dest);
-    } catch {
-      /* unreadable: reported elsewhere */
-    }
-  }
-  return out;
 };
 
 const staleness = (iso) => {

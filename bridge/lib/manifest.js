@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { businessError, envError } from './errors.js';
 import { targetPath, targetsDir } from './paths.js';
 
-const MODES = new Set(['copy', 'copy-tree', 'copy-flat', 'mcp-json', 'mcp-toml']);
+const MODES = new Set(['copy', 'copy-tree', 'copy-flat', 'mcp-json', 'mcp-toml', 'link']);
 const KINDS = new Set(['skill', 'command', 'agent', 'rules-doc', 'mcp']);
 
 const normalize = (relPath) => relPath.replace(/\/+$/, '');

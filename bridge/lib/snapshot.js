@@ -23,19 +23,48 @@ import { copyFile, ensureDir, hashFile, sha256, writeFile } from './fs-ops.js';
 import { snapshotsDir } from './paths.js';
 
 export const SNAPSHOT_ACTIONS = { CREATED: 'created', OVERWRITTEN: 'overwritten', REMOVED: 'removed' };
-const KEEP = 5;
 
+/**
+ * Snapshot ids must be unique. This is a correctness requirement, not cosmetics.
+ *
+ * They used to be second-resolution timestamps, so an `adopt` immediately
+ * followed by an `apply` computed the same id, wrote into the *same* directory,
+ * and the second `finalize()` overwrote the first manifest — silently erasing
+ * the record of everything the adopt had created. `revoke` then had nothing to
+ * undo and reported success anyway. Reproduced in the test suite with two
+ * operations in the same second.
+ *
+ * Millisecond resolution plus a uniqueness check in createSnapshot makes the
+ * collision impossible rather than merely unlikely. The format stays
+ * lexicographically sortable, which listSnapshots relies on.
+ */
 export const newSnapshotId = (date = new Date()) =>
-  date.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z').replace('T', 'T');
+  date.toISOString().replace(/[-:]/g, '').replace('.', '');
+
+const uniqueId = (repo, agent, base) => {
+  if (!existsSync(snapshotDir(repo, agent, base))) return base;
+  for (let n = 2; n < 1000; n += 1) {
+    const candidate = `${base}-${n}`;
+    if (!existsSync(snapshotDir(repo, agent, candidate))) return candidate;
+  }
+  throw businessError('SNAPSHOT_ID', `cannot allocate a snapshot id for ${agent} at ${base}`);
+};
 
 export const snapshotDir = (repo, agent, id) => join(snapshotsDir(repo), agent, id);
 
 export const createSnapshot = (repo, agent, { sourceLabel, plan }) => {
-  const id = newSnapshotId();
+  const id = uniqueId(repo, agent, newSnapshotId());
   const dir = snapshotDir(repo, agent, id);
   ensureDir(dir);
   const entries = [];
-  return { id, dir, entries, sourceLabel, add: (entry) => entries.push(entry), finalize: () => finalize(dir, agent, id, sourceLabel, entries) };
+  return {
+    id,
+    dir,
+    entries,
+    sourceLabel,
+    add: (entry) => entries.push(entry),
+    finalize: () => finalize(dir, agent, id, sourceLabel, entries),
+  };
 };
 
 const finalize = (dir, agent, id, sourceLabel, entries) => {
@@ -47,17 +76,90 @@ const finalize = (dir, agent, id, sourceLabel, entries) => {
     entries: entries.slice().sort((a, b) => a.path.localeCompare(b.path)),
   };
   writeFile(join(dir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 0o600);
-  pruneSnapshots(dir);
+  // Deliberately no pruning here. Revoke replays every surviving snapshot, so
+  // dropping old ones mid-adoption would silently shrink what revoke can undo.
+  // Pruning happens once, on a successful revoke (see revoke.js).
   return manifest;
 };
 
-/** Keep the newest KEEP snapshots for this agent; drop the rest. */
-const pruneSnapshots = (dir) => {
-  const agentRoot = join(dir, '..');
-  const ids = readdirSync(agentRoot).sort();
-  const excess = ids.slice(0, Math.max(0, ids.length - KEEP));
-  for (const old of excess) rmSync(join(agentRoot, old), { recursive: true, force: true });
+/**
+ * Keep the newest `keep` snapshots for one agent; delete the rest.
+ *
+ * Only safe to call when the snapshots are no longer needed to undo an
+ * adoption — i.e. after revoke has finished, where one historical record is
+ * kept for the audit trail.
+ */
+export const pruneSnapshots = (repo, agent, keep) => {
+  const dir = join(snapshotsDir(repo), agent);
+  if (!existsSync(dir)) return [];
+  const ids = readdirSync(dir).sort();
+  const excess = ids.slice(0, Math.max(0, ids.length - keep));
+  for (const old of excess) rmSync(join(dir, old), { recursive: true, force: true });
   return excess;
+};
+
+/** Every snapshot for an agent, oldest first, each with its parsed manifest. */
+export const agentSnapshots = (repo, agent) => {
+  return listSnapshots(repo, agent)
+    .slice()
+    .reverse() // listSnapshots is newest-first
+    .map((id) => ({ id, ...readSnapshot(repo, agent, id) }));
+};
+
+/**
+ * Build the plan that undoes an entire adoption.
+ *
+ * Why this replays *every* snapshot instead of just the newest one:
+ *
+ * `adopt` records which paths it created, then each later `apply` takes its own
+ * snapshot and updates `state.snapshot_id`. If revoke trusted only the latest
+ * pointer it would know about the handful of files the last apply happened to
+ * touch — and would happily report success while leaving everything else, the
+ * installed gate included, sitting on disk. That is the failure this function
+ * exists to prevent.
+ *
+ * Replaying oldest-first and keeping the FIRST mention of each path yields the
+ * pre-adopt state: a path first seen as `created` gets deleted, a path first
+ * seen as `overwritten` gets its earliest stored bytes back.
+ *
+ * @returns {{snapshots: string[], entries: Array<object>}|null} null when the
+ *          agent has no snapshots at all
+ */
+export const planRevoke = (repo, agent, home) => {
+  const snapshots = agentSnapshots(repo, agent);
+  if (snapshots.length === 0) return null;
+
+  const seen = new Map();
+  for (const snap of snapshots) {
+    for (const entry of snap.manifest.entries) {
+      if (seen.has(entry.path)) continue; // oldest wins: that is the pre-adopt state
+      seen.set(entry.path, { ...entry, snapshotId: snap.id, snapshotDir: snap.dir });
+    }
+  }
+
+  return { snapshots: snapshots.map((s) => s.id), entries: [...seen.values()] };
+};
+
+/**
+ * Verify a full revoke plan can actually be applied.
+ * @returns {{ok: boolean, problems: string[]}}
+ */
+export const verifyRevokePlan = (plan) => {
+  const problems = [];
+  for (const entry of plan.entries) {
+    if (entry.action === SNAPSHOT_ACTIONS.CREATED) continue;
+    const stored = join(entry.snapshotDir, 'files', entry.path);
+    if (!existsSync(stored)) {
+      problems.push(`missing stored copy of ${entry.path} (snapshot ${entry.snapshotId})`);
+      continue;
+    }
+    if (entry.sha256 && hashFile(stored) !== entry.sha256) {
+      problems.push(
+        `stored copy of ${entry.path} does not match its recorded checksum (snapshot ${entry.snapshotId})`,
+      );
+    }
+  }
+  return { ok: problems.length === 0, problems };
 };
 
 export const readSnapshot = (repo, agent, id) => {

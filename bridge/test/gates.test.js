@@ -13,9 +13,10 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   DEFAULT_CONFIG,
@@ -36,8 +37,18 @@ import {
   findRepoRoot,
 } from '../gates/policy.js';
 
-import piGate from '../gates/pi/index.js';
+import piGate, {
+  policyCandidates as policyCandidatesFor,
+  firstExistingPolicy as firstExisting,
+} from '../gates/pi/index.js';
 import { apply as dshApply } from '../gates/dsh/index.js';
+
+/** 
+ * Stand-in for the adapter's own directory in the checkout layout. The adapter
+ * computes this itself from `import.meta.url`; tests pass it explicitly so they
+ * can exercise both the checkout and the installed layouts.
+ */
+const PI_ADAPTER_HERE = dirname(fileURLToPath(new URL('../gates/pi/index.js', import.meta.url)));
 
 const noFs = () => false;
 
@@ -327,6 +338,121 @@ test('policy: both shipped policy files load and enable the graph rule', () => {
       loaded.policy.checks.includes('graph-before-read'),
       `${harness} policy must enable graph-before-read`,
     );
+  }
+});
+
+// Regression: a real install was silently enforcing nothing.
+//
+// The adapter looked for `policy.json` next to itself (`<gate>/pi/policy.json`),
+// but the installer writes the policy at the gate root (`<gate>/policy.json`).
+// The load failed, the gate fell back to fail-open, and the model cheerfully
+// read source files. Nothing warned anybody — which is the worst way for an
+// enforcement point to fail, because everyone assumes it is working.
+//
+// So: the adapter must look in BOTH layouts, and a miss must be loud.
+
+test('gates: the adapter finds the policy in the checkout layout', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'acb-layout-'));
+  try {
+    mkdirSync(join(dir, 'pi'), { recursive: true });
+    const beside = join(dir, 'pi', 'policy.json');
+    writeFileSync(beside, JSON.stringify({ name: 'next-to-adapter' }));
+    assert.equal(firstExisting(join(dir, 'pi'), null), beside);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('gates: the adapter finds the policy in the installed layout', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'acb-layout-'));
+  try {
+    mkdirSync(join(dir, 'pi'), { recursive: true });
+    const atRoot = join(dir, 'policy.json');
+    writeFileSync(atRoot, JSON.stringify({ name: 'at-gate-root' }));
+    // This is exactly the case that was broken: nothing next to the adapter.
+    assert.equal(firstExisting(join(dir, 'pi'), null), atRoot);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('gates: an explicit policyPath always wins', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'acb-layout-'));
+  try {
+    mkdirSync(join(dir, 'pi'), { recursive: true });
+    writeFileSync(join(dir, 'pi', 'policy.json'), JSON.stringify({ name: 'next-to-adapter' }));
+    const explicit = join(dir, 'mine.json');
+    writeFileSync(explicit, JSON.stringify({ name: 'explicit' }));
+    assert.equal(firstExisting(join(dir, 'pi'), explicit), explicit);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('gates: with no policy anywhere, every candidate path is reported', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'acb-layout-'));
+  try {
+    mkdirSync(join(dir, 'pi'), { recursive: true });
+    assert.equal(firstExisting(join(dir, 'pi'), null), null);
+    const candidates = policyCandidatesFor(join(dir, 'pi'), null);
+    assert.ok(candidates.length >= 2, 'both layouts are candidates');
+    assert.ok(candidates.every((c) => c.endsWith('policy.json')));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('gates: the installed layout really loads (the bug that shipped)', async () => {
+  // Mirrors an install byte for byte: the gate root holds policy.js and
+  // policy.json, the adapter sits in <gate>/pi/index.js, and there is no policy
+  // beside the adapter. Before the fix this reported itself active but had
+  // loaded nothing.
+  const dir = mkdtempSync(join(tmpdir(), 'acb-install-'));
+  try {
+    const gates = new URL('../gates/', import.meta.url);
+    cpSync(new URL('policy.js', gates), join(dir, 'policy.js'));
+    cpSync(new URL('pi/policy.json', gates), join(dir, 'policy.json'));
+    mkdirSync(join(dir, 'pi'), { recursive: true });
+    cpSync(new URL('pi/index.js', gates), join(dir, 'pi', 'index.js'));
+
+    // Awaited, not returned: a `return promise` inside try/finally would let the
+    // finally delete the tree before the assertions ever ran.
+    const mod = await import(join(dir, 'pi', 'index.js'));
+    const handlers = new Map();
+    mod.default({ on: (event, handler) => handlers.set(event, handler) });
+    const notes = [];
+    await handlers.get('session_start')({}, {
+      hasUI: true,
+      ui: { notify: (...args) => notes.push(args) },
+    });
+
+    const text = notes.map((n) => String(n[0])).join(' | ');
+    // Match the policy name, not the substring "active": the word "inactive"
+    // also contains "active", which made an earlier version of this assertion
+    // pass while the gate was in fact disabled.
+    assert.match(text, /graph-first-gate .*active|active \(graph-before-read\)/, `expected an active announcement, got: ${text}`);
+    assert.doesNotMatch(text, /DISABLED|inactive/, 'the gate must not be disabled here');
+
+    // And it must actually block, which is the only thing that matters.
+    //
+    // The path has to be a real source file inside a real VCS checkout: the
+    // shipped policy leaves `project_roots` empty on purpose so each machine
+    // auto-detects its own repositories rather than inheriting the author's
+    // layout. A made-up path such as /repo/src/a.ts exists nowhere and has no
+    // .git above it, so it is correctly out of scope — asserting a block on it
+    // would be asserting a bug.
+    const inRepoSource = fileURLToPath(new URL('../lib/paths.js', import.meta.url));
+    const verdict = await handlers.get('tool_call')({
+      toolName: 'read',
+      input: { path: inRepoSource },
+    });
+    assert.equal(
+      verdict?.block,
+      true,
+      `an installed gate must block an un-graphed read of ${inRepoSource}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

@@ -4,14 +4,14 @@
   "detect": [".pi"],
   "home_hint": "~/.pi",
   "verified": true,
-  "notes": "Paths verified against pi's own documentation (skills.md, configuration.md, prompt-templates.md) and the pi-mcp-adapter README. Skills deliberately go to ~/.agents/skills/ (the shared Agent Skills location pi documents as natively supported) instead of into pi's agent dir: it keeps ~/.pi clean and lets any other agent that opts into the shared location reuse one copy. The rules document goes to ~/AGENTS.md rather than ~/.pi/agent/AGENTS.md because pi loads context files from both the agent directory and the working-directory chain, so writing a second copy under ~/.pi would make the model read the same rules twice.",
+  "notes": "Paths verified against pi's own documentation (skills.md, configuration.md, prompt-templates.md) and the pi-mcp-adapter README. Skills are DECLARED AS A LINK rather than copied: pi documents ~/.agents/skills/ as a natively supported location, and sharing it by symlink gives pi the source's skills with no duplication and no drift to reconcile. The rules document goes to ~/AGENTS.md rather than ~/.pi/agent/AGENTS.md because pi loads context files from both the agent directory and the working-directory chain, so a second copy under ~/.pi would make the model read the same rules twice.",
   "managed": [
     {
       "kind": "skill",
       "from": "skills",
       "to": ".agents/skills",
-      "mode": "copy-tree",
-      "note": "directory-form skills only; flat <name>.md duplicates are reported, never bridged"
+      "mode": "link",
+      "note": "declared link: ~/.agents/skills should already be a symlink to ~/.claude/skills. pi's docs support ~/.agents/skills natively, so this path is shared rather than copied: changes in the source are visible immediately, nothing is duplicated, and there is no drift to reconcile. If you would rather the bridge own a real copy, change mode to copy-tree (then the link must be removed first — the planner refuses to write through one)."
     },
     {
       "kind": "command",

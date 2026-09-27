@@ -3,13 +3,13 @@
 ```yaml
 change_id: CHG-001
 version: 2                    # v1 假设"Claude 是全体 agent 的唯一源"，被用户否决；v2 引入 opt-in + revoke
-status: draft                 # 用户批准后置 approved
-prd_ref: PRD.md               # v2
+status: approved              # 用户批准（2026-09-27）；后续实质变更需 amendment
+prd_ref: PRD.md               # v2（APPROVED）
 health_ref: HEALTH.md
 supersedes: null              # v1 未批准，不构成被取代的历史版本
-adr_ref: [docs/ADR/001-bridge-architecture.md, docs/ADR/002-opt-in-and-revoke.md]
-approved_by: null
-approved_at: null
+adr_ref: [docs/ADR/001-bridge-architecture.md, docs/ADR/002-opt-in-and-revoke.md, docs/ADR/003-hard-gates.md]
+approved_by: user
+approved_at: 2026-09-27
 ```
 
 ---
@@ -65,12 +65,13 @@ approved_at: null
 
 | ID | 问题 | 建议 | 状态 |
 |---|---|---|---|
-| Q6 | adopt 时目标端已有内容与权威源冲突时的处理 | 先快照 → 覆盖受管清单内文件 → 冲突逐条列出 → plan 阶段可中止 | 🔴 待确认 |
+| Q6 | adopt 时目标端已有内容与权威源冲突时的处理 | 先快照 → 覆盖受管清单内文件 → 冲突逐条列出 → plan 阶段可中止 | ✅ 已定 |
 | Q7 | 快照保存位置与保留策略 | `<repo>/.bridge/snapshots/<agent>/<ts>/`（权限 700）；保留最近 5 份 | ✅ 已定（仓库内，见 D13） |
-| Q8 | 是否提供 `--prune` | 提供，默认关闭 | 非阻塞 |
+| Q8 | 是否提供 `--prune` | 提供，默认关闭 | ✅ 已定（已实现） |
 | Q9 | 上次同步时间戳位置 | `<repo>/.bridge/last-apply.json` | ✅ 已定 |
-| Q10 | 首次 adopt 的试点 agent | 由用户指定 | 🔴 待确认 |
-| Q11 | pi / Kimi 的 skill 落点 | `~/.agents/skills/`（二者共享） | 🔴 待确认 |
+| Q10 | 首次 adopt 的试点 agent | **Kimi Code**（用户指定） | ✅ 已定 |
+| Q11 | pi / Kimi 的 skill 落点 | pi：`~/.agents/skills/`；Kimi：`~/.kimi-code/skills/`（尊重厂商自己的目录） | ✅ 已定（已实现） |
+| Q12 | 受管目标的**符号链接**排查 | 已发现 `~/.agents/skills` 软链到权威源本身；已实现硬拦截（见 §4.11） | ✅ 已修
 
 ---
 

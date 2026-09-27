@@ -13,7 +13,7 @@
  * no trace on the machine — which is also why the CLI takes `--home`/`--repo`.
  */
 
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, readFileSync, existsSync, cpSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, readFileSync, existsSync, cpSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -85,6 +85,12 @@ export const makeSandbox = ({ install = ['pi', 'kimi'] } = {}) => {
     write(join(home, '.pi', 'agent', 'extensions', 'gate.ts'), '// private extension\n');
     write(join(home, '.pi', 'agent', 'APPEND_SYSTEM.md'), '# private system prompt tail\n');
     write(join(home, '.pi', 'agent', 'pi-router.json'), '{ "route": "private" }\n');
+    // pi.json declares its skills rule as a LINK, so the fixture must look the
+    // way a real machine looks. Creating a real directory here would make the
+    // fixture disagree with the manifest it copies in — and the manifest is the
+    // thing under test.
+    mkdirSync(join(home, '.agents'), { recursive: true });
+    symlinkSync(join(home, '.claude', 'skills'), join(home, '.agents', 'skills'));
     write(
       join(home, '.pi', 'agent', 'mcp.json'),
       `${JSON.stringify(

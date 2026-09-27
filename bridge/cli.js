@@ -40,6 +40,7 @@ OPTIONS
   --repo <path>       repository checkout holding .bridge/   (default: this checkout)
   --targets a,b       restrict to these agents
   --prune             also remove files this bridge created that the source no longer has
+  --dry-run           preview the run without writing anything (adopt, apply, revoke)
   --yes, -y           skip the confirmation prompt for adopt/revoke
   --json              emit a machine-readable report
   --strict            doctor/diff: treat warnings as failures
@@ -64,6 +65,7 @@ const parseArgs = (argv) => {
     repo: null,
     targets: null,
     prune: false,
+    dryRun: false,
     yes: false,
     json: false,
     strict: false,
@@ -77,6 +79,7 @@ const parseArgs = (argv) => {
       case '--repo': opts.repo = argv[++i]; break;
       case '--targets': opts.targets = String(argv[++i] ?? '').split(',').map((s) => s.trim()).filter(Boolean); break;
       case '--prune': opts.prune = true; break;
+      case '--dry-run': opts.dryRun = true; break;
       case '--yes': case '-y': opts.yes = true; break;
       case '--json': opts.json = true; break;
       case '--strict': opts.strict = true; break;
@@ -180,6 +183,39 @@ const main = async () => {
 
     case 'adopt': {
       if (names.length === 0) throw usageError('adopt needs at least one agent name, e.g. `adopt gemini`');
+      if (opts.dryRun) {
+        // Preview goes through the very same planner `adopt` uses, so the preview
+        // cannot drift from what the real run would do.
+        const preview = api.adopt({ repo, home, names, prune: opts.prune, dryRun: true, log });
+        if (opts.json) log.payload(preview);
+        else {
+          log.say(`adopt --dry-run: ${home}`);
+          for (const target of preview.targets) {
+            if (target.skipped) {
+              log.say(`  ${target.name.padEnd(10)} skipped — ${target.skipped}`);
+              continue;
+            }
+            const counts = target.actions.reduce(
+              (acc, a) => ({ ...acc, [a.op]: (acc[a.op] ?? 0) + 1 }),
+              {},
+            );
+            log.say(
+              `  ${target.name.padEnd(10)} ` +
+                Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(' '),
+            );
+            for (const action of target.actions) {
+              if (action.op === OP.KEEP) continue;
+              log.info(
+                `      ${action.op.padEnd(6)} ${action.to.replace(`${home}/`, '~/')}` +
+                  `${action.note ? `  (${action.note})` : ''}`,
+              );
+            }
+            for (const warning of target.warnings ?? []) log.warn(`${target.name}: ${warning}`);
+          }
+          log.say('\nnothing was written.');
+        }
+        return EXIT.OK;
+      }
       if (!opts.yes) {
         const ok = await confirm(
           `adopt ${names.join(', ')} — these agents will follow ${claudeDir(home)}.\n` +
@@ -208,10 +244,21 @@ const main = async () => {
         home,
         targets: opts.targets,
         prune: opts.prune,
+        dryRun: opts.dryRun,
         log,
       });
       if (opts.json) log.payload(result);
-      else {
+      else if (opts.dryRun) {
+        log.say(`apply --dry-run: ${home}`);
+        for (const target of result.targets) {
+          if (target.skipped) log.say(`  ${target.name}: skipped — ${target.skipped}`);
+          else {
+            const s = target.summary;
+            log.say(`  ${target.name}: ${s.add} to add, ${s.update} to update, ${s.keep} already identical`);
+          }
+        }
+        log.say('\nnothing was written.');
+      } else {
         if (result.targets.length === 0) {
           log.say(`nothing to do: ${result.note}`);
         } else {

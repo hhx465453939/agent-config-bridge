@@ -19,6 +19,7 @@ import { businessError } from './errors.js';
 import { hashFile, listFiles, sha256 } from './fs-ops.js';
 import { detectTarget, loadManifest, ruleDest } from './manifest.js';
 import { planGateInstall } from './gates.js';
+import { assertNoSymlinkedDestinations, assertDestOutsideSource, assertLinkRulesHold } from './symlink-guard.js';
 import { classifyMcpServer, scanSource } from './source.js';
 import { emitMcpJson, emitMcpToml, readIfExists } from './mcp.js';
 import { assertNoMissing, loadSecrets } from './secrets.js';
@@ -40,6 +41,15 @@ const OP = { ADD: 'add', UPDATE: 'update', KEEP: 'keep', REMOVE: 'remove' };
  * @param {boolean} ctx.prune
  */
 export const planTarget = ({ home, repo, manifest, source, secrets, stateEntry, prune }) => {
+  // Three refusals before anything is planned, all aimed at the same class of
+  // mistake: a destination that is not really the target's own directory.
+  //   1. a `link` rule must describe reality (right target, actually a link)
+  //   2. the source is read-only by design — never write into it
+  //   3. any other symlinked destination would send writes through the link
+  assertLinkRulesHold({ home, manifest });
+  assertDestOutsideSource({ home, manifest });
+  assertNoSymlinkedDestinations({ home, manifest, context: 'plan' });
+
   const actions = [];
   const warnings = [];
   const info = { unsupportedMcp: [], flatDuplicates: 0, derivedMcp: [] };
@@ -59,6 +69,22 @@ export const planTarget = ({ home, repo, manifest, source, secrets, stateEntry, 
   };
 
   for (const rule of manifest.managed) {
+    if (rule.mode === 'link') {
+      // The destination is a symlink into the source by declaration. There is
+      // nothing to copy and nothing to compare: the agent reads the source
+      // directly, so a change there is visible immediately with no apply step.
+      // assertLinkRulesHold above already verified the link is honest.
+      actions.push({
+        kind: rule.kind,
+        op: OP.KEEP,
+        from: join(home, `.claude/${rule.from}`),
+        to: ruleDest(rule, home),
+        note: `declared link to ${rule.from}`,
+        link: true,
+      });
+      continue;
+    }
+
     if (rule.kind === 'skill') {
       const destRoot = ruleDest(rule, home);
       const seen = new Set();

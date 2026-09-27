@@ -43,6 +43,24 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * Where the policy JSON can live. Same two layouts the pi adapter supports, and
+ * the same silent failure if it is got wrong: a missing file means the gate
+ * falls back to fail-open, i.e. it looks installed and enforces nothing.
+ *
+ *   repo checkout : bridge/gates/dsh/policy.json
+ *   installed     : <gate dir>/dsh/index.js  +  <gate dir>/policy.json
+ */
+export const policyCandidates = (here, explicit) =>
+  [explicit, join(here, 'policy.json'), join(here, '..', 'policy.json')].filter(Boolean);
+
+export const firstExistingPolicy = (here, explicit, exists = existsSync) => {
+  for (const candidate of policyCandidates(here, explicit)) {
+    if (exists(candidate)) return candidate;
+  }
+  return null;
+};
+
 export const name = 'enforce-rules';
 
 /** Graph-query tool names that satisfy the "ask the graph first" rule. */
@@ -70,9 +88,22 @@ const str = (args, key) => {
 export function apply(ctx, config = {}) {
   // An inline `policy` object lets a host inject configuration; `policyPath`
   // keeps the file-based route for real deployments.
+  const resolved =
+    typeof config.policyPath === 'string'
+      ? config.policyPath
+      : firstExistingPolicy(HERE, null);
   const loaded = config.policy
     ? policyFromObject(config.policy)
-    : loadPolicy(typeof config.policyPath === 'string' ? config.policyPath : join(HERE, 'policy.json'));
+    : resolved
+      ? loadPolicy(resolved)
+      : {
+          ok: false,
+          error:
+            'no policy file found; looked in:\n' +
+            policyCandidates(HERE, null)
+              .map((c) => `    ${c}`)
+              .join('\n'),
+        };
   const policy = loaded.ok
     ? loaded.policy
     : {
@@ -86,8 +117,11 @@ export function apply(ctx, config = {}) {
 
   if (!loaded.ok) {
     // Fail open, loudly. A gate that bricks the agent because of a typo in a
-    // JSON file is worse than an unenforced rule.
-    ctx.logger?.warn?.(`enforce-rules: policy not loaded (${loaded.error}); gate is inactive`);
+    // JSON file is worse than an unenforced rule — but a gate that is silently
+    // off is worse still, because everyone assumes it is working.
+    const message = `enforce-rules: DISABLED (${loaded.error})`;
+    ctx.logger?.warn?.(message);
+    process.stderr.write(`${message}\n`);
   }
 
   const state = newSessionState();
