@@ -141,27 +141,27 @@ fi
 
 if [ "$MODE_HISTORY" = 1 ]; then
   if git rev-parse --git-dir >/dev/null 2>&1; then
-    echo "mode: git history (all blobs, all refs)"
-    # Every blob reachable from any ref. Deduplicated by content hash.
-    git rev-list --objects --all 2>/dev/null \
-      | awk '{print $1}' \
-      | git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' 2>/dev/null \
-      | awk '$1=="blob"{print $2}' \
-      | sort -u \
-      | while read -r sha; do
-          [ -n "$sha" ] || continue
-          for entry in "${PATTERNS[@]}"; do
-            label="${entry%%|*}"
-            re="${entry#*|}"
-            git cat-file -p "$sha" 2>/dev/null | grep -aInE -e "$re" 2>/dev/null | while IFS= read -r line; do
-              content="${line#*:}"
-              if [ -n "$ALLOW_RE" ] && printf '%s' "$content" | grep -qE -e "$ALLOW_RE"; then
-                continue
-              fi
-              printf '%s|git-blob:%s|%s\n' "$label" "$sha" "$line" >> "$tmp_hits"
-            done
-          done
+    echo "mode: git history (every reachable commit, path-aware)"
+    # Walk every reachable commit and let `git grep` report rev:path:line:content.
+    # Keeping the path lets ALLOW_PATH_RE apply to historical hits exactly as it
+    # does for the working tree.
+    for rev in $(git rev-list --all 2>/dev/null); do
+      for entry in "${PATTERNS[@]}"; do
+        label="${entry%%|*}"
+        re="${entry#*|}"
+        git grep -aInE -e "$re" "$rev" -- 2>/dev/null | while IFS= read -r line; do
+          path="$(printf '%s' "$line" | cut -d: -f2)"
+          content="$(printf '%s' "$line" | cut -d: -f4-)"
+          if [ -n "$ALLOW_RE" ] && printf '%s' "$content" | grep -qE -e "$ALLOW_RE"; then
+            continue
+          fi
+          if printf '%s' "$path" | grep -qE -e "$ALLOW_PATH_RE"; then
+            continue
+          fi
+          printf '%s|%s|%s\n' "$label" "$path@${rev:0:8}" "$line" >> "$tmp_hits"
         done
+      done
+    done
   else
     echo "note: --history requested but this is not a git repository; skipped" >&2
   fi
