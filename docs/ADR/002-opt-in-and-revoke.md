@@ -33,8 +33,10 @@ ADR-001 的初版设计把 Claude Code 当作**全部** agent 的权威源，默
 | `bridged` | 用户显式 `adopt` 过 | 受管清单内的文件跟随权威源 |
 | `revoked` | 曾桥接、已撤回 | 恢复原生配置，保留一条记录备查 |
 
-状态存放在仓库外的单一文件 `<home>/.config/agent-config-bridge/state.json`。
+状态存放在仓库检出目录内的单一文件 `<repo>/.bridge/state.json`（`.gitignore` 已排除）。
 **状态文件缺失 = 全部 native**（安全默认）。**状态文件损坏 = 拒绝一切写操作**（不是猜，不是重置）。
+
+> 为什么不放 `~/.config` 或 `~/.local/state`：状态、快照、备份跟着仓库走，换目录、容器重起（只要挂载了该目录）都还在，也不会在别处再堆一堆 `.xxx` 目录。代价是删仓库就丢状态，所以 `doctor` 会直接输出状态文件位置与快照数量。仓库外只剩一个文件：`~/.config/agent-config-bridge/secrets.env`（真实凭据）。
 
 ### 2. 选择与撤回是两个显式动作
 
@@ -51,9 +53,9 @@ plan/apply/diff:  只作用于 bridged 的 agent；其余打印"未接管，跳�
 快照内容（仓库外，权限 700）：
 
 ```
-<home>/.local/state/agent-config-bridge/snapshots/<agent>/<snapshot_id>/
-  manifest.json     # 每个将被接管的路径 → 动作(add | overwrite) + 原 sha256 + 原权限
-  files/            # 仅 overwrite 类才拷原文件
+<repo>/.bridge/snapshots/<agent>/<snapshot_id>/
+  manifest.json     # 每个将被接管的路径 → 动作(created | overwritten | removed) + 原 sha256
+  files/            # 仅 overwritten / removed 两种动作才拷原文件
 ```
 
 * `manifest.json` 是 revoke 的唯一执行依据；
@@ -99,8 +101,8 @@ skills、命令/提示词模板、子 agent 定义、全局规则文档、MCP �
 
 ### 方案 C：把状态写在各目标端目录里（如 `.bridge-state.json`）
 
-* 否决原因：污染目标端目录，且目标端工具可能因未知 JSON 文件报警或清理；快照也需要一个统一位置来做保留策略。
-* 处置：统一放仓库外 `<home>/.config/agent-config-bridge/` 与 `<home>/.local/state/`。
+* 否决原因：污染目标端目录（且本项目的初衷就是不要再往家目录里撒点目录），目标端工具也可能因未知 JSON 文件报警或清理；快照与备份也需要一个统一位置来做保留策略。
+* 处置：统一放仓库检出目录内的 `.bridge/`（`.gitignore` 排除）；配置类文件仍放 `~/.config/agent-config-bridge/`。
 
 ### 方案 D：撤回时把该 agent 的目录整目录删掉重建
 

@@ -188,6 +188,23 @@ approved_at: null
     - 目标端目录不存在时跳过并告警，不擅自创建整套目录树
   evidence_method: [文档走查, 干净用户目录模拟执行]
   risks: [文档过期]
+
+- id: US-010
+  title: 把规则文档里最关键的那几条落成硬闸门
+  user: 主力用户
+  outcome: 对**有扩展机制的** agent（pi、DeepSeek Harness），"读源码前先查代码图谱"这类规则不再只靠模型自觉 —— 跳过就被工具拒绝；且这套能力随 adopt/revoke 自然获得与卸载
+  priority: 1
+  dependencies: [US-002, US-003]
+  acceptance_criteria:
+    - 规则逻辑只存一处（策略层），每个 harness 的适配层是薄的翻译层，不重复实现规则
+    - adopt 装上闸门；revoke 按快照连闸门目录一起恢复，且不碰同父目录里用户自己的扩展
+    - 闸门安装幂等（第二次 plan 对闸门文件报 0 变更）；手改 policy 能被 diff 捕获并可被 apply 修复
+    - 策略文件缺失/损坏时 **fail open 并告警**，绝不把 agent 卡死；每会话拦截次数有上限
+    - harness 不自动加载扩展时（dsh）必须如实说明"已安装但需手动挂载"，并给出那行配置
+    - 没有扩展机制的 harness（Kimi）在 status 里明说"规则仍是建议"，不装作已覆盖
+    - 不在任何地方硬编码作者本人的家目录/项目路径（作用范围靠配置或向上找 VCS 根）
+  evidence_method: [策略层纯逻辑单测, 假 harness 对象驱动适配层, 沙箱内整树快照对比]
+  risks: [适配器写错会让闸门静默失效, 装进去但未挂载给人假安全感, 规则写死把人卡住]
 ```
 
 ## 6. 范围
@@ -200,6 +217,7 @@ approved_at: null
 | agents（子 agent） | ✅ | 目标端支持时桥接，不支持则报告跳过 |
 | 全局规则文档 | ✅ | 由权威源派生各端镜像名 |
 | MCP 声明 | ✅ | 跨格式转换 + 密钥外置 + 保留用户自有条目 |
+| **硬闸门（gate）** | ✅ | 仅对有扩展机制的 harness（pi、dsh）；Kimi 无此机制，明确报告不覆盖 |
 | **各端私有设置** | ❌ 保留 | 模型/主题/快捷键/权限/非 MCP 段 |
 | **各端扩展机制** | ❌ | Claude hooks、pi extensions：只报告不代管 |
 | output-styles / themes | ❌ | 无对等概念 |
@@ -254,7 +272,7 @@ approved_at: null
 
 **Definition of Done（产品完成）**
 
-* [ ] US-001~US-008 验收标准全部有证据；US-009 有文档走查记录；
+* [ ] US-001~US-008、US-010 验收标准全部有证据；US-009 有文档走查记录；
 * [ ] 真机演练：`status` → `adopt <试点>` → `plan` → `apply` → `diff`(0) → `revoke` → 快照比对(0)；
 * [ ] 未 adopt 的 agent 全程 md5 不变（有记录）；
 * [ ] 被 adopt agent 的私有配置全程 md5 不变（有记录）；
@@ -276,15 +294,16 @@ approved_at: null
 | US-007 | 制造漂移后回放 | doctor 输出（非 0 退出码） |
 | US-008 | 回滚前后 md5 比对 | 演练记录 |
 | US-009 | 文档走查 / 干净环境模拟 | 走查清单 |
+| US-010 | 策略层单测 + 适配层假 harness 驱动 + 沙箱整树快照 | `node --test` 输出 |
 
 ## 13. 未决问题
 
 | ID | 问题 | 建议默认 |
 |---|---|---|
 | Q6 | adopt 时目标端已有内容与权威源冲突，如何处理 | 先快照；以权威源覆盖**受管清单内**的文件；冲突逐条列出；plan 阶段可中止 |
-| Q7 | adopt 快照保存位置与保留策略 | `<home>/.local/state/agent-config-bridge/snapshots/<agent>/<ts>/`（权限 700）；保留最近 5 份 |
+| Q7 | adopt 快照保存位置与保留策略 | `<repo>/.bridge/snapshots/<agent>/<ts>/`（权限 700）；保留最近 5 份 |
 | Q8 | 首版是否要 `--prune` | 提供该 flag，默认关闭 |
-| Q9 | 是否需要把同步时间戳落盘 | 是，`<home>/.config/agent-config-bridge/last-apply.json` |
+| Q9 | 是否需要把同步时间戳落盘 | 是，`<repo>/.bridge/last-apply.json` |
 | Q10 | 试点 agent 选谁 | 由用户指定；建议先用一个"毁掉也不心疼"的端验证 |
 
 ## 14. 下一路由

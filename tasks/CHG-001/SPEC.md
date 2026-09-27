@@ -66,9 +66,9 @@ approved_at: null
 | ID | 问题 | 建议 | 状态 |
 |---|---|---|---|
 | Q6 | adopt 时目标端已有内容与权威源冲突时的处理 | 先快照 → 覆盖受管清单内文件 → 冲突逐条列出 → plan 阶段可中止 | 🔴 待确认 |
-| Q7 | 快照保存位置与保留策略 | `<home>/.local/state/agent-config-bridge/snapshots/<agent>/<ts>/`（权限 700）；保留最近 5 份 | 🔴 待确认 |
+| Q7 | 快照保存位置与保留策略 | `<repo>/.bridge/snapshots/<agent>/<ts>/`（权限 700）；保留最近 5 份 | ✅ 已定（仓库内，见 D13） |
 | Q8 | 是否提供 `--prune` | 提供，默认关闭 | 非阻塞 |
-| Q9 | 上次同步时间戳位置 | `<home>/.config/agent-config-bridge/last-apply.json` | 非阻塞 |
+| Q9 | 上次同步时间戳位置 | `<repo>/.bridge/last-apply.json` | ✅ 已定 |
 | Q10 | 首次 adopt 的试点 agent | 由用户指定 | 🔴 待确认 |
 | Q11 | pi / Kimi 的 skill 落点 | `~/.agents/skills/`（二者共享） | 🔴 待确认 |
 
@@ -84,7 +84,7 @@ approved_at: null
 
 ## 3. 选定设计与 ADR / 权衡
 
-详见 `docs/ADR/001-bridge-architecture.md` 与 `docs/ADR/002-opt-in-and-revoke.md`。此处给结论：
+详见 `docs/ADR/001-bridge-architecture.md`、`docs/ADR/002-opt-in-and-revoke.md` 与 `docs/ADR/003-hard-gates.md`。此处给结论：
 
 | 决策点 | 选定 | 被否方案 | 理由 |
 |---|---|---|---|
@@ -100,6 +100,10 @@ approved_at: null
 | **D10 撤回机制** | **adopt 时落完整快照；revoke 按快照反向恢复** | 只删本项目新增文件 | 只删新增文件无法还原"被覆盖的内容"，不叫撤回 |
 | **D11 状态持久化** | **`state.json` 单一事实来源**（仓库外） | 散落在各 endpoint | 便于审计、便于撤销、便于 doctor 校验 |
 | **D12 快照形态** | **文件级拷贝 + 清单（路径/模式/哈希）** | 打包 tar | 可逐项校验、可增量读取、失败可定位（体积可控） |
+| **D13 状态与快照落点** | **仓库检出目录内的 `.bridge/`**（`.gitignore` 排除） | 用户全局状态目录；系统临时目录 | 项目跟着仓库走、便于携带与审计；容器里若挂载了可读写区就自然生效。代价：重建仓库会丢状态，因此 `doctor` 明确报告状态文件位置与快照数量 |
+| **D14 硬闸门（gate）** | **策略层唯一（`bridge/gates/policy.js`）+ 每 harness 一层薄适配**（pi / dsh） | 每个 harness 各写一份完整实现 | 规则逻辑只存一处，不会出现"pi 管、dsh 不管"的静默不一致；适配层薄到可通读，便于审计闸门是否真的在拦 |
+| **D15 闸门安装方式** | **与其它受管内容同一套计划动作** | 给闸门单做一套安装/卸载逻辑 | 自动获得"adopt 快照、revoke 恢复、diff/doctor 报漂移"，无需第二套生命周期 |
+| **D16 策略加载失败的行为** | **fail open**（放行 + 明确告警） | fail closed（拒绝一切调用） | 一条写错的规则把 agent 卡死，比某条规则暂时没执行严重得多。真正需要 fail-closed 的规则（写凭据、写出界）是独立检查项，不依赖于"策略加载失败"这个状态 |
 
 ---
 
@@ -135,37 +139,42 @@ options:
 
 ### 4.2 状态与快照数据契约
 
-**单一状态文件**（仓库外）：
+**单一状态文件**（仓库检出目录内，`.gitignore` 已排除）：
 
 ```jsonc
-// <home>/.config/agent-config-bridge/state.json   (mode 600)
+// <repo>/.bridge/state.json   (mode 600)
 {
   "version": 1,
-  "source": { "kind": "claude-code", "root": "<resolved at runtime>" },
   "agents": {
-    "gemini": {
+    "pi": {
       "status": "bridged",              // native | bridged | revoked
       "adopted_at": "2026-09-27T10:15:00Z",
-      "snapshot_id": "20260927T101500", // 指向 snapshots/<agent>/<id>/
-      "managed_files": 42,              // 上次同步后的受管文件数
+      "snapshot_id": "20260927T101500Z", // 指向 snapshots/pi/<id>/
+      "tracked": ["<abs path>"],       // 本工具创建过的路径（累积，用于 --prune 判定归属）
+      "derivedMcp": ["<server name>"], // 本工具派生过的 MCP 条目名（用于安全删除）
+      "managed_files": 42,
       "last_apply": "2026-09-27T10:20:00Z"
     },
-    "kimi": { "status": "native", "adopted_at": null, "snapshot_id": null }
-  },
-  "format": "1"
+    "kimi": { "status": "native" }
+  }
 }
 ```
+
+> `tracked` 是**累积并集**，不是当前派生的快照。若每次刷新都用当前集合覆盖它，那么"源里已删掉、目标端还留着"的文件会立刻看起来像用户自己的文件，于是永远无法被 `--prune` 清理。陈旧条目的代价只是多尝试删一次已经不存在的路径。
+
+> **为什么放在仓库里**：状态、快照与备份跟着仓库走，换目录、容器重起（只要挂载了该目录）都还在。代价是"删仓库就丢状态"，所以 `doctor` 会明确输出状态文件位置与快照数量。
+> 仓库外的文件只有一个：`~/.config/agent-config-bridge/secrets.env`（真实凭据），它**永远**不在仓库内。
 
 * `status` 是唯一权威的开关：`native` 与 `revoked` 的 agent，`plan`/`apply`/`diff` 一律跳过并打印"未接管"；
 * 状态文件缺失 → 全部视为 `native`（安全默认），并给出提示；
 * 状态文件损坏 → **拒绝执行任何写操作**，提示修复或删除（删除即回到全 native）。
 
-**快照目录**（仓库外，权限 700）：
+**快照目录**（仓库内，权限 700）：
 
 ```
-<home>/.local/state/agent-config-bridge/snapshots/<agent>/<snapshot_id>/
-  manifest.json          # 记录：被接管的路径清单、每条的动作(add/overwrite)、原文件 sha256、原文件权限
-  files/                 # 原文件的逐字节拷贝（仅覆盖类动作才有）
+<repo>/.bridge/snapshots/<agent>/<snapshot_id>/
+  manifest.json          # 记录：被接管的路径清单、每条的动作(created/overwritten/removed)、原文件 sha256
+  files/                 # 原文件的逐字节拷贝（仅 overwritten / removed 两种动作才有）
 ```
 
 * `manifest.json` 是 revoke 的唯一执行依据；
@@ -240,7 +249,7 @@ options:
 | 产物权限 | 生成的目标配置（可能含展开后的密钥）写入后 `chmod 600` |
 | 状态/快照权限 | `state.json` 600；快照目录 700 |
 | 日志 | 输出中屏蔽任何形如 32+ 位 token 的字符串（`redact()` 统一处理） |
-| 备份 | `<home>/.local/state/agent-config-bridge/backups/<ts>/`，权限 700 |
+| 备份 | `<repo>/.bridge/backups/<ts>/`，权限 700 |
 
 ### 4.6 兼容
 
@@ -257,9 +266,57 @@ options:
 ### 4.8 可观测性
 
 * `state.json` 记录每个 agent 的状态、adopt 时间、最后同步时间与受管文件数；
-* 每次 `apply` 更新 `<home>/.config/agent-config-bridge/last-apply.json`（时间戳、目标端、文件计数、备份路径、失败项）；
+* 每次 `apply` 更新 `<repo>/.bridge/last-apply.json`（时间戳、目标端、文件计数、备份路径、失败项）；
 * `--json` 输出供脚本消费；
 * 日志级别：`-q` 仅摘要；默认每条变更一行；失败带源/目标路径与原因。
+
+### 4.10 硬闸门契约（gate）
+
+**目标**：让"读代码前先查图谱"这类关键规则**真的被执行**，而不是仅仅写在规则文档里指望模型照做。适合**有可用扩展/插件机制**的 harness。
+
+**分层**：
+
+```
+bridge/gates/policy.js       策略层（纯逻辑，零 harness 依赖，可离线单测）
+bridge/gates/<harness>/     适配层（薄：native 事件 ⇄ 规范化问句 ⇄ native 决定）
+  index.js
+  policy.json               该 harness 的默认策略
+```
+
+**安装布局**（与清单里的 `gates` 块对应）：
+
+```
+<home>/<gates.extension_dir>/<gates.install_as>/
+  policy.js      规则引擎（随适配器一起装，适配器用 `../policy.js` 相对导入）
+  policy.json    由清单覆盖合并生成
+  index.js       pi 目录入口（dsh 不需要，按路径挂载）
+  <adapter>/index.js
+  README.md      它是什么 + 如何卸载
+```
+
+**契约要点**：
+
+| 项 | 规定 |
+|---|---|
+| 安装 | 闸门文件是普通计划动作，自动进入 adopt 快照与备份 |
+| 卸载 | `revoke` 按快照恢复该目录（含删除本工具新增的文件），**只碰该目录**，同父目录下用户自己的扩展不受影响 |
+| 幂等 | 第二次 `plan` 对闸门文件报 0 变更 |
+| 漂移 | 用户手改 `policy.json` 后，`diff` 报出，`apply` 修复 |
+| 清单校验 | `gates.adapter` 必须 ∈ {`pi`, `dsh`}；`gates.install_as` 必须是小写 slug；`extension_dir` 必须是 home 相对路径 |
+| `auto_load` | `true` = harness 会自动加载该目录；`false` = 已安装但需用户手动挂载，`status` 与生成的 README 必须明确写出 |
+| 不可用 harness | 清单里 `gates.supported = false` 并给出原因，`status` 显示"该端无硬闸门，规则仅为建议"，不静默跳过 |
+| 策略加载失败 | **fail open** + 告警（见 D16） |
+| 会话内拦截上限 | `max_blocks_per_session`（默认 3），超出后放行，避免一条错规则卡死 agent |
+| 作用域 | 默认按 "配置了 `project_roots` 就用配置，否则沿目录向上找 `.git`" 判定；不硬编码任何人家目录 |
+
+**检查项（策略层内置，可按 policy.json 选配）**：
+
+| 名称 | 作用 | 默认启用 |
+|---|---|---|
+| `graph-before-read` | 读源码前必须先有一次成功的图谱查询 | ✅ |
+| `index-before-read` | 仓库无索引标记（`.codebase-memory`）时先建索引 | 可选 |
+| `no-write-outside` | 仅在配置了 `write_roots` 时生效，限制写入范围 | 可选 |
+| `no-secret-write` | 写入内容命中凭据模式时拦截 | 可选 |
 
 ### 4.9 上线与回滚
 
@@ -279,11 +336,11 @@ options:
 | 项 | 内容 |
 |---|---|
 | 依赖 | 无 |
-| 文件 | `bridge/cli.js`（命令分发/参数解析/退出码）、`bridge/lib/paths.js`、`bridge/lib/log.js`（含 `redact()`）、`bridge/lib/state.js`（state.json 读写/损坏检测）、`bridge/lib/plan.js`（计划数据结构）、`scripts/scan-secrets.sh`、`.gitignore`、`templates/secrets.env.example` |
+| 文件 | `bridge/cli.js`、`bridge/lib/{errors,paths,log,state,fs-ops,plan}.js`、`scripts/scan-secrets.sh`、`.gitignore`、`templates/secrets.env.example` |
 | 交付 | `status` 在无状态文件时报告"全部 native"；`--help` 完整；扫描脚本可用 |
 | 验收 | `node bridge/cli.js status` 退出 0；`node --test` 全绿；`bash scripts/scan-secrets.sh` 0 命中 |
 | 检查 | `node --check` 全文件、`node --test`、扫描脚本 |
-| 风险 | 状态损坏时行为不明确 → 单测覆盖"缺失/损坏/半损坏"三种 |
+| 风险 | 状态损坏时行为不明确 → 单测覆盖"缺失/损坏/版本不符"三种 |
 | 回滚 | 纯新增文件，`git revert` |
 
 ### M2 — adopt / revoke 状态机与快照
@@ -291,55 +348,67 @@ options:
 | 项 | 内容 |
 |---|---|
 | 依赖 | M1 |
-| 文件 | `bridge/lib/snapshot.js`（快照落盘、manifest、校验、保留策略）、`bridge/lib/adopt.js`、`bridge/lib/revoke.js`、`tests/state.test.js`、`tests/snapshot.test.js` |
-| 交付 | `adopt` 落快照并置 `bridged`（此阶段只改状态，尚未复制文件）；`revoke` 按快照恢复并置 `revoked`；快照缺失时拒绝执行 |
-| 验收 | PRD US-002/003 的**状态与快照部分**验收通过；未 adopt 的 agent 文件 md5 不变 |
-| 检查 | 单测（含"快照被删 → revoke 报错"）+ 真机演练 |
+| 文件 | `bridge/lib/{snapshot,adopt,revoke,apply}.js`、`bridge/test/sandbox.js`、`bridge/test/engine.test.js`（状态与快照部分） |
+| 交付 | `adopt` 落快照并置 `bridged`；`revoke` 按快照恢复并置 `revoked`；快照缺失/不完整时**拒绝执行** |
+| 验收 | PRD US-002/003 验收通过：`revoke` 后目录树与 adopt 前逐字节一致；未 adopt 的 agent md5 不变 |
+| 检查 | 单测（含"删掉一个快照副本 → revoke 报错"）+ 沙箱整树快照对比 |
 | 风险 | 快照不完整导致伪撤回（R8）→ manifest 逐文件 sha256 校验，缺一即拒 |
-| 回滚 | `git revert` + 手工删除 `state.json` 回到全 native |
+| 回滚 | `git revert` + 手工删除 `.bridge/state.json` 回到全 native |
 
 ### M3 — 文件类桥接（skill / command / agent / rules-doc）
 
 | 项 | 内容 |
 |---|---|
 | 依赖 | M2 |
-| 文件 | `bridge/lib/scan-source.js`、`bridge/lib/manifest.js`、`bridge/lib/fs-ops.js`（复制/备份/权限）、`bridge/lib/render.js`（frontmatter 适配）、`bridge/targets/{pi,codex,gemini,kimi}.json` |
-| 交付 | `plan`/`apply`/`diff` 对文件类资产全通；**仅对 bridged 的 agent 生效**；幂等；rollback 可用 |
-| 验收 | PRD US-004/005/008 验收通过；native agent 零改动；bridged agent 私有文件零改动 |
-| 检查 | 单测（fixture 目录树）+ 真机干跑 + 真机 apply 一次 |
-| 风险 | 覆盖用户手改（R1）→ 备份 + plan 显式列出"将覆盖" |
-| 回滚 | `rollback` + 备份目录 |
+| 文件 | `bridge/lib/{source,manifest,status}.js`、`bridge/targets/{pi,kimi,dsh}.json` |
+| 交付 | `plan`/`apply`/`diff` 对文件类资产全通；**仅对 bridged 的 agent 生效**；幂等 |
+| 验收 | PRD US-001/004/005 验收通过；native agent 零改动；bridged agent 私有配置零改动 |
+| 检查 | 单测（真实清单 + 合成源目录）+ 沙箱干跑与二次幂等 |
+| 风险 | 覆盖用户手改（R1）→ 备份 + `plan` 显式列出"将覆盖" |
+| 备注 | 最终只收录**路径已核实**的目标端：pi（官方文档）、kimi（其自带 Claude 导入器说明）、dsh（部分核实）。早期草案里的 Gemini / Codex 未收录，是为避免把猜测写进清单 |
 
 ### M4 — MCP 跨格式派生 + 密钥外置 + 保留自有条目
 
 | 项 | 内容 |
 |---|---|
 | 依赖 | M3 |
-| 文件 | `bridge/lib/mcp/read-source.js`、`emit-pi.js`、`emit-codex-toml.js`、`emit-gemini.js`、`emit-kimi.js`、`bridge/lib/secrets.js`（`${VAR}` 展开 + fail-closed） |
-| 交付 | 权威源 MCP 一次登记 → 各 bridged 端等价配置；含密钥条目走 secrets.env；产物 600；用户自有条目保留 |
-| 验收 | PRD US-006 验收通过；fixture 往返单测；真机转换后人工核对一次；`--strict` 0 命中 |
-| 检查 | 单测 + `doctor --strict` + 人工核对记录 |
-| 风险 | 误删用户自有 MCP 条目（R9）→ 双向白名单 + 快照兜底；测用例必须含"用户自有条目保留"断言 |
+| 文件 | `bridge/lib/mcp.js`（读取器 + JSON/TOML 写出器）、`bridge/lib/secrets.js` |
+| 交付 | 权威源 MCP 一次登记 → 各 bridged 端等价配置；含密钥条目走 `secrets.env`；产物 600；用户自有条目保留 |
+| 验收 | PRD US-006 验收通过：四路断言（派生条目到位 / 自有条目保留 / 密钥展开 / 缺变量 fail-closed 且不写入） |
+| 检查 | 单测 + `doctor --strict` |
+| 风险 | 误删用户自有 MCP 条目（R9）→ 只删"已登记派生集合"内的名字，且有快照兜底 |
 | 回滚 | 备份 + 逐端 `--targets` 单独回退 |
 
-### M5 — doctor 完整化 / rollback / 可观测
+### M5 — 硬闸门（gate）抽象与铺开
 
 | 项 | 内容 |
 |---|---|
-| 依赖 | M4 |
-| 文件 | `bridge/lib/doctor.js`（状态一致性、清单与 never_touch 冲突、目录权限、占位符残留、敏感模式、快照完整性、软链检测、陈旧度）、`bridge/lib/rollback.js` |
+| 依赖 | M3 |
+| 文件 | `bridge/gates/policy.js`（策略层）、`bridge/gates/{pi,dsh}/{index.js,policy.json}`（适配层）、`bridge/lib/gates.js`（安装规划）、`bridge/test/gates.test.js` |
+| 交付 | 规则文档中"读源码前先查图谱"这类关键规则在 pi 上自动生效；dsh 上安装但需手动挂载（如实声明）；Kimi 明确不支持 |
+| 验收 | PRD US-010 验收通过：adopt 装上闸门 / revoke 连目录一起恢复 / 幂等 / 手改 policy 能被 diff 捕获 / 无扩展机制的 harness 如实报告 |
+| 检查 | 策略层纯逻辑单测 + 假 harness 对象驱动适配层（不启动真 pi/dsh） |
+| 风险 | 适配层写错会让闸门静默失效 → 适配层压到几十行并逐条单测；策略加载失败一律 **fail open + 告警**，并设每会话拦截上限 |
+| 回滚 | 随 `revoke` 卸载；`git revert` 回退代码 |
+
+### M6 — doctor 完整化 / rollback / 可观测
+
+| 项 | 内容 |
+|---|---|
+| 依赖 | M4、M5 |
+| 文件 | `bridge/lib/{doctor,rollback,api}.js` |
 | 交付 | PRD US-007/008 验收通过；`doctor` 退出码语义正确（error/warn 分级） |
-| 验收 | 人为制造漂移 → `doctor` 非 0；删除 bridged agent 的一个 skill → `apply` 恢复且其他 agent md5 不变 |
-| 检查 | 单测 + 真实回放 |
+| 验收 | PRD US-007 验收通过（快照不完整 / 状态损坏 / 清单冲突 三类 error 各一条用例） |
+| 检查 | 单测 + 人为制造漂移后的回放 |
 | 风险 | 误报导致告警疲劳 → 分级并分别影响 `--strict` |
 | 回滚 | `git revert` |
 
-### M6 — 文档闭环、脱敏终检、真机端到端验收
+### M7 — 文档闭环、脱敏终检、真机端到端验收
 
 | 项 | 内容 |
 |---|---|
-| 依赖 | M5 |
-| 文件 | `README.md`、`docs/USAGE.md`、`docs/ADR/001-bridge-architecture.md`、`docs/ADR/002-opt-in-and-revoke.md`、`tasks/CHG-001/TRACEABILITY.md`（回填证据）、`CONTRIBUTING.md` |
+| 依赖 | M6 |
+| 文件 | `README.md`、`docs/USAGE.md`、`docs/ADR/{001,002,003}.md`、`docs/plans/000-roadmap.md`、`tasks/CHG-001/TRACEABILITY.md`（回填）、`CONTRIBUTING.md`、CI workflow |
 | 交付 | 文档齐备；仓库脱敏终检 0 命中（含 `--history`）；真机端到端演练记录 |
 | 验收 | PRD DoD 清单逐条勾选；`doctor --strict` 通过 |
 | 检查 | 敏感扫描 + 文档走查 + 端到端演练 |
@@ -352,23 +421,22 @@ options:
 
 **Ready（进入 M1 前）**
 
-* [ ] PRD v2 状态 APPROVED，用户答复 Q6、Q7、Q10、Q11；
+* [ ] PRD v2 状态 APPROVED，用户答复 Q6、Q10、Q11（Q7/Q9 已定）；
 * [ ] 目标端路径表经用户确认；
-* [ ] 仓库初始化（git init、LICENSE、.gitignore、CI workflow 骨架）；
-* [ ] 试点 agent 由用户指定。
+* [ ] 仓库初始化（git init、LICENSE、.gitignore、CI workflow 骨架）。
 
 **Done（CHG-001 关闭）**
 
-* [ ] M1~M6 全部验收通过并有证据（写入 TRACEABILITY 的 Evidence 列）；
+* [ ] M1~M7 全部验收通过并有证据（写入 TRACEABILITY 的 Evidence 列）；
 * [ ] `status` 在干净状态下报告全 native；
 * [ ] `adopt` → `apply` → `diff` = 0 漂移；`plan` 二次幂等（0 变更）；
-* [ ] `revoke` 后与 adopt 前快照逐字节一致（有 md5 报告）；
+* [ ] `revoke` 后与 adopt 前快照逐字节一致（有整树快照对比报告）；
 * [ ] 未 adopt 的 agent 全程 md5 不变（有记录）；
 * [ ] 被 adopt agent 的私有配置全程 md5 不变（有记录）；
+* [ ] 硬闸门：adopt 装上、`diff` 幂等、`revoke` 连目录一起恢复；无扩展机制的 harness 被如实标注（有记录）；
 * [ ] `doctor --strict` 通过；`rollback` 演练成功；
 * [ ] 仓库敏感模式扫描 0 命中（含 `git log --all` 历史扫描）；
-* [ ] README / USAGE / ADR×2 / PRD / SPEC 描述一致；
-* [ ] pi 侧抽样 5 个 skill 的可见性验证记录（若 pi 被 adopt）；
+* [ ] README / USAGE / ADR×3 / PRD / SPEC 描述一致；
 * [ ] 未纳入项在 TRACEABILITY 标 `accepted`。
 
 ---

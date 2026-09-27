@@ -1,0 +1,51 @@
+{
+  "name": "kimi",
+  "display": "Kimi Code",
+  "detect": [".kimi-code"],
+  "home_hint": "~/.kimi-code",
+  "verified": true,
+  "notes": "Paths verified against Kimi Code's own bundled Claude-importer instructions, which state the user-global mappings explicitly: instructions -> $KIMI_CODE_HOME/AGENTS.md (else ~/.kimi-code/AGENTS.md), skills -> $KIMI_CODE_HOME/skills/ (else ~/.kimi-code/skills/), MCP -> ~/.kimi-code/mcp.json. Commands are deliberately NOT bridged: the same instructions state that Claude custom commands are out of scope, i.e. Kimi offers no equivalent destination. Known limitation: if KIMI_CODE_HOME points elsewhere, the declared paths no longer apply; `doctor` reports this.",
+  "managed": [
+    {
+      "kind": "skill",
+      "from": "skills",
+      "to": ".kimi-code/skills",
+      "mode": "copy-tree",
+      "note": "kept inside Kimi's own directory rather than the shared ~/.agents/skills, so this target never competes with pi for the same path"
+    },
+    {
+      "kind": "rules-doc",
+      "from": "CLAUDE.md",
+      "to": ".kimi-code/AGENTS.md",
+      "mode": "copy"
+    },
+    {
+      "kind": "mcp",
+      "from": "@mcpServers",
+      "to": ".kimi-code/mcp.json",
+      "mode": "mcp-json"
+    }
+  ],
+  "gates": {
+    "supported": false,
+    "reason": "Kimi Code ships no user-installable extension or hook mechanism that this project can target, so the rules document stays advisory for this harness. Reported in `status` rather than silently skipped."
+  },
+  "never_touch": [
+    ".kimi-code/config.toml",
+    ".kimi-code/tui.toml",
+    ".kimi-code/credentials",
+    ".kimi-code/oauth",
+    ".kimi-code/server.token",
+    ".kimi-code/sessions",
+    ".kimi-code/cache",
+    ".kimi-code/logs",
+    ".kimi-code/user-history",
+    ".kimi-code/workspace-trust",
+    ".kimi-code/telemetry",
+    ".kimi-code/search-index",
+    ".kimi-code/device_id",
+    ".kimi-code/region",
+    ".kimi-code/updates",
+    ".kimi-code/bin"
+  ]
+}

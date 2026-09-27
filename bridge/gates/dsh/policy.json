@@ -1,0 +1,23 @@
+{
+  "name": "graph-first-gate",
+  "version": 1,
+  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces: source files may not be read before the code graph has been consulted. Mounted through the `tools/pre-execute` waterfall.",
+  "reminder": "",
+  "checks": ["graph-before-read"],
+  "config": {
+    "project_roots": [],
+    "exclude_globs": [
+      "**/node_modules/**",
+      "**/vendor/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/.git/**",
+      "**/site-packages/**",
+      "**/.venv/**",
+      "**/target/**"
+    ],
+    "max_blocks_per_session": 3,
+    "signal_ttl_ms": 3600000,
+    "index_marker": ".codebase-memory"
+  }
+}

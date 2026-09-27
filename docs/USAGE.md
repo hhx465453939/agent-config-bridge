@@ -67,7 +67,7 @@ node bridge/cli.js status            # 先确认它当前是 native
 node bridge/cli.js adopt gemini      # 会先给它的现有配置拍快照，再首次同步
 ```
 
-* 快照存在 `~/.local/state/agent-config-bridge/snapshots/gemini/<时间戳>/`，权限 700；
+* 快照存在**仓库内**的 `.bridge/snapshots/gemini/<时间戳>/`（权限 700，已被 `.gitignore` 排除）；
 * 只有它被改动，其他 agent 的文件 md5 完全不变；
 * 它自己的私有配置（模型选择、主题、快捷键、权限）**原样保留**。
 
@@ -140,19 +140,49 @@ node bridge/cli.js apply
 | 子 agent 定义 | ✅ | 目标端支持时桥接，不支持则报告跳过 |
 | 全局规则文档（开发习惯 / 记忆） | ✅ | 由权威源派生出各端镜像名 |
 | MCP server 声明 | ✅ | 跨格式转换；密钥走仓库外的 `secrets.env`；**用户自有条目保留** |
+| **硬闸门（gate）** | ✅ | 仅对有扩展机制的 agent（pi、dsh）；Kimi 无此机制，`status` 会明说 |
 | **各端私有设置** | ❌ 保留 | 模型选择、主题、快捷键、权限白名单、非 MCP 段配置 |
-| **各端扩展 / 插件** | ❌ | 例如 pi 的 extensions、Claude 的 hooks，无对等概念，不代管 |
+| **各端扩展 / 插件** | ❌ | 你自己写的扩展原样保留；本工具只往里加它自己那一个子目录 |
 | 会话 / 历史 / 缓存 / 凭据文件 | ❌ | 运行时数据，永不触碰 |
 | output-styles / themes | ❌ | 无对等概念 |
 
 完整的受管路径清单见 `bridge/targets/*.json` —— **清单是唯一的结构知识来源**，代码里没有"猜路径"的逻辑。每个清单还带一份 `never_touch`（该端私有、永不接管）。清单里没有的东西，本项目一律不碰。
+
+## 6.1 硬闸门（gate）：让规则文档真的被遵守
+
+规则文档是建议，有些规则却必须真的执行 —— 比如「读源码前先查代码图谱」。本项目把这类规则给**有扩展机制的 agent** 装成工具级拒绝。
+
+| Agent | 硬闸门 | 你需要做什么 |
+|---|---|---|
+| **pi** | ✅ | 什么都不用做：`adopt pi` 后 pi 会自动加载 |
+| **DeepSeek Harness** | ✅ | `adopt dsh` 会把闸门装到 `~/.dsh/plugins/`，但 **dsh 不会自动加载**。你需要在自己的 cordis 组合里加一行（`status` 与装好的 `README.md` 里都写了现成的一行） |
+| **Kimi Code** | ❌ | 它没有用户可装的扩展/钩子机制，规则对它仍是建议 |
+
+装到哪个目录、装了什么文件，都可以直接看：
+
+```
+~/.pi/agent/extensions/enforce-rules/
+  policy.js      规则引擎
+  policy.json    策略（想改就改这个）
+  index.js       pi 入口
+  pi/index.js    适配层
+  README.md      它是什么 + 如何卸载
+```
+
+想改规则（换检查项、改作用范围、改"一个会话最多拦几次"）→ 直接编辑 `policy.json`。改了之后跑一次 `apply` 会被还原 —— 因为它是受管文件；如果你想长期用自己那版，改仓库里的 `bridge/targets/<agent>.json` 的 `gates.policy` 覆盖块。
+
+安全的默认值：
+
+* 策略文件坏了 → **放行**并告警，不会把 agent 卡死；
+* 一个会话最多拦 3 次，之后放行；
+* 不让工具碰你自己写的扩展 —— `revoke` 只删它装的那一个子目录。
 
 ## 7. 安全说明
 
 * 仓库内**永远**只有 `${VAR}` 占位符，没有真实值；
 * 真实值只在 `~/.config/agent-config-bridge/secrets.env`，权限 `600`；
 * 生成的目标配置可能含展开后的真实值，因此写入后会被 `chmod 600`；
-* `state.json` 权限 600；快照与备份目录权限 700；
+* `state.json` 权限 600；快照与备份目录权限 700，两者都在仓库检出目录的 `.bridge/` 下（不会入库）；
 * 桥接器会屏蔽输出中的疑似 token 串，但**请不要把完整输出贴到公开场合**。
 
 ## 8. 故障排查
@@ -163,6 +193,9 @@ node bridge/cli.js apply
 | 某端显示"未检测到" | 该 agent 目录不存在 | 先启动一次该 agent，再 `status` 确认 |
 | `apply` 报"缺少环境变量 X" | `secrets.env` 未填该变量 | 填上，或从配置里移除该引用 |
 | `revoke` 报"快照不完整" | 快照被手工删改 | 按报错列出的路径手工恢复；不要指望工具硬撑 |
+| pi 里闸门没生效 | 扩展目录未被加载或 pi 未 reload | 重启 pi 或 `/reload`；在 pi 里跑 `/status` 看已加载扩展 |
+| dsh 里闸门没生效 | dsh 不自动加载扩展目录 | 按装好的 `README.md` 里那行把闸门挂进 cordis 组合 |
+| 闸门拦得太狠 / 该拦的没拦 | 策略配置不合你的习惯 | 改 `policy.json`（检查项、作用范围、拦截上限），或改仓库清单里的 `gates.policy` 覆盖块 |
 | `doctor` 报"检测到符号链接" | 你用软链把通用技能目录指向了 Claude 技能目录 | 见下节，自行决定是否改复制方案 |
 | `apply` 后 `diff` 仍非 0 | 目标端被别的工具改写 | 看 `diff` 详情；若该端有自管机制，把对应路径从清单移除 |
 | `status` 说状态文件损坏 | `state.json` 被写坏 | 修好它，或删掉（删掉=回到全部 native） |

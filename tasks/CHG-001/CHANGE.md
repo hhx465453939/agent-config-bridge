@@ -61,7 +61,8 @@ evidence_date: 2026-09-27
 * S6 **密钥外置**：仓库只存 `${VAR}` 占位符，真实值来自仓库外的 `secrets.env`，缺失即 fail-closed；
 * S7 **保留私有配置**：桥接只覆盖共享维度，agent 自身特有配置（模型/主题/快捷键/权限/扩展等）原样保留；
 * S8 幂等性、备份与回滚、`--dry-run` 优先的安全语义；
-* S9 自检器：残留占位符、明文凭据模式（正则黑名单）、md5 漂移、快照完整性。
+* S9 自检器：残留占位符、明文凭据模式（正则黑名单）、md5 漂移、快照完整性；
+* S10 **硬闸门（gate）**：把规则文档里最关键的规则抽成策略层（`bridge/gates/policy.js`），并给**有扩展机制的 harness** 铺上适配层（起步：pi、DeepSeek Harness），让规则从"建议"变成"工具级拒绝"；闸门走与其它内容同一套受管路径，因此 adopt 可快照、revoke 可卸载。
 
 **非目标（Non-goals）：**
 
@@ -125,7 +126,8 @@ evidence_date: 2026-09-27
 | Q4 | 仓库是否包含一份"最小可运行示例"（fixture）以便在其他机器上验证 | 包含 `tests/fixtures/`，不含任何真实资产 | ✅ |
 | Q5 | **默认桥接哪些 agent** | **一个都不桥接（全部 native）**，由用户逐个 `adopt` | ✅ 用户已明确 |
 | Q6 | adopt 时若该 agent 已有内容与权威源冲突，如何处理 | 先快照，再以"权威源覆盖、冲突逐条列出"的方式同步；用户可在 `plan` 阶段中止 | 待确认 |
-| Q7 | adopt 的快照保存在哪 | `<home>/.local/state/agent-config-bridge/snapshots/<agent>/<ts>/`（权限 700），仓库外 | 待确认 |
+| Q7 | adopt 的快照保存在哪 | `<repo>/.bridge/snapshots/<agent>/<ts>/`（权限 700），仓库内但 `.gitignore` 排除 | ✅ 已定 |
+| Q8 | **硬闸门（gate）怎么抽出来** | 策略层唯一（`bridge/gates/policy.js`）+ 每 harness 薄适配；优先 pi 与 DeepSeek Harness | ✅ 用户已明确 |
 
 ## 11. Evidence Pointers（取证位置）
 

@@ -1,0 +1,64 @@
+{
+  "name": "pi",
+  "display": "pi (pi coding agent)",
+  "detect": [".pi"],
+  "home_hint": "~/.pi",
+  "verified": true,
+  "notes": "Paths verified against pi's own documentation (skills.md, configuration.md, prompt-templates.md) and the pi-mcp-adapter README. Skills deliberately go to ~/.agents/skills/ (the shared Agent Skills location pi documents as natively supported) instead of into pi's agent dir: it keeps ~/.pi clean and lets any other agent that opts into the shared location reuse one copy. The rules document goes to ~/AGENTS.md rather than ~/.pi/agent/AGENTS.md because pi loads context files from both the agent directory and the working-directory chain, so writing a second copy under ~/.pi would make the model read the same rules twice.",
+  "managed": [
+    {
+      "kind": "skill",
+      "from": "skills",
+      "to": ".agents/skills",
+      "mode": "copy-tree",
+      "note": "directory-form skills only; flat <name>.md duplicates are reported, never bridged"
+    },
+    {
+      "kind": "command",
+      "from": "commands",
+      "to": ".pi/agent/prompts",
+      "mode": "copy-flat",
+      "note": "pi exposes prompt templates as /<filename> commands"
+    },
+    {
+      "kind": "rules-doc",
+      "from": "CLAUDE.md",
+      "to": "AGENTS.md",
+      "mode": "copy",
+      "note": "home-level context file; avoids a second copy under .pi/agent that pi would also load"
+    },
+    {
+      "kind": "mcp",
+      "from": "@mcpServers",
+      "to": ".pi/agent/mcp.json",
+      "mode": "mcp-json"
+    }
+  ],
+  "gates": {
+    "supported": true,
+    "adapter": "pi",
+    "install_as": "enforce-rules",
+    "extension_dir": ".pi/agent/extensions",
+    "auto_load": true,
+    "mount_hint": "pi loads ~/.pi/agent/extensions/*.ts and subdirectories containing index.ts or index.js, so no manual mount is needed",
+    "policy": {
+      "config": {
+        "project_roots": []
+      }
+    }
+  },
+  "never_touch": [
+    ".pi/agent/settings.json",
+    ".pi/agent/keybindings.json",
+    ".pi/agent/models.json",
+    ".pi/agent/auth.json",
+    ".pi/agent/APPEND_SYSTEM.md",
+    ".pi/agent/extensions",
+    ".pi/agent/sessions",
+    ".pi/agent/themes",
+    ".pi/agent/npm",
+    ".pi/agent/.debug",
+    ".pi/agent/pi-router.json",
+    ".agents/shared"
+  ]
+}

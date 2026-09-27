@@ -1,0 +1,34 @@
+{
+  "name": "dsh",
+  "display": "DeepSeek Harness (dsh)",
+  "detect": [".dsh"],
+  "home_hint": "~/.dsh",
+  "verified": false,
+  "notes": "PARTIALLY VERIFIED, and it matters which parts. Verified from dsh's own documentation and source: the harness home is $DSH_HOME or ~/.dsh and holds the fixed user-global AGENTS.md; plugins are Cordis modules mounted explicitly (dsh does NOT auto-load an extensions directory); the tool pipeline exposes `tools/pre-execute`, and the built-in filesystem tools are named read/write/edit with a `file_path` argument. NOT verified: where a user-global MCP declaration lives (dsh resolves MCP servers per session/adapter, and this project refuses to write to a guessed path), and whether dsh reads ~/.agents/skills. Because of that this manifest declares only the parts that were checked, and `doctor` keeps reporting the target as unverified until someone confirms it against a real installation.",
+  "managed": [
+    {
+      "kind": "rules-doc",
+      "from": "CLAUDE.md",
+      "to": ".dsh/AGENTS.md",
+      "mode": "copy",
+      "note": "the fixed user-global instruction file, per config-catalog (dshHome + AGENTS.md)"
+    }
+  ],
+  "gates": {
+    "supported": true,
+    "adapter": "dsh",
+    "install_as": "agent-config-gates",
+    "extension_dir": ".dsh/plugins",
+    "auto_load": false,
+    "mount_hint": "dsh mounts plugins through a Cordis composition, so the installed directory does not take effect until a plugin row points at it. Add to your cordis patch:\n\n  - name: '~/.dsh/plugins/agent-config-gates/'\n    config:\n      policyPath: '~/.dsh/plugins/agent-config-gates/policy.json'\n\n`status` reports whether the gate directory is installed; whether it is mounted is visible only in your own composition file, which this project deliberately does not edit.",
+    "policy": {
+      "config": {
+        "project_roots": []
+      }
+    }
+  },
+  "never_touch": [
+    ".dsh/storages",
+    ".dsh/profiles"
+  ]
+}

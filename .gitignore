@@ -8,6 +8,8 @@ secrets/**
 *.local.jsonc
 
 # 桥接器运行时状态（属于用户机器，不属于仓库）
+# 三种状态、快照与备份都放在这里；这也是容器挂载可读写区时的首选落点。
+.bridge/
 .bridge-state/
 bridge-state.json
 last-apply.json

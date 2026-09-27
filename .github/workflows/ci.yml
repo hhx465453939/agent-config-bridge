@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The history scan looks at every reachable commit, so it needs them.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: syntax check
+        run: |
+          fail=0
+          for f in $(find bridge -name '*.js'); do
+            node --check "$f" || fail=1
+          done
+          exit $fail
+
+      - name: unit tests
+        run: node --test
+
+      # Runs on every platform/version pair on purpose: the scanner is the last
+      # line of defence before a credential reaches a public repository, and a
+      # scanner that only works on one platform is a scanner that will one day
+      # not run.
+      - name: sensitive content scan
+        run: bash scripts/scan-secrets.sh --history

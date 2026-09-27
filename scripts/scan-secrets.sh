@@ -65,7 +65,7 @@ PATTERNS=(
 # Narrow, explicitly-public exceptions. Each entry: "label|regex"
 ALLOW_PATTERNS=(
   'loopback|(^|[^0-9])127\.0\.0\.1([^0-9]|$)|(^|[^0-9])0\.0\.0\.0([^0-9]|$)'
-  'public-hosts|(^|[^a-z0-9.-])(github\.com|gitlab\.com|npmjs\.com|nodejs\.org|example\.com|agentskills\.io|opensource\.org|mit\.edu)([^a-z0-9.-]|$)'
+  'public-hosts|(^|[^a-z0-9-])(github\.com|gitlab\.com|npmjs\.com|nodejs\.org|example\.com|agentskills\.io|opensource\.org|mit\.edu)([^a-z0-9.-]|$)'
   'placeholders|<[^<>[:space:]]+>|\$\{[A-Za-z_][A-Za-z0-9_]*\}|xxxx+|your-|your_'
 )
 

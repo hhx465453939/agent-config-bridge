@@ -8,12 +8,14 @@
 M1 骨架/安全地基/状态层
  └── M2 adopt-revoke 状态机与快照
       └── M3 文件类桥接（skill/command/agent/rules-doc）
-           └── M4 MCP 跨格式派生 + 密钥外置
-                └── M5 doctor / rollback / 可观测
-                     └── M6 文档闭环 + 脱敏终检 + 真机端到端
+           ├── M4 MCP 跨格式派生 + 密钥外置
+           └── M5 硬闸门（gate）抽象与铺开
+                └── M6 doctor / rollback / 可观测
+                     └── M7 文档闭环 + 脱敏终检 + 真机端到端
 ```
 
 不可跳阶：M2 没做完就不做 M3 —— 否则会出现"能同步但不能撤回"的半成品，比不做更危险。
+M5 依赖 M3（闸门要走同一套受管路径才能被快照），但不依赖 M4。
 
 ## M1 骨架 / 安全地基 / 状态层
 
@@ -58,40 +60,67 @@ M1 骨架/安全地基/状态层
 
 **完成判定**：fixture 往返单测通过；"用户自有条目保留"用例通过；真机转换后人工核对记录归档。
 
-## M5 doctor / rollback / 可观测
+## M5 硬闸门（gate）抽象与铺开
 
-- [ ] `bridge/lib/doctor.js`：状态一致性、清单冲突、目录与权限、占位符残留、敏感模式、快照完整性、软链检测、陈旧度
+- [ ] `bridge/gates/policy.js`：策略层（纯逻辑，零 harness 依赖）
+- [ ] `bridge/gates/pi/{index.js,policy.json}`：pi 适配层
+- [ ] `bridge/gates/dsh/{index.js,policy.json}`：DeepSeek Harness 适配层
+- [ ] `bridge/lib/gates.js`：安装规划（生成 policy.json、README、目录入口）
+- [ ] 清单 `gates` 块校验 + `never_touch` 的窄豁免（只免闸门自己那个子目录）
+- [ ] `status` 报告每个端的闸门状态（已装/未装/不支持 + 是否需要手动挂载）
+- [ ] `bridge/test/gates.test.js`
+
+**完成判定**：`node --test` 全绿；沙箱里 adopt 装上闸门、`diff` 幂等、revoke 连目录一起恢复且不碰用户自己的扩展。
+
+## M6 doctor / rollback / 可观测
+
+- [ ] `bridge/lib/doctor.js`：状态一致性、清单冲突、占位符残留、敏感模式、快照完整性、软链、陈旧度
 - [ ] `bridge/lib/rollback.js`
-- [ ] `last-apply.json` 落盘
+- [ ] `last-apply.json` 落盘（`<repo>/.bridge/`）
 - [ ] error / warn 分级与 `--strict` 语义
 
-**完成判定**：人为制造漂移 → `doctor` 非 0；删除 bridged agent 一个 skill → `apply` 恢复且其他 agent md5 不变。
+**完成判定**：人为制造漂移 → `doctor` 非 0；快照不完整 → `doctor` 非 0 且 `revoke` 拒绝执行。
 
-## M6 文档闭环 + 脱敏终检 + 端到端
+## M7 文档闭环 + 脱敏终检 + 端到端
 
-- [ ] `README.md`（状态图 + 会桥接什么/不会碰什么表）
+- [ ] `README.md`（状态图 + 会桥接什么/不会碰什么表 + 硬闸门一节）
 - [ ] `docs/USAGE.md`
-- [ ] `docs/ADR/001`、`docs/ADR/002`
+- [ ] `docs/ADR/001`、`docs/ADR/002`、`docs/ADR/003`
 - [ ] `CONTRIBUTING.md`
+- [ ] `.github/workflows/ci.yml`（`node --test` + 敏感扫描）
 - [ ] `tasks/CHG-001/TRACEABILITY.md` 回填证据
 - [ ] `bash scripts/scan-secrets.sh --history` 0 命中
-- [ ] 真机端到端演练记录（status → adopt → plan → apply → diff → revoke → 快照比对）
+- [ ] 真机端到端演练记录（status → adopt → plan → apply → diff → revoke → 整树比对）
 
 **完成判定**：SPEC §6 DoD 逐条打勾且每条可复现。
 
-## 真机演练脚本（M6 用）
+## 真机演练脚本（M7 用）
+
+下面全部在**沙箱**里跑（`bridge/test/sandbox.js` 会把机器上的 `.xxx` 目录复制进临时目录，跑完整个临时目录一起删掉）。**不碰本机真实配置。**
 
 ```bash
-node bridge/cli.js status
-node bridge/cli.js adopt <试点端>
-node bridge/cli.js plan
-node bridge/cli.js apply
-node bridge/cli.js diff                 # 期望 0 漂移
-node bridge/cli.js plan                 # 期望 0 变更（幂等）
-md5sum <未 adopt 端的任一配置文件>       # 记录
-node bridge/cli.js revoke <试点端>
-node bridge/cli.js status
-md5sum <未 adopt 端的任一配置文件>       # 应完全一致
+# 1. 全套自动化检查
+node --test
+bash scripts/scan-secrets.sh --history
+
+# 2. 一次性人工演练（临时目录，可重复跑）
+node -e "
+  import('./bridge/test/sandbox.js').then(async (m) => {
+    const api = await import('./bridge/lib/api.js');
+    const sb = m.makeSandbox({ install: ['pi', 'kimi', 'dsh'] });
+    const quiet = { info(){}, say(){}, ok(){}, warn(){}, error(){}, payload(){} };
+    console.log('1 status ', api.status(sb.repo, sb.home).agents.map(a => a.name + ':' + a.status).join(' '));
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    console.log('2 adopt  pi ->', api.status(sb.repo, sb.home).agents.find(a => a.name === 'pi').status);
+    console.log('3 diff   ', JSON.stringify(api.diff({ repo: sb.repo, home: sb.home }).targets.filter(t => !t.skipped).map(t => [t.name, t.actions.length])));
+    api.revoke({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    console.log('4 revoke pi ->', api.status(sb.repo, sb.home).agents.find(a => a.name === 'pi').status);
+    sb.cleanup();
+  });
+"
+
+# 3. 第 3 步期望输出 [['pi',0]]（0 变更 = 幂等）
+# 4. 第 4 步之后被 adopt 端的目录树应与 adopt 前一致（单测已断言）
 ```
 
-演练记录（命令 + 输出 + 时间）写入 `tasks/CHG-001/TRACEABILITY.md` 的证据列。
+> 真机上跑之前，先 `node bridge/cli.js status` 看一眼。真要 adopt 时，**建议先用一个"毁掉也不心疼"的端试**。本机实测记录留空，等用户授权后填。
