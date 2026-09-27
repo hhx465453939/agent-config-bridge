@@ -105,6 +105,13 @@ export const makeSandbox = ({ install = ['pi', 'kimi'] } = {}) => {
     write(join(home, '.kimi-code', 'config.toml'), '[general]\ntheme = "dark"\n');
     write(join(home, '.kimi-code', 'mcp.json'), `${JSON.stringify({ mcpServers: {} }, null, 2)}\n`);
   }
+  if (install.includes('dsh')) {
+    // dsh is the harness that does NOT auto-load extensions, so its fixture
+    // exists to exercise the manual-mount warning path. Its rule document is
+    // the only managed path it declares.
+    mkdirSync(join(home, '.dsh'), { recursive: true });
+    write(join(home, '.dsh', 'storages', 'workspace.json'), '{}\n');
+  }
 
   // ---- target manifests + gate sources --------------------------------------
   // The REAL manifests and gate sources are copied in, not re-declared here. A

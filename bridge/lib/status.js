@@ -125,8 +125,13 @@ export const formatStatus = (report) => {
           `${row.gate.installed ? 'installed' : 'not installed'}` +
           `${row.gate.policy ? `  (policy: ${row.gate.policy})` : ''}`,
       );
-      if (row.gate.installed && row.gate.mounts) {
+      if (row.gate.manualMount) {
         lines.push(`      gate mount  : manual — this harness does not auto-load extensions`);
+        if (row.gate.mountHint) {
+          for (const hintLine of String(row.gate.mountHint).split('\n')) {
+            lines.push(`                    ${hintLine}`);
+          }
+        }
       }
     } else if (row.status === STATUS.BRIDGED) {
       lines.push(`      gate        : not available on this harness (its rules stay advisory)`);

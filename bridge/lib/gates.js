@@ -32,11 +32,11 @@ import { targetPath } from './paths.js';
 export const gatesSourceDir = (repo) => join(repo, 'bridge', 'gates');
 
 export const gateInstallDir = (manifest, home) =>
-  targetPath(home, `${manifest.gates.extension_dir}/${manifest.gates.install_as}`);
+  targetPath(home, `${manifest.gates.extensionDir}/${manifest.gates.installAs}`);
 
 /** The home-relative form of the gate directory, used to carve it out of never_touch. */
 export const gateRelDir = (manifest) =>
-  manifest.gates ? `${manifest.gates.extension_dir}/${manifest.gates.install_as}` : null;
+  manifest.gates ? `${manifest.gates.extensionDir}/${manifest.gates.installAs}` : null;
 
 const PI_ENTRY = `// Entry point so the harness finds the adapter when it loads this directory.
 // pi loads a subdirectory that contains an index.ts / index.js.
@@ -63,16 +63,16 @@ const readme = (manifest) => {
     'which restores this directory to whatever was here before it was adopted.',
   ];
 
-  if (manifest.gates.auto_load === false) {
+  if (manifest.gates.autoLoad === false) {
     lines.push(
       '',
       '## This harness does not auto-load extensions',
       '',
-      ...(manifest.gates.mount_hint ? [manifest.gates.mount_hint, ''] : []),
+      ...(manifest.gates.mountHint ? [manifest.gates.mountHint, ''] : []),
       'Mount this directory with a Cordis plugin row:',
       '',
       '```yaml',
-      `- name: '${manifest.gates.extension_dir}/${manifest.gates.install_as}/'`,
+      `- name: '${manifest.gates.extensionDir}/${manifest.gates.installAs}/'`,
       '```',
     );
   }
@@ -172,7 +172,17 @@ export const gateStatus = ({ repo, home, manifest }) => {
     dir,
     installed: existsSync(join(dir, adapterEntry(manifest))),
     policy: policyName,
-    mounts: manifest.gates.mount_hint ?? null,
+    /**
+     * Whether the user still has to mount this by hand.
+     *
+     * Derived from `autoLoad`, NOT from the presence of a hint. The first
+     * version keyed off the hint and therefore told the user pi needed manual
+     * mounting — pi auto-loads its extension directory perfectly well. A false
+     * statement on the single line people read to decide whether their gate is
+     * live is worse than saying nothing.
+     */
+    manualMount: manifest.gates.autoLoad === false,
+    mountHint: manifest.gates.mountHint ?? null,
   };
 };
 

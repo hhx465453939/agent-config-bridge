@@ -686,6 +686,48 @@ test('gates: a harness without an extension mechanism gets no gate, only a repor
   });
 });
 
+// Regressions from the first real-machine runs.
+
+test('gates: a harness that does not auto-load says so, in both plan and status', async () => {
+  // dsh mounts plugins through a Cordis composition, so installing the gate is
+  // not enough. The warning is the only thing standing between the user and a
+  // gate they believe is live but which nothing ever loads.
+  await withSandbox({ install: ['dsh'] }, (sb) => {
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['dsh'], log: quiet });
+
+    const plan = api.plan({ repo: sb.repo, home: sb.home, targets: ['dsh'] });
+    assert.ok(
+      plan.targets[0].warnings.some((w) => /does not auto-load extends|does not auto-load/.test(w)),
+      `expected a manual-mount warning, got ${JSON.stringify(plan.targets[0].warnings)}`,
+    );
+
+    const dsh = api.status(sb.repo, sb.home).agents.find((a) => a.name === 'dsh');
+    assert.equal(dsh.gate.manualMount, true, 'status must say the mount is manual');
+    assert.ok(dsh.gate.mountHint, 'and must carry the hint the user needs');
+  });
+});
+
+test('gates: a harness that auto-loads must NOT be reported as needing a manual mount', async () => {
+  // The first version keyed "needs manual mounting" off the presence of a hint
+  // string rather than off autoLoad, so pi — which auto-loads its extension
+  // directory perfectly well — told the user to go mount it by hand.
+  // A false statement on the one line that answers "is my gate live?" is worse
+  // than saying nothing.
+  await withSandbox({ install: ['pi'] }, (sb) => {
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+
+    const plan = api.plan({ repo: sb.repo, home: sb.home, targets: ['pi'] });
+    assert.equal(
+      plan.targets[0].warnings.some((w) => /does not auto-load/.test(w)),
+      false,
+      'no manual-mount warning for a harness that mounts itself',
+    );
+
+    const pi = api.status(sb.repo, sb.home).agents.find((a) => a.name === 'pi');
+    assert.equal(pi.gate.manualMount, false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // destination guards
 //

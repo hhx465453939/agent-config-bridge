@@ -13,7 +13,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,6 +42,16 @@ import piGate, {
   firstExistingPolicy as firstExisting,
 } from '../gates/pi/index.js';
 import { apply as dshApply } from '../gates/dsh/index.js';
+import { loadManifest } from '../lib/manifest.js';
+
+/**
+ * The `bridge/` directory itself. Resolved from this file's own URL rather than
+ * from another constant, so it cannot depend on declaration order — an earlier
+ * revision derived it from a `const` declared further down and threw
+ * `Cannot access 'PI_ADAPTER_HERE' before initialization`, which took the whole
+ * suite offline rather than failing one assertion.
+ */
+const BRIDGE_DIR = fileURLToPath(new URL('..', import.meta.url));
 
 /** 
  * Stand-in for the adapter's own directory in the checkout layout. The adapter
@@ -591,4 +601,126 @@ test('dsh adapter: write tools are recorded so reading them back is allowed', as
   dshApply(ctx, { policy: TEST_POLICY });
   await run('write', { file_path: '/repo/src/fresh.ts', content: 'x' });
   assert.deepEqual(await run('read', { file_path: '/repo/src/fresh.ts' }), { kind: 'allow' });
+});
+
+// ---------------------------------------------------------------------------
+// the naming contract between the manifest JSON and the code that reads it
+//
+// This cost a real bug on a real machine: the validator emitted `auto_load`
+// while the planner read `autoLoad`, so the manual-mount warning never fired.
+// A check that silently never runs is the exact failure mode this project keeps
+// trying to design out, so it gets a test that fails the moment the two sides
+// drift apart again.
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip comments, keep everything else.
+ *
+ * The naming-contract tests below scan source text, and prose mentions things
+ * like `bridge/test/gates.test.js` or `<extension_dir>/<install_as>/`. Those are
+ * comments, not readers — without this the tests report false positives, and a
+ * checker that cries wolf is worse than no checker.
+ *
+ * Strings are deliberately kept: `manifest.gates.extensionDir` inside a
+ * template literal is a real reader and must be caught.
+ */
+const stripComments = (source) => {
+  let out = '';
+  let i = 0;
+  let state = 'code';
+  while (i < source.length) {
+    const c = source[i];
+    const next = source[i + 1];
+    if (state === 'code') {
+      if (c === '/' && next === '/') { state = 'line'; i += 2; continue; }
+      if (c === '/' && next === '*') { state = 'block'; i += 2; continue; }
+      if (c === "'" || c === '"' || c === '`') state = c;
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (state === 'line') {
+      if (c === '\n') { state = 'code'; out += c; }
+      i += 1;
+      continue;
+    }
+    if (state === 'block') {
+      if (c === '*' && next === '/') { state = 'code'; i += 2; } else { if (c === '\n') out += c; i += 1; }
+      continue;
+    }
+    // inside a string or template literal
+    if (c === '\\') { out += c + (next ?? ''); i += 2; continue; }
+    if (c === state) state = 'code';
+    out += c;
+    i += 1;
+  }
+  return out;
+};
+
+test('gates: every key the code reads is a key the validator produces', () => {
+  // Reads all go through `manifest.gates.X`, so matching that prefix keeps the
+  // scan precise: an error message that happens to spell `gates.install_as`
+  // inside a template literal is prose, not a reader, and flagging it would
+  // make this test cry wolf.
+  //
+  // The alias check below catches the case where someone shortens the access
+  // path (`const g = manifest.gates`) — at which point this scan would silently
+  // stop covering those reads, which is the same class of silent gap the test
+  // exists to prevent.
+  const readerRe = /manifest\??\.gates\??\.([A-Za-z_][A-Za-z0-9_]*)/g;
+  const aliasRe = /(?:=|\{)[^;\n]*\bmanifest\.gates\b(?![.?])/;
+  const files = [
+    ...readdirSync(join(BRIDGE_DIR, 'lib'))
+      .filter((f) => f.endsWith('.js'))
+      .map((f) => join(BRIDGE_DIR, 'lib', f)),
+    join(BRIDGE_DIR, 'cli.js'),
+  ];
+
+  const readers = new Map();
+  for (const file of files) {
+    const source = stripComments(readFileSync(file, 'utf8'));
+    const where = file.slice(BRIDGE_DIR.length);
+    for (const match of source.matchAll(readerRe)) {
+      const key = match[1];
+      if (!readers.has(key)) readers.set(key, new Set());
+      readers.get(key).add(where);
+    }
+    assert.doesNotMatch(
+      source,
+      aliasRe,
+      `${where} aliases manifest.gates to a local variable; extend this test so the scan still covers those reads`,
+    );
+  }
+
+  assert.ok(readers.size > 0, 'sanity check: the scan should find readers at all');
+
+  for (const target of ['pi', 'dsh']) {
+    const produced = new Set(Object.keys(loadManifest(join(BRIDGE_DIR, '..'), target).gates));
+    for (const [key, where] of readers) {
+      assert.ok(
+        produced.has(key),
+        `the code reads gates.${key} (${[...where].join(', ')}) but the validator for "${target}" ` +
+          `does not produce it.\n` +
+          `  produced: ${[...produced].sort().join(', ')}\n` +
+          `  snake_case is the manifest JSON spelling; camelCase is what the rest of the code uses.`,
+      );
+    }
+  }
+});
+
+test('gates: raw snake_case keys are read only where the manifest is parsed', () => {
+  // `extension_dir` / `install_as` / `auto_load` / `mount_hint` are the on-disk
+  // spelling. If one leaks past manifest.js, some downstream reader is looking
+  // at raw JSON by accident — which works until someone normalises the reader,
+  // and then breaks in production instead of in CI.
+  const RAW_KEYS = ['extension_dir', 'install_as', 'auto_load', 'mount_hint'];
+  const leaks = [];
+  for (const file of readdirSync(join(BRIDGE_DIR, 'lib')).filter((f) => f.endsWith('.js'))) {
+    if (file === 'manifest.js') continue; // the one place allowed to see raw JSON
+    const source = stripComments(readFileSync(join(BRIDGE_DIR, 'lib', file), 'utf8'));
+    for (const key of RAW_KEYS) {
+      if (source.includes(key)) leaks.push(`bridge/lib/${file} reads the raw key ${key}`);
+    }
+  }
+  assert.deepEqual(leaks, [], leaks.join('\n'));
 });

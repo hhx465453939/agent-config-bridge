@@ -123,6 +123,19 @@ const validate = (manifest, file) => {
  * The gate block. Optional, but a harness only gets gates if it declares where
  * its extension mechanism looks; guessing that would install code into a
  * directory the harness never reads, which is the worst kind of silent failure.
+ *
+ * NAMING CONTRACT — read this before adding a field.
+ * The manifest JSON is user-facing data and uses snake_case (`auto_load`,
+ * `extension_dir`). Everything downstream is a JavaScript object and uses
+ * camelCase (`autoLoad`, `extensionDir`), matching the rest of this file
+ * (`home_hint` -> `homeHint`, `never_touch` -> `neverTouch`).
+ *
+ * This translation bit us once: the validator emitted `auto_load` while the
+ * planner read `autoLoad`, so a harness that needs manual mounting produced no
+ * warning at all — a check that silently never fires. If you add a field here,
+ * add it to BOTH sides, and extend the contract test in
+ * bridge/test/gates.test.js, which fails when a reader asks for a key this
+ * function does not produce.
  */
 const validateGates = (raw, file, targetName) => {
   if (raw === undefined || raw === null || raw.supported === false) {
@@ -145,11 +158,11 @@ const validateGates = (raw, file, targetName) => {
   return {
     supported: true,
     adapter,
-    install_as: installAs,
-    extension_dir: assertRelative(raw.extension_dir, 'gates.extension_dir', file),
+    installAs,
+    extensionDir: assertRelative(raw.extension_dir, 'gates.extension_dir', file),
     policy: raw.policy ?? {},
-    mount_hint: raw.mount_hint ?? null,
-    auto_load: raw.auto_load !== false,
+    mountHint: raw.mount_hint ?? null,
+    autoLoad: raw.auto_load !== false,
   };
 };
 
