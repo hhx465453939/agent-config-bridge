@@ -20,6 +20,41 @@ import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+/**
+ * Create a directory link, preferring the one form Windows can make without
+ * administrator rights.
+ *
+ * The fixtures need real links, because link semantics are what several tests
+ * assert (`~/.agents/skills` must stay a link; the guard must refuse to write
+ * through one). On Windows an unprivileged process cannot create a symbolic
+ * link at all — `symlinkSync` fails with EPERM unless Developer Mode is on or
+ * the shell is elevated — but it CAN create a junction, and Node reports a
+ * junction as a symbolic link (`lstat().isSymbolicLink()` is true,
+ * `readlinkSync` returns the target). So the junction form is tried first on
+ * win32 and the classic form everywhere else.
+ *
+ * The two are not identical: a junction can only point at a directory, and its
+ * link text is always resolved to an absolute path. Neither difference matters
+ * here — every link the fixtures make points at a directory, and the tests
+ * compare against absolute paths.
+ */
+export const makeDirLink = (target, path) => {
+  // `type` is a string, not an options object: `symlinkSync(target, path, {type:
+  // 'junction'})` is silently ignored as an unknown type and falls back to the
+  // privileged form, so the junction attempt has to pass the bare string.
+  const types = process.platform === 'win32' ? ['junction', undefined] : [undefined];
+  let lastError = null;
+  for (const type of types) {
+    try {
+      symlinkSync(target, path, type);
+      return;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+};
+
 export const write = (file, content, mode) => {
   mkdirSync(join(file, '..'), { recursive: true });
   writeFileSync(file, content);
@@ -90,7 +125,7 @@ export const makeSandbox = ({ install = ['pi', 'kimi'] } = {}) => {
     // fixture disagree with the manifest it copies in — and the manifest is the
     // thing under test.
     mkdirSync(join(home, '.agents'), { recursive: true });
-    symlinkSync(join(home, '.claude', 'skills'), join(home, '.agents', 'skills'));
+    makeDirLink(join(home, '.claude', 'skills'), join(home, '.agents', 'skills'));
     write(
       join(home, '.pi', 'agent', 'mcp.json'),
       `${JSON.stringify(

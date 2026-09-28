@@ -32,7 +32,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, posix, sep } from 'node:path';
+import { dirname, isAbsolute, join, posix, relative, sep } from 'node:path';
 
 export const DEFAULT_CONFIG = {
   /** Absolute paths whose files are in scope. Empty = auto-detect a VCS root. */
@@ -191,6 +191,22 @@ export const findRepoRoot = (filePath, exists, opts = {}) => {
 };
 
 /**
+ * Is `child` the same as `parent`, or inside it?
+ *
+ * Compared with `path.relative` rather than a string prefix. The prefix form
+ * ("does the path start with `<root>/`") only works when the separator is a
+ * literal forward slash, which is a POSIX assumption: on Windows every path
+ * uses `\`, so a configured project root never matched anything and the gate
+ * silently stopped applying to the projects it was configured for. The string
+ * form also gets `<root>-sibling` wrong, which the tests pin separately.
+ */
+const withinRoot = (parent, child) => {
+  if (child === parent) return true;
+  const rel = relative(parent, child);
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+};
+
+/**
  * Is this path in scope for the gate?
  * @returns {{inScope: boolean, reason: string, root: string|null}}
  */
@@ -201,9 +217,7 @@ export const scopeOf = (filePath, { config = DEFAULT_CONFIG, exists }) => {
   if (isExcluded(filePath, config)) return { inScope: false, reason: 'excluded path', root: null };
 
   if (Array.isArray(config.project_roots) && config.project_roots.length > 0) {
-    const root = config.project_roots.find(
-      (r) => filePath === r || filePath.startsWith(r.endsWith('/') ? r : `${r}/`),
-    );
+    const root = config.project_roots.find((r) => withinRoot(r, filePath));
     return root
       ? { inScope: true, reason: 'under a configured project root', root }
       : { inScope: false, reason: 'outside every configured project root', root: null };
@@ -313,9 +327,7 @@ const CHECKS = {
     const allowed = policy.config.write_roots ?? [];
     if (allowed.length === 0) return null;
     const path = input.path ?? '';
-    const inside = allowed.some(
-      (r) => path === r || path.startsWith(r.endsWith('/') ? r : `${r}/`),
-    );
+    const inside = allowed.some((r) => withinRoot(r, path));
     if (inside) return null;
     return {
       code: 'WRITE_OUTSIDE',

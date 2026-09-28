@@ -15,8 +15,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cpSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   DEFAULT_CONFIG,
@@ -63,6 +63,24 @@ const PI_ADAPTER_HERE = dirname(fileURLToPath(new URL('../gates/pi/index.js', im
 const noFs = () => false;
 
 /**
+ * Build a path that is absolute on the platform the suite is running on.
+ *
+ * The policy deliberately ignores relative paths (`scopeOf` returns "not an
+ * absolute path"), which is the right behaviour — but it means every fixture
+ * path has to be absolute to exercise anything at all. Hardcoding POSIX
+ * literals like `/repo/src/a.ts` silently disabled the whole fixture on
+ * Windows, where `path.isAbsolute('/repo/src/a.ts')` is false: the tests still
+ * "ran", they just stopped reaching the code they were written to check. This
+ * helper keeps the readable shape (they read like paths) while staying
+ * absolute everywhere.
+ *
+ *   abs('/repo', 'src/a.ts')  ->  /repo/src/a.ts      on POSIX
+ *                             ->  \repo\src\a.ts      on Windows
+ */
+const abs = (...segments) =>
+  join(sep, ...segments.flatMap((s) => String(s).split('/').filter(Boolean)));
+
+/**
  * The policy the adapter tests run with. `project_roots` is pinned to the fake
  * layout the tests use, so scoping is exercised for real rather than inherited
  * from whatever the shipped policy happens to say.
@@ -72,7 +90,7 @@ const TEST_POLICY = {
   reminder: 'ASK THE GRAPH FIRST',
   checks: ['graph-before-read'],
   config: {
-    project_roots: ['/repo', '/work'],
+    project_roots: [abs('/repo'), abs('/work')],
     max_blocks_per_session: 3,
     signal_ttl_ms: 1000,
   },
@@ -82,8 +100,11 @@ const policy = normalizePolicy(TEST_POLICY);
 
 const existsAlways = () => true;
 
-const read = (path) => ({ action: 'read', path, tool: 'read' });
-const write = (path, content) => ({ action: 'write', path, tool: 'write', content });
+// `read`/`write` normalise the fixture path, so the cases below can keep
+// spelling paths the readable way ("/repo/src/a.ts") and still be absolute on
+// the platform actually running the suite. See `abs`.
+const read = (path) => ({ action: 'read', path: abs(path), tool: 'read' });
+const write = (path, content) => ({ action: 'write', path: abs(path), tool: 'write', content });
 
 // ---------------------------------------------------------------------------
 // path predicates
@@ -113,17 +134,19 @@ test('policy: vendor trees stay out of scope', () => {
 });
 
 test('policy: scoping prefers configured roots, and falls back to repo detection', () => {
-  const config = { ...DEFAULT_CONFIG, project_roots: ['/work'] };
-  assert.equal(scopeOf('/work/a/b.ts', { config, exists: noFs }).inScope, true);
-  assert.equal(scopeOf('/elsewhere/b.ts', { config, exists: noFs }).inScope, false);
-  assert.equal(scopeOf('/work/README.md', { config, exists: noFs }).inScope, false, 'non-code stays out');
+  const work = abs('/work');
+  const config = { ...DEFAULT_CONFIG, project_roots: [work] };
+  assert.equal(scopeOf(abs('/work/a/b.ts'), { config, exists: noFs }).inScope, true);
+  assert.equal(scopeOf(abs('/elsewhere/b.ts'), { config, exists: noFs }).inScope, false);
+  assert.equal(scopeOf(abs('/work/README.md'), { config, exists: noFs }).inScope, false, 'non-code stays out');
   assert.equal(scopeOf('relative/path.ts', { config, exists: noFs }).inScope, false, 'relative paths are not scoped');
 
   // With no configured roots, a VCS marker decides.
   const bare = { ...DEFAULT_CONFIG, project_roots: [] };
-  const existsGit = (p) => p === '/work/proj/.git';
-  assert.equal(scopeOf('/work/proj/src/a.ts', { config: bare, exists: existsGit }).inScope, true);
-  assert.equal(scopeOf('/tmp/loose/a.ts', { config: bare, exists: noFs }).inScope, false);
+  const proj = abs('/work/proj');
+  const existsGit = (p) => p === join(proj, '.git');
+  assert.equal(scopeOf(join(proj, 'src/a.ts'), { config: bare, exists: existsGit }).inScope, true);
+  assert.equal(scopeOf(abs('/tmp/loose/a.ts'), { config: bare, exists: noFs }).inScope, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -174,7 +197,7 @@ test('gate: a stale signal no longer counts', () => {
 
 test('gate: reading a file this session wrote is always allowed', () => {
   const state = newSessionState();
-  recordWrite(state, '/repo/src/new.ts');
+  recordWrite(state, read('/repo/src/new.ts').path);
   const verdict = shouldBlock({
     policy,
     input: read('/repo/src/new.ts'),
@@ -222,12 +245,14 @@ test('gate: index-marker check blocks only when the index is genuinely absent', 
     checks: ['index-before-read'],
     config: { project_roots: [], signal_ttl_ms: 0 },
   });
+  const repo = abs('/repo');
+  const file = abs('/repo/src/a.ts');
   const state = newSessionState();
   const missing = shouldBlock({
     policy: indexPolicy,
-    input: read('/repo/src/a.ts'),
+    input: { action: 'read', path: file, tool: 'read' },
     state,
-    exists: (p) => p === '/repo/.git',
+    exists: (p) => p === join(repo, '.git'),
     now: 1,
   });
   assert.equal(missing.block, true);
@@ -235,9 +260,9 @@ test('gate: index-marker check blocks only when the index is genuinely absent', 
 
   const present = shouldBlock({
     policy: indexPolicy,
-    input: read('/repo/src/a.ts'),
+    input: { action: 'read', path: file, tool: 'read' },
     state: newSessionState(),
-    exists: (p) => p === '/repo/.git' || p === '/repo/.codebase-memory',
+    exists: (p) => p === join(repo, '.git') || p === join(repo, '.codebase-memory'),
     now: 1,
   });
   assert.equal(present.block, false);
@@ -253,7 +278,7 @@ test('gate: write protection only fires when write_roots are configured', () => 
   const on = normalizePolicy({
     name: 'w',
     checks: ['no-write-outside'],
-    config: { write_roots: ['/repo'] },
+    config: { write_roots: [abs('/repo')] },
   });
   assert.equal(
     shouldBlock({ policy: on, input: write('/etc/passwd', 'x'), state: newSessionState(), exists: noFs, now: 1 }).block,
@@ -426,8 +451,10 @@ test('gates: the installed layout really loads (the bug that shipped)', async ()
     cpSync(new URL('pi/index.js', gates), join(dir, 'pi', 'index.js'));
 
     // Awaited, not returned: a `return promise` inside try/finally would let the
-    // finally delete the tree before the assertions ever ran.
-    const mod = await import(join(dir, 'pi', 'index.js'));
+    // finally delete the tree before the assertions ever ran. `pathToFileURL` is
+    // what makes this import work on Windows, where a bare absolute path is
+    // interpreted as a URL with the drive letter as its scheme.
+    const mod = await import(pathToFileURL(join(dir, 'pi', 'index.js')).href);
     const handlers = new Map();
     mod.default({ on: (event, handler) => handlers.set(event, handler) });
     const notes = [];

@@ -17,7 +17,7 @@
  */
 
 import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import { businessError } from './errors.js';
 import { copyFile, ensureDir, hashFile, sha256, writeFile } from './fs-ops.js';
 import { snapshotsDir } from './paths.js';
@@ -217,7 +217,18 @@ export const recordFromPlan = (snapshot, { home, plan }) => {
   const seen = new Set();
   for (const action of plan.actions) {
     if (action.op === 'keep') continue;
-    const rel = action.to.slice(home.length + 1);
+    // POSIX-style and relative to home, spelled identically to what
+    // backupFiles() records. A snapshot entry is read back by revoke, which
+    // splits it on "/" — so storing the platform's separator here would make
+    // the recorded path and its reader disagree, and a manifest written on one
+    // platform would be unreadable on another.
+    const rel = relative(home, action.to).split(sep).join('/');
+    if (rel.startsWith('..') || isAbsolute(rel)) {
+      throw businessError(
+        'SNAPSHOT_OUTSIDE_HOME',
+        `${action.to} is not inside ${home}; refusing to record it in a snapshot.`,
+      );
+    }
     if (seen.has(rel)) continue;
     seen.add(rel);
 

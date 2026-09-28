@@ -26,6 +26,15 @@ import { listFiles } from './fs-ops.js';
 
 const PLACEHOLDER_RESIDUE = /\{\{[A-Z_]+\}\}/g;
 
+/**
+ * Does this platform have POSIX permission bits at all?
+ *
+ * Used to decide whether a "file mode must be 600" finding is a real problem or
+ * an unanswerable question. Kept as a constant so the tests can reason about it
+ * instead of hardcoding a platform check of their own.
+ */
+export const POSIX_PERMISSIONS = process.platform !== 'win32';
+
 export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
   const findings = [];
   const add = (level, code, message, hint = null) => findings.push({ level, code, message, hint });
@@ -62,11 +71,23 @@ export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
   // --- secrets ------------------------------------------------------------
   const secretsInfo = loadSecrets(home, process.env);
   const secretsPath = secretsFile(home);
-  if (existsSync(secretsPath)) {
+  if (existsSync(secretsPath) && POSIX_PERMISSIONS) {
+    // POSIX only. Windows has no mode bits: Node reports a fixed 0o666 for
+    // every ordinary file, so comparing against 600 there reported a perfectly
+    // private file as a failure — an error the user could not act on, since
+    // `chmod` cannot produce 600 on that platform either. Saying "not checked"
+    // is honest; reporting a fake violation is not.
     const mode = statSync(secretsPath).mode & 0o777;
     if (mode !== 0o600) {
       add('error', 'SECRETS_MODE', `${secretsPath} has mode ${mode.toString(8)}, expected 600`, `chmod 600 ${secretsPath}`);
     }
+  } else if (existsSync(secretsPath)) {
+    add(
+      'info',
+      'SECRETS_MODE_UNCHECKED',
+      `${secretsPath} permissions are not checked on this platform`,
+      'Windows protects files with ACLs, not POSIX mode bits',
+    );
   } else {
     add('info', 'SECRETS_ABSENT', `no secrets file at ${secretsPath} (fine unless an MCP entry uses \${VAR})`);
   }

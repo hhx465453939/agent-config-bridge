@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import * as api from '../lib/api.js';
-import { withSandbox, write } from './sandbox.js';
+import { withSandbox, write, makeDirLink } from './sandbox.js';
 import { listFiles } from '../lib/fs-ops.js';
 import { readState, STATUS, writeState } from '../lib/state.js';
 import { hashFile } from '../lib/fs-ops.js';
@@ -434,6 +434,11 @@ test('mcp: generated configuration is written with mode 600', async () => {
   await withSandbox({}, (sb) => {
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
     const mode = statSync(sb.path('.pi/agent/mcp.json')).mode & 0o777;
+    // Windows has no mode bits to assert: Node reports a constant 0o666 and
+    // there is no chmod that can produce 600 there. The guarantee is a POSIX
+    // one, and the platform that can express it is the platform that must
+    // prove it. `bridge/lib/doctor.js` skips the same check for the same reason.
+    if (process.platform === 'win32') return;
     assert.equal(mode, 0o600);
   });
 });
@@ -739,10 +744,13 @@ test('gates: a harness that auto-loads must NOT be reported as needing a manual 
 
 test('guard: refuses a managed destination that is a symlink', async () => {
   await withSandbox({ install: ['kimi'] }, (sb) => {
-    const { mkdirSync, symlinkSync } = require('node:fs');
+    const { mkdirSync } = require('node:fs');
     const elsewhere = join(sb.root, 'elsewhere');
     mkdirSync(elsewhere, { recursive: true });
-    symlinkSync(elsewhere, sb.path('.kimi-code/skills'));
+    // Through the sandbox helper, not symlinkSync directly: Windows can only
+    // make a junction without elevation, and the guard's job is to notice a
+    // linked destination, whichever flavour of link it is.
+    makeDirLink(elsewhere, sb.path('.kimi-code/skills'));
 
     assert.throws(
       () => api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet }),
@@ -761,9 +769,8 @@ test('guard: refuses a managed destination that is a symlink', async () => {
 
 test('guard: refuses a destination whose symlink resolves into the authoritative source', async () => {
   await withSandbox({ install: ['kimi'] }, (sb) => {
-    const { symlinkSync } = require('node:fs');
     // The exact shape seen in the wild: a target's skills path linked to the source.
-    symlinkSync(join(sb.home, '.claude', 'skills'), sb.path('.kimi-code/skills'));
+    makeDirLink(join(sb.home, '.claude', 'skills'), sb.path('.kimi-code/skills'));
 
     assert.throws(
       () => api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet }),
@@ -816,7 +823,7 @@ test('guard: a destination that merely shares a prefix with the source is allowe
 
 test('doctor: a symlinked destination is an error, not a warning', async () => {
   await withSandbox({ install: ['kimi'] }, (sb) => {
-    const { mkdirSync, symlinkSync } = require('node:fs');
+    const { mkdirSync } = require('node:fs');
     const elsewhere = join(sb.root, 'elsewhere');
     mkdirSync(elsewhere, { recursive: true });
     api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
@@ -824,7 +831,7 @@ test('doctor: a symlinked destination is an error, not a warning', async () => {
     // Break it after the fact, the way a user would.
     const { rmSync } = require('node:fs');
     rmSync(sb.path('.kimi-code/skills'), { recursive: true, force: true });
-    symlinkSync(elsewhere, sb.path('.kimi-code/skills'));
+    makeDirLink(elsewhere, sb.path('.kimi-code/skills'));
 
     const report = api.doctor({ repo: sb.repo, home: sb.home });
     assert.equal(report.ok, false);
