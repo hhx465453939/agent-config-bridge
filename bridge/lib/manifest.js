@@ -18,7 +18,6 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { businessError, envError } from './errors.js';
 import { targetPath, targetsDir } from './paths.js';
-
 const MODES = new Set(['copy', 'copy-tree', 'copy-flat', 'mcp-json', 'mcp-toml', 'link']);
 const KINDS = new Set(['skill', 'command', 'agent', 'rules-doc', 'mcp']);
 
@@ -43,6 +42,37 @@ const assertRelative = (value, field, target) => {
     throw businessError('MANIFEST_INVALID', `${target}: "${field}" must not contain ".." (${value})`);
   }
   return value;
+};
+
+/**
+ * Per-server keys to inject into a JSON MCP target (pi's `directTools` is the
+ * motivating example). Optional, and only for `mcp-json`: silently ignoring it
+ * on another mode would look like the bridge wrote the setting when it did
+ * not, which is the failure this whole file exists to make impossible.
+ *
+ * The bridge owns these exact keys only. Everything else in a server entry,
+ * including keys the user added by hand, is preserved by the emitter's merge.
+ */
+const validateServerSettings = (rule, where) => {
+  if (rule.server_settings === undefined || rule.server_settings === null) return null;
+  if (rule.kind !== 'mcp' || rule.mode !== 'mcp-json') {
+    throw businessError(
+      'MANIFEST_INVALID',
+      `${where}: "server_settings" is only supported on an mcp rule with mode "mcp-json"`,
+    );
+  }
+  const raw = rule.server_settings;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw businessError('MANIFEST_INVALID', `${where}: "server_settings" must be an object keyed by server name`);
+  }
+  const settings = {};
+  for (const [server, value] of Object.entries(raw)) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw businessError('MANIFEST_INVALID', `${where}: "server_settings.${server}" must be an object`);
+    }
+    settings[server] = value;
+  }
+  return settings;
 };
 
 const validate = (manifest, file) => {
@@ -71,6 +101,7 @@ const validate = (manifest, file) => {
       from: assertRelative(rule.from, 'from', where),
       to: assertRelative(rule.to, 'to', where),
       note: rule.note ?? null,
+      serverSettings: validateServerSettings(rule, where),
     };
   });
 

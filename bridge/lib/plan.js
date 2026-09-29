@@ -24,7 +24,7 @@ import { classifyMcpServer, scanSource } from './source.js';
 import { emitMcpJson, emitMcpToml, readIfExists } from './mcp.js';
 import { assertNoMissing, loadSecrets } from './secrets.js';
 import { agentSnapshotDir, STATUS } from './state.js';
-import { isInside, targetPath } from './paths.js';
+import { claudeDir, isInside, targetPath } from './paths.js';
 
 const OP = { ADD: 'add', UPDATE: 'update', KEEP: 'keep', REMOVE: 'remove' };
 
@@ -70,18 +70,45 @@ export const planTarget = ({ home, repo, manifest, source, secrets, stateEntry, 
 
   for (const rule of manifest.managed) {
     if (rule.mode === 'link') {
-      // The destination is a symlink into the source by declaration. There is
-      // nothing to copy and nothing to compare: the agent reads the source
-      // directly, so a change there is visible immediately with no apply step.
-      // assertLinkRulesHold above already verified the link is honest.
-      actions.push({
-        kind: rule.kind,
-        op: OP.KEEP,
-        from: join(home, `.claude/${rule.from}`),
-        to: ruleDest(rule, home),
-        note: `declared link to ${rule.from}`,
-        link: true,
-      });
+      // The destination is a symlink into the source by declaration. When it
+      // already exists there is nothing to copy and nothing to compare: the
+      // agent reads the source directly, so a change there is visible
+      // immediately with no apply step. assertLinkRulesHold above verified the
+      // link is honest — or absent.
+      //
+      // When it is absent, the bridge CREATES it. That is the step the user had
+      // to perform by hand before adopting (and the step that made `adopt pi`
+      // fail on a fresh machine with "the destination does not exist"). A
+      // junction is used on Windows because an unprivileged process can create
+      // one; `makeDirLink` picks the form.
+      const source = join(claudeDir(home), rule.from);
+      const dest = ruleDest(rule, home);
+      if (existsSync(dest)) {
+        actions.push({
+          kind: rule.kind,
+          op: OP.KEEP,
+          from: source,
+          to: dest,
+          note: `declared link to ${rule.from}`,
+          link: true,
+        });
+      } else if (existsSync(source)) {
+        actions.push({
+          kind: rule.kind,
+          op: OP.ADD,
+          from: source,
+          to: dest,
+          note: `create link to ${rule.from}`,
+          link: true,
+          linkTarget: source,
+        });
+      } else {
+        // Nothing to link to. Say so instead of surfacing an ENOENT from the
+        // middle of a write. The target keeps its own directory either way.
+        warnings.push(
+          `source ${rule.from} does not exist; ${manifest.name} keeps its own ${rule.kind} directory`,
+        );
+      }
       continue;
     }
 
@@ -148,6 +175,7 @@ export const planTarget = ({ home, repo, manifest, source, secrets, stateEntry, 
         derivedNames: stateEntry?.derivedMcp ?? [],
         secrets,
         prune,
+        serverSettings: rule.serverSettings ?? null,
       });
       if (result.unsupported.length > 0) info.unsupportedMcp.push(...result.unsupported);
       info.derivedMcp = result.derived;

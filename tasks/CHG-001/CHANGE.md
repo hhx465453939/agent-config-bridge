@@ -19,7 +19,7 @@ evidence_date: 2026-09-27
 | 斜杠命令 | `~/.claude/commands/` | `~/.pi/agent/prompts/` | — | — | `~/.kimi-code/commands/` |
 | 子 agent | `~/.claude/agents/` | — | — | — | — |
 | 全局规则文档 | `~/CLAUDE.md` | `~/AGENTS.md` | `~/.codex/AGENTS.md` | `~/.gemini/GEMINI.md` | `~/.kimi-code/AGENTS.md` |
-| MCP 声明 | `~/.claude.json` | `~/.pi/agent/mcp.json` | `~/.codex/config.toml` | `~/.gemini/settings.json` | `~/.kimi-code/mcp.json` |
+| MCP 声明 | `~/.claude.json` | `~/.pi/agent/mcp-adapter.json`（v3 起；旧 `mcp.json`） | `~/.codex/config.toml` | `~/.gemini/settings.json` | `~/.kimi-code/mcp.json` |
 | 硬闸门/扩展 | `~/.claude/hooks/` | `~/.pi/agent/extensions/` | — | — | — |
 
 **现状代价（本机实测）**：skill 源有 69 个目录形式 + 34 个平铺单文件（并存冗余）；`~/.codex/skills/` 只有 58 项、`~/.gemini/skills/` 只有 55 项，与 Claude 侧 106 项不一致；全局规则文档出现两套不同 md5 的分叉版本（`~/AGENTS.md` 与 `~/CLAUDE.md` 相同 = 31804 字节；`~/.codex/AGENTS.md` 与 `~/.gemini/GEMINI.md` 相同 = 28233 字节，**内容更旧**）；MCP 只登记在 Claude 与 Gemini 两端，Codex/pi 三端缺失或含明文密钥。
@@ -57,7 +57,7 @@ evidence_date: 2026-09-27
 * S2 实现桥接器 CLI：`status` / `adopt` / `revoke` / `plan` / `apply` / `diff` / `doctor` / `rollback`；
 * S3 **按 agent 选择与撤回的状态机**：`native（默认，不碰）` / `bridged（已 adopt）` / `revoked（已撤回，恢复原生）`；
 * S4 **adopt 前自动快照**：为每个 agent 记录其被接管前的配置快照，使 `revoke` 能真正恢复原样；
-* S5 MCP 配置**格式转换**：Claude 的 `mcpServers` JSON → Codex TOML、Gemini settings JSON、pi `mcp.json`、Kimi JSON；
+* S5 MCP 配置**格式转换**：Claude 的 `mcpServers` JSON → Codex TOML、Gemini settings JSON、pi `mcp-adapter.json`、Kimi JSON；
 * S6 **密钥外置**：仓库只存 `${VAR}` 占位符，真实值来自仓库外的 `secrets.env`，缺失即 fail-closed；
 * S7 **保留私有配置**：桥接只覆盖共享维度，agent 自身特有配置（模型/主题/快捷键/权限/扩展等）原样保留；
 * S8 幂等性、备份与回滚、`--dry-run` 优先的安全语义；
@@ -139,3 +139,11 @@ evidence_date: 2026-09-27
 ## 12. 下一路由（Next Route）
 
 `project-health-audit` → `prd` → `ai-spec`（本 CHG 已把 SPEC 骨架同时产出）。
+
+## 13. 变更记录（Change Log）
+
+| 日期 | 变更 | 说明 |
+|---|---|---|
+| 2026-09-29 | C1 平台约束修订：**Windows 原生纳入支持** | 技能链接改为 junction（免管理员权限），并为 `link` 规则增加自动创建与声明式校验（指向错误仍硬拒）；CI 增加 `windows-latest`。原 C1 中"Windows 明确列为非目标"作废；复制式桥接仍是各端默认，只有 manifest 显式声明的链接才走链接。 |
+| 2026-09-29 | S10 硬闸门落地为三层 fallback（graph-first / index-before-read / index-freshness） | 由真实 Linux 参考实现移植，拦截文案与逐轮提醒为中文，并加入 Windows 路径归一化；同时识别 pi-mcp-adapter 代理模式下的图谱查询。 |
+| 2026-09-29 | pi MCP 目标路径随 pi-mcp-adapter v3 改名 | 适配器 v3 起只读 `~/.pi/agent/mcp-adapter.json`（`mcp.json` 留给 pi 未来的内置 MCP）；manifest、测试与文档同步更新。 |

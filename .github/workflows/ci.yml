@@ -12,10 +12,16 @@ jobs:
   test:
     name: test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # Git Bash on Windows too: the syntax check and the secret scanner are
+        # shell scripts, and running them through pwsh would not test what the
+        # macOS/Linux jobs test.
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         node: ['20', '22', '24']
     steps:
       - uses: actions/checkout@v4

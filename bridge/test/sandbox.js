@@ -63,7 +63,7 @@ export const write = (file, content, mode) => {
 
 export const read = (file) => readFileSync(file, 'utf8');
 
-export const makeSandbox = ({ install = ['pi', 'kimi'] } = {}) => {
+export const makeSandbox = ({ install = ['pi', 'kimi'], linkSkills = true } = {}) => {
   const root = mkdtempSync(join(tmpdir(), 'acb-test-'));
   const home = join(root, 'home');
   const repo = join(root, 'repo');
@@ -121,13 +121,15 @@ export const makeSandbox = ({ install = ['pi', 'kimi'] } = {}) => {
     write(join(home, '.pi', 'agent', 'APPEND_SYSTEM.md'), '# private system prompt tail\n');
     write(join(home, '.pi', 'agent', 'pi-router.json'), '{ "route": "private" }\n');
     // pi.json declares its skills rule as a LINK, so the fixture must look the
-    // way a real machine looks. Creating a real directory here would make the
+    // way a real machine looks — unless the test is specifically about the
+    // missing-link case (`linkSkills: false`), where the bridge is expected to
+    // create the link itself. Creating a real directory here would make the
     // fixture disagree with the manifest it copies in — and the manifest is the
     // thing under test.
     mkdirSync(join(home, '.agents'), { recursive: true });
-    makeDirLink(join(home, '.claude', 'skills'), join(home, '.agents', 'skills'));
+    if (linkSkills) makeDirLink(join(home, '.claude', 'skills'), join(home, '.agents', 'skills'));
     write(
-      join(home, '.pi', 'agent', 'mcp.json'),
+      join(home, '.pi', 'agent', 'mcp-adapter.json'),
       `${JSON.stringify(
         { mcpServers: { 'pi-only': { command: 'pi-private', args: [], env: {} } } },
         null,

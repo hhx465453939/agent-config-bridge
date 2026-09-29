@@ -4,14 +4,14 @@
   "detect": [".pi"],
   "home_hint": "~/.pi",
   "verified": true,
-  "notes": "Paths verified against pi's own documentation (skills.md, configuration.md, prompt-templates.md) and the pi-mcp-adapter README. Skills are DECLARED AS A LINK rather than copied: pi documents ~/.agents/skills/ as a natively supported location, and sharing it by symlink gives pi the source's skills with no duplication and no drift to reconcile. The rules document goes to ~/AGENTS.md rather than ~/.pi/agent/AGENTS.md because pi loads context files from both the agent directory and the working-directory chain, so a second copy under ~/.pi would make the model read the same rules twice.",
+  "notes": "Paths verified against pi's own documentation (skills.md, configuration.md, prompt-templates.md) and the pi-mcp-adapter README (v3.2). Skills are DECLARED AS A LINK rather than copied: pi documents ~/.agents/skills/ as a natively supported location, and sharing it by link gives pi the source's skills with no duplication and no drift to reconcile. The bridge CREATES that link (a symlink on POSIX, a junction on Windows) on the first adopt when it is missing, and recreates it if it was deleted. The rules document goes to ~/AGENTS.md rather than ~/.pi/agent/AGENTS.md because pi loads context files from both the agent directory and the working-directory chain, so a second copy under ~/.pi would make the model read the same rules twice. NOTE: pi 0.87 has no built-in MCP support; MCP reaches pi through the pi-mcp-adapter package, which since v3 reads ~/.pi/agent/mcp-adapter.json (it renamed the file from mcp.json and reserves mcp.json for a future pi built-in). Install or update it with `pi install npm:pi-mcp-adapter`.",
   "managed": [
     {
       "kind": "skill",
       "from": "skills",
       "to": ".agents/skills",
       "mode": "link",
-      "note": "declared link: ~/.agents/skills should already be a symlink to ~/.claude/skills. pi's docs support ~/.agents/skills natively, so this path is shared rather than copied: changes in the source are visible immediately, nothing is duplicated, and there is no drift to reconcile. If you would rather the bridge own a real copy, change mode to copy-tree (then the link must be removed first — the planner refuses to write through one)."
+      "note": "declared link: ~/.agents/skills is a link to ~/.claude/skills (a junction on Windows). pi's docs support ~/.agents/skills natively, so this path is shared rather than copied: changes in the source are visible immediately, nothing is duplicated, and there is no drift to reconcile. The bridge creates the link when it is missing, so a fresh machine needs no manual ln -s. If you would rather the bridge own a real copy, change mode to copy-tree (remove the link first — the planner refuses to write through one)."
     },
     {
       "kind": "command",
@@ -30,8 +30,15 @@
     {
       "kind": "mcp",
       "from": "@mcpServers",
-      "to": ".pi/agent/mcp.json",
-      "mode": "mcp-json"
+      "to": ".pi/agent/mcp-adapter.json",
+      "mode": "mcp-json",
+      "note": "pi-mcp-adapter (v3+) reads this file. codebase-memory-mcp gets directTools so its query and indexing tools appear first-class in pi's tool list — the hard gate keys off those names, and proxy-only mode would report every call as `mcp`. lifecycle=eager connects at startup so the tool catalog (and the direct-tool registration) is populated without a first manual `mcp({connect})` call.",
+      "server_settings": {
+        "codebase-memory-mcp": {
+          "directTools": true,
+          "lifecycle": "eager"
+        }
+      }
     }
   ],
   "gates": {

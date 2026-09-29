@@ -174,13 +174,13 @@ $EDITOR ~/.config/agent-config-bridge/secrets.env
 * **不做运行时数据同步**：会话、历史、缓存、凭据不在范围内。
 * **不做跨机器实时同步**：这是单机工具；换机器时在目标机器上跑同一份 `apply`。
 * **不替你做决定**：默认不 adopt 任何 agent；要不要桥接、撤回，都由你显式发起。
-* **不支持 Windows 原生**（路径约定与符号链接语义差异大）。
+* **平台**：Linux / macOS / Windows 原生均支持。Windows 上的技能链接用 **junction**（无需管理员权限，由工具自己创建），其余受管内容在所有平台走同一套复制 + 哈希比对；CI 在三个平台跑同一套测试。
 
 ## 与符号链接方案的区别
 
-把通用技能目录软链到 Claude 的技能目录，确实能"少抄一遍"，但：无法逐文件审计（说不清哪几个文件漂移了）、无法回滚、Windows 不可用、还可能被目标端工具整目录重写后静默失效。
+手工把通用技能目录软链到 Claude 的技能目录，确实能"少抄一遍"，但：无法逐文件审计（说不清哪几个文件漂移了）、无法回滚、还可能被目标端工具整目录重写后静默失效。
 
-本工具用**复制 + 逐文件哈希比对**，换来可审计（`diff`）、可回滚（`rollback`）、可撤回（`revoke`）——代价是 Claude 侧改动需要跑一次 `apply` 才生效（本项目不常驻、不监听）。
+本工具默认用**复制 + 逐文件哈希比对**，换来可审计（`diff`）、可回滚（`rollback`）、可撤回（`revoke`）——代价是 Claude 侧改动需要跑一次 `apply` 才生效（本项目不常驻、不监听）。唯一的例外是 pi 的 `~/.agents/skills`：它是一条**声明式链接**（manifest 里显式声明、`doctor` 会校验指向），由工具在 adopt 时自动创建（POSIX 符号链接 / Windows junction）、被快照、可撤回——不是一条没人管的软链。
 
 ## 目录结构
 
@@ -188,8 +188,8 @@ $EDITOR ~/.config/agent-config-bridge/secrets.env
 bridge/         桥接器本体（Node 20+，零第三方依赖）
 templates/      环境变量与目标端配置模板
 docs/           架构决策记录（ADR）与使用手册
+bridge/test/    单元测试与 fixture（node --test，无框架依赖）
 tasks/          按变更编号归档的 CHANGE / HEALTH / PRD / SPEC / TRACEABILITY
-tests/          单元测试与 fixture
 ```
 
 ## 许可

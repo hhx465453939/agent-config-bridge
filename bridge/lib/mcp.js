@@ -92,7 +92,14 @@ export const mergeJsonServers = ({ existing, classified, derivedNames, secrets, 
   return { servers, missing, unsupported, removed };
 };
 
-export const emitMcpJson = ({ existingText, classified, derivedNames, secrets, prune }) => {
+export const emitMcpJson = ({
+  existingText,
+  classified,
+  derivedNames,
+  secrets,
+  prune,
+  serverSettings = null,
+}) => {
   let existing = {};
   if (existingText && existingText.trim() !== '') {
     try {
@@ -109,6 +116,18 @@ export const emitMcpJson = ({ existingText, classified, derivedNames, secrets, p
     secrets,
     prune,
   });
+
+  // Per-server keys the manifest declares (pi's `directTools`, for example).
+  // Only names the source actually derives are touched: a stale override must
+  // not resurrect a server that is gone from the source, especially under
+  // --prune, where the user explicitly asked for stale entries to be removed.
+  if (serverSettings) {
+    for (const [name, settings] of Object.entries(serverSettings)) {
+      if (!servers[name]) continue;
+      servers[name] = { ...servers[name], ...settings };
+    }
+  }
+
   const next = { ...existing, mcpServers: servers };
   return {
     text: `${JSON.stringify(next, null, 2)}\n`,

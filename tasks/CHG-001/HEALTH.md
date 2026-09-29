@@ -39,7 +39,7 @@ scope: 新建仓库（greenfield）；被治理对象 = 本机 5 个 agent 的�
 | **During（本次变更加以解决）** | skill 跨端漂移；规则文档分叉；MCP 覆盖不全；MCP 明文凭据 | 纳入 CHG-001 范围（S1~S4） |
 | **During（本次变更加以隔离）** | 源目录里的备份文件与平铺冗余；一次性老脚本 | **不删除**（用户资产，可能是他域在途改动），桥接器显式忽略并报告 |
 | **After（变更后再议）** | 是否淘汰 `sync-skill-pool.sh` / `deploy-skills.py`；是否把 Claude `output-styles/` 纳入 | 交付后由 `iteration-manager` 决策 |
-| **Accepted（明确接受）** | Windows 原生不支持；不做跨机同步 | 已写入 CHANGE.md 非目标 |
+| **Accepted（明确接受）** | ~~Windows 原生不支持~~（2026-09-29 起支持：junction 链接 + 三平台 CI；见 CHANGE.md 变更记录）；不做跨机同步 | 原约束已修订 |
 
 ## 4. 架构热点 / 依赖与安全风险
 

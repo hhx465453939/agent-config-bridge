@@ -14,7 +14,7 @@
 
 import { existsSync } from 'node:fs';
 import { businessError } from './errors.js';
-import { backupFiles, copyFile, ensureDir, removePath, writeFile } from './fs-ops.js';
+import { backupFiles, copyFile, ensureDir, makeDirLink, removePath, writeFile } from './fs-ops.js';
 import { backupsDir } from './paths.js';
 import { createSnapshot, recordFromPlan } from './snapshot.js';
 import { OP } from './plan.js';
@@ -58,7 +58,13 @@ export const executeTargetPlan = ({ home, repo, plan, reason }) => {
       case OP.ADD:
       case OP.UPDATE:
         try {
-          if (action.content !== undefined) {
+          if (action.linkTarget) {
+            // A `link` rule whose destination was missing: create the link.
+            // removePath is link-aware, so a damaged leftover is unlinked
+            // without touching whatever it pointed at.
+            removePath(action.to);
+            makeDirLink(action.linkTarget, action.to);
+          } else if (action.content !== undefined) {
             writeFile(action.to, action.content, action.mode ?? 0o600);
           } else {
             copyFile(action.from, action.to);

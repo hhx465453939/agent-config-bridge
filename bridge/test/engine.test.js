@@ -9,7 +9,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
 
 import * as api from '../lib/api.js';
 import { withSandbox, write, makeDirLink } from './sandbox.js';
@@ -20,6 +21,13 @@ import { loadManifest } from '../lib/manifest.js';
 import { stripTomlMcpSections } from '../lib/mcp.js';
 
 const quiet = { info() {}, say() {}, ok() {}, warn() {}, error() {}, payload() {} };
+
+// Node's test runner may start executing registered tests before this module's
+// last statement has run. A top-level `await import()` near the bottom used to
+// make `treeSnapshot` (declared below it) unreachable from earlier tests — an
+// intermittent "Cannot access 'treeSnapshot' before initialization". A static
+// import has no such window.
+const require = createRequire(import.meta.url);
 
 // ---------------------------------------------------------------------------
 // status
@@ -134,6 +142,97 @@ test('adopt: bridges only the named agent and leaves the other untouched', async
   });
 });
 
+// ---------------------------------------------------------------------------
+// declared links — creating the destination the user used to have to make by hand
+// ---------------------------------------------------------------------------
+
+test('adopt: creates the declared skills link when the destination is missing', async () => {
+  await withSandbox({ linkSkills: false }, (sb) => {
+    assert.equal(existsSync(sb.path('.agents/skills')), false, 'fixture starts without the link');
+
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+
+    const { lstatSync, readlinkSync } = require('node:fs');
+    const dest = sb.path('.agents/skills');
+    assert.equal(lstatSync(dest).isSymbolicLink(), true, 'the bridge created a link, not a copy');
+    assert.equal(readlinkSync(dest), join(sb.home, '.claude', 'skills'), 'and it points at the source');
+    assert.equal(
+      readFileSync(join(dest, 'beta', 'SKILL.md'), 'utf8'),
+      readFileSync(join(sb.home, '.claude', 'skills', 'beta', 'SKILL.md'), 'utf8'),
+      'the source skills are reachable through it',
+    );
+  });
+});
+
+test('adopt: a missing declared link is one add in the preview, and nothing is written', async () => {
+  await withSandbox({ linkSkills: false }, (sb) => {
+    const before = treeSnapshot(sb.home);
+    const preview = api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], dryRun: true, log: quiet });
+    const pi = preview.targets.find((t) => t.name === 'pi');
+    const linkAction = pi.actions.find((a) => a.link);
+    assert.ok(linkAction, 'the missing link appears in the preview');
+    assert.equal(linkAction.op, 'add');
+    assert.equal(linkAction.to, sb.path('.agents/skills'));
+    assert.equal(linkAction.linkTarget, join(sb.home, '.claude', 'skills'));
+    assert.deepEqual(treeSnapshot(sb.home), before, 'a dry run writes nothing');
+  });
+});
+
+test('apply: recreates the declared link if it was deleted', async () => {
+  await withSandbox({}, (sb) => {
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    dropDirLink(sb.path('.agents/skills'));
+    assert.equal(existsSync(sb.path('.agents/skills')), false);
+
+    api.apply({ repo: sb.repo, home: sb.home, log: quiet });
+
+    const { lstatSync } = require('node:fs');
+    assert.equal(lstatSync(sb.path('.agents/skills')).isSymbolicLink(), true, 'the link is back');
+  });
+});
+
+test('revoke: removes a skills link the bridge created, and nothing else', async () => {
+  await withSandbox({ linkSkills: false }, (sb) => {
+    const before = treeSnapshot(sb.home);
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    api.revoke({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+
+    assert.equal(existsSync(sb.path('.agents/skills')), false, 'the created link is gone');
+    assert.deepEqual(treeSnapshot(sb.home), before, 'the tree is exactly as it was');
+  });
+});
+
+test('guard: a declared link with the wrong shape is refused, and says how to fix it', async () => {
+  await withSandbox({ linkSkills: false }, (sb) => {
+    // (a) a real directory where the link belongs
+    mkdirSync(sb.path('.agents/skills'), { recursive: true });
+    assert.throws(
+      () => api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet }),
+      (err) => {
+        assert.equal(err.code, 'TARGET_LINK_WRONG');
+        assert.match(err.message, /it is a real directory\/file, not a symlink/);
+        return true;
+      },
+    );
+
+    // (b) a link that points somewhere else
+    rmSync(sb.path('.agents/skills'), { recursive: true, force: true });
+    const elsewhere = join(sb.root, 'elsewhere');
+    mkdirSync(elsewhere, { recursive: true });
+    makeDirLink(elsewhere, sb.path('.agents/skills'));
+    assert.throws(
+      () => api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet }),
+      (err) => {
+        assert.equal(err.code, 'TARGET_LINK_WRONG');
+        assert.match(err.message, /it points at/);
+        assert.match(err.message, /mklink \/J|ln -s/, 'the fix hint matches the platform');
+        return true;
+      },
+    );
+    assert.equal(readState(sb.repo).agents.pi, undefined, 'nothing was adopted');
+  });
+});
+
 test('skills: flat <name>.md duplicates are reported but never copied', async () => {
   await withSandbox({ install: ['kimi'] }, (sb) => {
     api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet });
@@ -174,9 +273,9 @@ test('adopt: writes a snapshot before anything is overwritten', async () => {
 
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
     assert.equal(manifest.agent, 'pi');
-    // The pi mcp.json existed with a private server, so it must be recorded as
-    // overwritten and its previous bytes preserved.
-    const mcpEntry = manifest.entries.find((e) => e.path.endsWith('.pi/agent/mcp.json'));
+    // The pi mcp-adapter.json existed with a private server, so it must be
+    // recorded as overwritten and its previous bytes preserved.
+    const mcpEntry = manifest.entries.find((e) => e.path.endsWith('.pi/agent/mcp-adapter.json'));
     assert.equal(mcpEntry.action, 'overwritten');
     const stored = join(sb.repo, '.bridge', 'snapshots', 'pi', id, 'files', mcpEntry.path);
     assert.equal(hashFile(stored), mcpEntry.sha256);
@@ -297,8 +396,13 @@ test('revoke: refuses to run on an incomplete snapshot', async () => {
         assert.equal(err.code, 'SNAPSHOT_INCOMPLETE');
         assert.match(err.message, /cannot reconstruct the pre-adopt state, refusing to revoke/);
         // The message must name the exact missing file, otherwise the user has
-        // no way to repair the snapshot.
-        assert.match(err.message, /missing stored copy of .+mcp\.json/);
+        // no way to repair the snapshot. Asserted against the victim the test
+        // actually deleted, not a hard-coded filename that drifts when a
+        // manifest destination is renamed.
+        assert.ok(
+          err.message.includes(`missing stored copy of ${victim.path}`),
+          `expected the message to name ${victim.path}, got: ${err.message}`,
+        );
         return true;
       },
     );
@@ -393,7 +497,7 @@ test('mcp: derived servers reach the target and preserve the target own servers'
   await withSandbox({}, (sb) => {
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
 
-    const emitted = JSON.parse(readFileSync(sb.path('.pi/agent/mcp.json'), 'utf8'));
+    const emitted = JSON.parse(readFileSync(sb.path('.pi/agent/mcp-adapter.json'), 'utf8'));
     const names = Object.keys(emitted.mcpServers);
 
     assert.ok(names.includes('local-tool'));
@@ -404,10 +508,63 @@ test('mcp: derived servers reach the target and preserve the target own servers'
   });
 });
 
+test('mcp: manifest server_settings are merged into a derived server and survive apply', async () => {
+  await withSandbox({}, (sb) => {
+    sb.findAndReplaceManifests((m) => {
+      if (m.name !== 'pi') return null;
+      m.managed = m.managed.map((r) =>
+        r.kind === 'mcp' ? { ...r, server_settings: { 'local-tool': { directTools: true } } } : r,
+      );
+      return m;
+    });
+
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    const file = sb.path('.pi/agent/mcp-adapter.json');
+    let emitted = JSON.parse(readFileSync(file, 'utf8'));
+    assert.equal(emitted.mcpServers['local-tool'].directTools, true, 'the declared setting is written');
+    assert.equal(emitted.mcpServers['local-tool'].command, 'npx', 'and the source-derived keys stay');
+
+    // A later apply must not fight the merge: the setting is part of what the
+    // bridge derives, so the refreshed file converges instead of oscillating.
+    api.apply({ repo: sb.repo, home: sb.home, log: quiet });
+    emitted = JSON.parse(readFileSync(file, 'utf8'));
+    assert.equal(emitted.mcpServers['local-tool'].directTools, true);
+    const diff = api.diff({ repo: sb.repo, home: sb.home });
+    assert.equal(
+      diff.targets.find((t) => t.name === 'pi').actions.length,
+      0,
+      'a converged apply leaves no drift',
+    );
+  });
+});
+
+test('manifest: server_settings are refused outside an mcp-json rule', async () => {
+  await withSandbox({ install: ['kimi'] }, (sb) => {
+    sb.findAndReplaceManifests((m) => {
+      if (m.name !== 'kimi') return null;
+      m.managed = m.managed.map((r) =>
+        r.kind === 'skill' ? { ...r, server_settings: { anything: {} } } : r,
+      );
+      return m;
+    });
+
+    // Refused at plan time with the manifest named, rather than silently
+    // dropping a setting the user believes was applied.
+    assert.throws(
+      () => api.adopt({ repo: sb.repo, home: sb.home, names: ['kimi'], log: quiet }),
+      (err) => {
+        assert.equal(err.code, 'MANIFEST_INVALID');
+        assert.match(err.message, /server_settings/);
+        return true;
+      },
+    );
+  });
+});
+
 test('mcp: secrets are expanded from a file outside the repository', async () => {
   await withSandbox({}, (sb) => {
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
-    const emitted = JSON.parse(readFileSync(sb.path('.pi/agent/mcp.json'), 'utf8'));
+    const emitted = JSON.parse(readFileSync(sb.path('.pi/agent/mcp-adapter.json'), 'utf8'));
     assert.equal(emitted.mcpServers['secret-tool'].env.API_KEY, 'not-a-real-key');
     assert.equal(emitted.mcpServers['secret-tool'].env.EMAIL, 'nobody@example.com');
   });
@@ -433,7 +590,7 @@ test('mcp: a referenced but missing variable aborts the whole run', async () => 
 test('mcp: generated configuration is written with mode 600', async () => {
   await withSandbox({}, (sb) => {
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
-    const mode = statSync(sb.path('.pi/agent/mcp.json')).mode & 0o777;
+    const mode = statSync(sb.path('.pi/agent/mcp-adapter.json')).mode & 0o777;
     // Windows has no mode bits to assert: Node reports a constant 0o666 and
     // there is no chmod that can produce 600 there. The guarantee is a POSIX
     // one, and the platform that can express it is the platform that must
@@ -846,7 +1003,16 @@ test('doctor: a symlinked destination is an error, not a warning', async () => {
 // helpers
 // ---------------------------------------------------------------------------
 
-const require = (await import('node:module')).createRequire(import.meta.url);
+/** Remove a directory link without ever following it. */
+const dropDirLink = (path) => {
+  const { lstatSync, rmdirSync, unlinkSync } = require('node:fs');
+  const st = lstatSync(path);
+  assert.equal(st.isSymbolicLink(), true, `${path} should be a link`);
+  // Windows: rmdir removes a directory reparse point without touching its
+  // target. POSIX: unlink removes the symlink itself.
+  if (process.platform === 'win32') rmdirSync(path);
+  else unlinkSync(path);
+};
 
 const treeSnapshot = (root) => {
   const out = {};

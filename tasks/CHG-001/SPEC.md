@@ -229,7 +229,7 @@ options:
 
 | 目标 | 文件 | 形态 |
 |---|---|---|
-| pi | `~/.pi/agent/mcp.json` | `{"mcpServers": {...}}`；**保留** pi 私有字段（如 `directTools`） |
+| pi | `~/.pi/agent/mcp-adapter.json` | `{"mcpServers": {...}}`；**保留** pi 私有字段（如 `directTools`）；v3 起 pi-mcp-adapter 使用此文件名（旧 `mcp.json` 留给 pi 未来的内置 MCP） |
 | Codex | `~/.codex/config.toml` | `[mcp_servers.<name>]` + `command`/`args`/`env` |
 | Gemini | `~/.gemini/settings.json` | 与权威源同构的 `mcpServers`（**保留**该文件其它键） |
 | Kimi | `~/.kimi-code/mcp.json` | 同构 JSON |

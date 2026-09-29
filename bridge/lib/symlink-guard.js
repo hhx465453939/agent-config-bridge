@@ -186,12 +186,18 @@ export const verifyLinkRule = ({ home, rule }) => {
 
 /**
  * Throw when a `link` rule does not describe reality.
+ *
+ * An ABSENT destination is allowed: the planner emits a create-link action for
+ * it (a junction on Windows, a symlink elsewhere). Every other mismatch — a
+ * real directory in the link's place, or a link pointing somewhere else — is a
+ * mis-declaration and stops the run before anything is snapshotted.
  */
 export const assertLinkRulesHold = ({ home, manifest }) => {
   for (const rule of manifest.managed) {
     if (!isLinkRule(rule)) continue;
     const check = verifyLinkRule({ home, rule });
     if (check.ok) continue;
+    if (!existsSync(check.dest)) continue; // planned: the bridge will create it
     throw businessError(
       'TARGET_LINK_WRONG',
       `${manifest.name}: the "${rule.kind}" rule is declared as a link but ${check.reason}.\n` +
@@ -199,12 +205,20 @@ export const assertLinkRulesHold = ({ home, manifest }) => {
         `  expected -> ${check.source}\n` +
         (check.target ? `  actual   -> ${check.target}\n` : '') +
         `\n  Fix one of the two:\n` +
-        `    a) make the link again:  ln -s "${check.source}" "${check.dest}"\n` +
+        `    a) make it a link again:  ${linkCommand(check.dest, check.source)}\n` +
+        `       (remove whatever sits at the path first — or simply delete it and\n` +
+        `        let the bridge create the link on the next adopt/apply)\n` +
         `    b) change bridge/targets/${manifest.name}.json to a copying mode if the\n` +
         `       bridge should own that directory instead.`,
     );
   }
 };
+
+/** The platform's own way to make a directory link, for the fix-it hint above. */
+const linkCommand = (dest, source) =>
+  process.platform === 'win32'
+    ? `cmd /c mklink /J "${dest}" "${source}"`
+    : `ln -s "${source}" "${dest}"`;
 
 /**
  * Throw when any managed destination is a symlink.

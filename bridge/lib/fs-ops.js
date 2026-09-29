@@ -12,11 +12,14 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -41,6 +44,36 @@ export const readText = (file) => readFileSync(file, 'utf8');
 export const ensureDir = (dir, mode = 0o700) => {
   mkdirSync(dir, { recursive: true, mode });
   return dir;
+};
+
+/**
+ * Create a directory link, in the strongest form the platform allows.
+ *
+ * Windows: a junction first. An unprivileged process can create one without
+ * Developer Mode or elevation, and Node reports it as a symbolic link
+ * (`lstat().isSymbolicLink()` is true, `readlinkSync` returns the target), so
+ * every link-aware path in this codebase treats the two the same. A real
+ * symlink (type 'dir') is the fallback when junctions are unavailable.
+ * POSIX: a symbolic link; `type` is ignored there.
+ *
+ * The type is passed as a bare string on purpose: Node silently ignores an
+ * unknown type passed as `{ type: 'junction' }` AND falls back to the
+ * privileged form, so the object form never creates a working junction when
+ * the process is not elevated.
+ */
+export const makeDirLink = (target, path) => {
+  ensureDir(dirname(path));
+  const types = process.platform === 'win32' ? ['junction', 'dir'] : [undefined];
+  let lastError = null;
+  for (const type of types) {
+    try {
+      symlinkSync(target, path, type);
+      return;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
 };
 
 /** Recursively list files under `root`, returned as POSIX-style relative paths. */
@@ -79,7 +112,24 @@ export const copyTree = (from, to) => {
 };
 
 export const removePath = (target) => {
-  if (existsSync(target)) rmSync(target, { recursive: true, force: true });
+  let stat;
+  try {
+    stat = lstatSync(target);
+  } catch {
+    return; // already gone
+  }
+  if (stat.isSymbolicLink()) {
+    // Remove the link itself, never what it points at. Node reports a Windows
+    // junction as a symbolic link; unlink deletes the reparse point without
+    // following it (verified on Node 22 / Windows 11), and on POSIX it is the
+    // ordinary way to delete a symlink. Removing a link with rmSync(recursive)
+    // is what an earlier revision did — safe on current Node, but one
+    // regression away from deleting the source through the link, and the whole
+    // design treats the source as read-only.
+    unlinkSync(target);
+    return;
+  }
+  rmSync(target, { recursive: true, force: true });
 };
 
 export const exists = (target) => existsSync(target);
@@ -92,6 +142,18 @@ export const backupFiles = (files, base, backupRoot, meta = {}) => {
   const entries = [];
   for (const abs of files) {
     if (!existsSync(abs)) continue;
+    let st;
+    try {
+      st = lstatSync(abs);
+    } catch {
+      continue;
+    }
+    // A link is not backed up. `copyFile` follows it and copies the target's
+    // bytes (and on a Windows junction it fails with EPERM outright), while
+    // restoring that copy would silently replace a link with a directory tree.
+    // The one link this bridge creates — the skills link — is recreated by
+    // `apply` and removed by `revoke`; neither path needs its bytes here.
+    if (st.isSymbolicLink()) continue;
     const rel = relative(base, abs);
     const dest = join(backupRoot, 'files', rel);
     copyFile(abs, dest);
