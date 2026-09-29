@@ -127,11 +127,11 @@ test('adopt: bridges only the named agent and leaves the other untouched', async
     // bridge must not have replaced it with a directory), and nothing may have
     // been duplicated into it.
     assert.ok(existsSync(sb.path('.agents/skills/beta/SKILL.md')), 'source skills reachable through the link');
-    const { lstatSync, readlinkSync } = require('node:fs');
+    const { lstatSync } = require('node:fs');
     assert.equal(lstatSync(sb.path('.agents/skills')).isSymbolicLink(), true, 'still a link');
     assert.equal(
-      readlinkSync(sb.path('.agents/skills')),
-      join(sb.home, '.claude', 'skills'),
+      linkResolvesTo(sb.path('.agents/skills'), join(sb.home, '.claude', 'skills')),
+      true,
       'and still pointing at the source',
     );
     assert.deepEqual(
@@ -152,10 +152,14 @@ test('adopt: creates the declared skills link when the destination is missing', 
 
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
 
-    const { lstatSync, readlinkSync } = require('node:fs');
+    const { lstatSync } = require('node:fs');
     const dest = sb.path('.agents/skills');
     assert.equal(lstatSync(dest).isSymbolicLink(), true, 'the bridge created a link, not a copy');
-    assert.equal(readlinkSync(dest), join(sb.home, '.claude', 'skills'), 'and it points at the source');
+    assert.equal(
+      linkResolvesTo(dest, join(sb.home, '.claude', 'skills')),
+      true,
+      'and it points at the source',
+    );
     assert.equal(
       readFileSync(join(dest, 'beta', 'SKILL.md'), 'utf8'),
       readFileSync(join(sb.home, '.claude', 'skills', 'beta', 'SKILL.md'), 'utf8'),
@@ -1002,6 +1006,24 @@ test('doctor: a symlinked destination is an error, not a warning', async () => {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Does `link` resolve to `target`?
+ *
+ * Compares real paths instead of link text on purpose: Node 20 returns a
+ * Windows junction's target with a trailing separator and Node 22+ does not,
+ * while the link is identical either way. The production guard
+ * (`verifyLinkRule`) also compares real paths, so this asserts the same
+ * relationship the code does.
+ */
+const linkResolvesTo = (link, target) => {
+  const { realpathSync } = require('node:fs');
+  try {
+    return realpathSync(link) === realpathSync(target);
+  } catch {
+    return false;
+  }
+};
 
 /** Remove a directory link without ever following it. */
 const dropDirLink = (path) => {
