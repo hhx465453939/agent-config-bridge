@@ -6,10 +6,17 @@
  *          missing secret referenced by the source, unexpanded placeholder left
  *          in a generated file
  *   warn   target not installed, Kimi paths unverified, stale sync, source rules
- *          document missing, a managed path that is actually a symlink
+ *          document missing, a managed path that is actually a symlink, a
+ *          declared runtime companion that is not installed
  *   info   counts worth eyeballing
  *
  * Exit code is 0 only when there are no errors (and, under --strict, no warnings).
+ *
+ * `doctor` is the only place environment probing is allowed to happen. The
+ * planner must stay a hermetic function of source + destination, or `apply`
+ * stops being reproducible and every plan/diff snapshot test becomes a coin
+ * flip. "Is this companion installed?" is a fact about the machine, so it is
+ * a doctor finding, never a plan action.
  */
 
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -34,6 +41,54 @@ const PLACEHOLDER_RESIDUE = /\{\{[A-Z_]+\}\}/g;
  * instead of hardcoding a platform check of their own.
  */
 export const POSIX_PERMISSIONS = process.platform !== 'win32';
+
+/**
+ * Candidate locations for one `requires` probe, most specific first.
+ *
+ * A manifest declares ONE relative path (`probe`), but the same companion is
+ * routinely installed in more than one place — a per-agent package directory,
+ * a global prefix, the cwd. Rather than make every manifest enumerate those,
+ * a probe containing a `node_modules/` segment is also tried as a global
+ * install (`<home>/.npm-global/lib/node_modules/...`) and under the current
+ * working directory. All of them express the same question — "is a copy of
+ * this package reachable?" — and an empty result is the only thing that
+ * becomes a finding, so a wrong guess costs nothing but a missed warning.
+ *
+ * A probe with no `node_modules/` in it is used verbatim: it is a direct path
+ * question, not a package question.
+ */
+export const requirementCandidates = (home, probe) => {
+  const direct = join(home, probe);
+  const marker = 'node_modules/';
+  const at = probe.indexOf(marker);
+  if (at === -1) return [direct];
+  const tail = probe.slice(at + marker.length);
+  return [
+    direct,
+    join(home, '.npm-global', 'lib', 'node_modules', tail),
+    join(process.cwd(), 'node_modules', tail),
+  ];
+};
+
+/**
+ * Is a declared runtime companion present?
+ *
+ * Returns the path that satisfied the probe, or null. `unless` is an accepted
+ * alternative location — an "or it is installed here instead" clause — so a
+ * requirement satisfied the unconventional way is not reported as missing.
+ *
+ * This is a pure fact. It deliberately does not consult the agent's own
+ * `never_touch` settings file (for pi, `settings.json` `packages`) to decide
+ * whether the companion is *wanted*: that file is the user's, and the bridge
+ * reads nothing but the paths the manifest names.
+ */
+export const findRequirement = (home, req) => {
+  for (const candidate of requirementCandidates(home, req.probe)) {
+    if (existsSync(candidate)) return candidate;
+  }
+  if (req.unless && existsSync(join(home, req.unless))) return join(home, req.unless);
+  return null;
+};
 
 export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
   const findings = [];
@@ -94,6 +149,7 @@ export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
 
   // --- per target ---------------------------------------------------------
   const installed = [];
+  const bridgedOnly = [];
   for (const manifest of manifests) {
     const isInstalled = detectTarget(manifest, home);
     const status = state.agents[manifest.name]?.status ?? STATUS.NATIVE;
@@ -106,6 +162,7 @@ export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
       add('warn', 'TARGET_UNVERIFIED', `${manifest.name}: manifest paths are declared but unverified`, `run a real adopt, then confirm the agent discovers its skills`);
     }
     if (status === STATUS.BRIDGED) {
+      bridgedOnly.push(manifest);
       const entry = state.agents[manifest.name];
       const snapId = entry.snapshot_id ?? latestSnapshot(repo, manifest.name);
       if (!snapId) {
@@ -128,6 +185,33 @@ export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
             `remove the link, or drop the "${link.rule.kind}" rule from bridge/targets/${manifest.name}.json`,
         );
       }
+    }
+  }
+
+  // --- declared runtime requirements --------------------------------------
+  //
+  // A companion the target needs at runtime but that this project cannot
+  // install (it would live in a `never_touch` file). Reported only when the
+  // target is bridged AND the configuration that needs it actually exists —
+  // otherwise the advice would be noise on a machine that never adopted this
+  // target in the first place.
+  //
+  // Severity is `warn`, not `error`: a missing companion does not make the
+  // bridge's own output wrong, and `apply` is still the correct response to a
+  // real drift. It is a silent-hole finder, so it fires every run until the
+  // user acts, and `doctor --strict` promotes it to a failure for CI use.
+  for (const manifest of bridgedOnly) {
+    for (const req of manifest.requires ?? []) {
+      const declaredBy = ruleDest({ to: req.declaredBy }, home);
+      if (!existsSync(declaredBy)) continue; // nothing generated yet; nothing to orphan
+      if (findRequirement(home, req)) continue;
+      add(
+        'warn',
+        'REQUIREMENT_MISSING',
+        `${manifest.name}: ${req.id} is not installed, so ${declaredBy.replace(`${home}/`, '~/')} ` +
+          `is generated but nothing loads it — ${req.why}`,
+        req.install,
+      );
     }
   }
 

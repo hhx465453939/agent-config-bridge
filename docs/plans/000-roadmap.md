@@ -74,18 +74,18 @@ M5 依赖 M3（闸门要走同一套受管路径才能被快照），但不依�
 
 ## M6 doctor / rollback / 可观测
 
-- [ ] `bridge/lib/doctor.js`：状态一致性、清单冲突、占位符残留、敏感模式、快照完整性、软链、陈旧度
+- [ ] `bridge/lib/doctor.js`：状态一致性、清单冲突、占位符残留、敏感模式、快照完整性、软链、陈旧度、**声明的运行时依赖是否存在**（ADR-004）
 - [ ] `bridge/lib/rollback.js`
 - [ ] `last-apply.json` 落盘（`<repo>/.bridge/`）
 - [ ] error / warn 分级与 `--strict` 语义
 
-**完成判定**：人为制造漂移 → `doctor` 非 0；快照不完整 → `doctor` 非 0 且 `revoke` 拒绝执行。
+**完成判定**：人为制造漂移 → `doctor` 非 0；快照不完整 → `doctor` 非 0 且 `revoke` 拒绝执行；把 pi-mcp-adapter 移走 → `doctor` 报 `REQUIREMENT_MISSING`（warn，`--strict` 下非 0），装回来即消失。
 
 ## M7 文档闭环 + 脱敏终检 + 端到端
 
 - [ ] `README.md`（状态图 + 会桥接什么/不会碰什么表 + 硬闸门一节）
 - [ ] `docs/USAGE.md`
-- [ ] `docs/ADR/001`、`docs/ADR/002`、`docs/ADR/003`
+- [ ] `docs/ADR/001`、`docs/ADR/002`、`docs/ADR/003`、`docs/ADR/004`
 - [ ] `CONTRIBUTING.md`
 - [ ] `.github/workflows/ci.yml`（`node --test` + 敏感扫描）
 - [ ] `tasks/CHG-001/TRACEABILITY.md` 回填证据

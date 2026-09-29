@@ -33,6 +33,15 @@
       "to": ".pi/agent/mcp-adapter.json",
       "mode": "mcp-json",
       "note": "pi-mcp-adapter (v3+) reads this file. codebase-memory-mcp gets directTools so its query and indexing tools appear first-class in pi's tool list — the hard gate keys off those names, and proxy-only mode would report every call as `mcp`. lifecycle=eager connects at startup so the tool catalog (and the direct-tool registration) is populated without a first manual `mcp({connect})` call.",
+      "requires": [
+        {
+          "id": "pi-mcp-adapter",
+          "probe": ".pi/agent/npm/node_modules/pi-mcp-adapter/package.json",
+          "unless": ".pi/agent/extensions/pi-mcp-adapter",
+          "install": "pi install npm:pi-mcp-adapter",
+          "why": "pi has no built-in MCP support, so this package is the only thing that reads the generated config; without it the MCP servers and the direct codebase-memory tools vanish from the tool list and the hard gate loses the tools it keys off (all silently — the config on disk stays correct)"
+        }
+      ],
       "server_settings": {
         "codebase-memory-mcp": {
           "directTools": true,

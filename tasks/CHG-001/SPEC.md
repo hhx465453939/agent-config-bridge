@@ -215,6 +215,29 @@ options:
 
 **清单必须显式枚举，`never_touch` 与 `managed` 不得重叠**（`doctor` 会校验并报错）。
 
+**受管条目的可选 `requires`（声明式运行时依赖）**
+
+有些产物**必须有外部程序才能生效**，而那个程序按设计不由本项目安装（它记在 `never_touch` 文件里）。这类"产物正确但没人读"的静默失效必须能被发现，因此在**条目上**显式声明（详见 ADR-004）：
+
+```json
+{
+  "kind": "mcp", "mode": "mcp-json", "to": ".pi/agent/mcp-adapter.json",
+  "requires": [
+    {
+      "id": "pi-mcp-adapter",                                  // 告警里显示的名字
+      "probe": ".pi/agent/npm/node_modules/pi-mcp-adapter/package.json",  // 存在的证据（相对 home）
+      "unless": ".pi/agent/extensions/pi-mcp-adapter",         // 可接受的备选安装位置（可选）
+      "install": "pi install npm:pi-mcp-adapter",               // 修复命令（只提示，不执行）
+      "why": "pi has no built-in MCP support, ..."              // 缺失的真实后果
+    }
+  ]
+}
+```
+
+约束：`requires` 必须是数组；每项的键只能是上述五个；`id` / `probe` / `install` / `why` 必须是非空字符串；`probe` / `unless` 必须是 **相对 `home`** 的路径（绝对路径与 `../` 越界一律报 `MANIFEST_INVALID`）。库内没有任何端专属代码，任何端都可声明任何伴随程序。
+
+**`requires` 只在 `doctor` 里探测，不在 planner 里**——`plan` / `apply` / `diff` 必须是"源 + 目标"的确定性函数，否则计划不可复现、快照测试失效（ADR-004 决策 2）。
+
 ### 4.4 MCP 转换契约
 
 最小公共能力集（超出部分忽略并在报告中列出）：

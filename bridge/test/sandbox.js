@@ -136,6 +136,16 @@ export const makeSandbox = ({ install = ['pi', 'kimi'], linkSkills = true } = {}
         2,
       )}\n`,
     );
+    // pi.json declares a `requires` probe for the pi-mcp-adapter package, and
+    // the real machine has it installed. The fixture must therefore look
+    // installed too, or every doctor test would carry a REQUIREMENT_MISSING
+    // warning — and a fixture that quietly reports a false problem is worse
+    // than no fixture, because the tests would stop noticing real ones. Tests
+    // that exercise the missing case delete this file explicitly.
+    write(
+      join(home, '.pi', 'agent', 'npm', 'node_modules', 'pi-mcp-adapter', 'package.json'),
+      '{"name":"pi-mcp-adapter","version":"0.0.0-fixture"}\n',
+    );
   }
   if (install.includes('kimi')) {
     mkdirSync(join(home, '.kimi-code'), { recursive: true });

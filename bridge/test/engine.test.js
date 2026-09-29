@@ -640,6 +640,81 @@ test('doctor: clean sandbox has no errors', async () => {
   });
 });
 
+// The failure this check exists for: pi's MCP support is a package, not a
+// feature, and the package is recorded in settings.json — a never_touch file.
+// So the bridge can generate a perfectly valid mcp-adapter.json that nothing on
+// the machine ever reads. Nothing about that is visible from the generated
+// files; the only way to notice is to ask whether the consumer exists.
+test('doctor: reports a generated MCP config whose consumer is not installed', async () => {
+  await withSandbox({}, (sb) => {
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    rmSync(sb.path('.pi/agent/npm/node_modules/pi-mcp-adapter/package.json'));
+
+    const report = api.doctor({ repo: sb.repo, home: sb.home });
+    const finding = report.findings.find((f) => f.code === 'REQUIREMENT_MISSING');
+    assert.ok(finding, `expected REQUIREMENT_MISSING, got ${JSON.stringify(report.findings)}`);
+    assert.equal(finding.level, 'warn');
+    // The config is still on disk and still correct — that is the whole point.
+    assert.ok(sb.exists('.pi/agent/mcp-adapter.json'));
+    assert.match(finding.message, /pi-mcp-adapter/);
+    // The hint has to be the command that actually fixes it, not advice.
+    assert.equal(finding.hint, 'pi install npm:pi-mcp-adapter');
+    // A warning, so plain `doctor` still exits 0 — but --strict must fail.
+    assert.equal(report.ok, true);
+    assert.equal(api.doctor({ repo: sb.repo, home: sb.home, strict: true }).ok, false);
+  });
+});
+
+test('doctor: stays quiet about a requirement while the target is not bridged', async () => {
+  await withSandbox({}, (sb) => {
+    rmSync(sb.path('.pi/agent/npm/node_modules/pi-mcp-adapter/package.json'));
+    const report = api.doctor({ repo: sb.repo, home: sb.home });
+    // pi is installed but native: the bridge generates nothing for it, so there
+    // is nothing to orphan and no advice to give.
+    assert.equal(report.findings.some((f) => f.code === 'REQUIREMENT_MISSING'), false);
+  });
+});
+
+test('doctor: a companion installed at an accepted alternative location counts', async () => {
+  await withSandbox({}, (sb) => {
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    rmSync(sb.path('.pi/agent/npm/node_modules/pi-mcp-adapter/package.json'));
+    mkdirSync(sb.path('.pi/agent/extensions/pi-mcp-adapter'), { recursive: true });
+    const report = api.doctor({ repo: sb.repo, home: sb.home });
+    assert.equal(report.findings.some((f) => f.code === 'REQUIREMENT_MISSING'), false);
+  });
+});
+
+test('manifest: rejects a malformed `requires` declaration', async () => {
+  const withRequires = (requires) =>
+    withSandbox({}, (sb) => {
+      sb.findAndReplaceManifests((manifest, name) => {
+        if (name !== 'pi') return null;
+        const rule = manifest.managed.find((r) => r.kind === 'mcp');
+        if (requires === undefined) delete rule.requires;
+        else rule.requires = requires;
+        return manifest;
+      });
+      return loadManifest(sb.repo, 'pi');
+    });
+
+  // A requirement is a claim about the machine, so an unreadable one is a
+  // manifest bug, not something to silently skip.
+  await assert.rejects(() => withRequires('pi-mcp-adapter'), /"requires" must be an array/);
+  await assert.rejects(() => withRequires([{}]), /must be a non-empty string/);
+  await assert.rejects(
+    () => withRequires([{ id: 'x', probe: '/etc/passwd', install: 'a', why: 'b' }]),
+    /must be relative/,
+  );
+  await assert.rejects(
+    () => withRequires([{ id: 'x', probe: 'a', install: 'b', why: 'c', command: 'rm -rf /' }]),
+    /unknown field/,
+  );
+  // Omitting it entirely is fine — most targets need nothing installed.
+  const plain = await withRequires(undefined);
+  assert.deepEqual(plain.requires, []);
+});
+
 test('doctor: flags an incomplete snapshot as an error', async () => {
   await withSandbox({}, (sb) => {
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });

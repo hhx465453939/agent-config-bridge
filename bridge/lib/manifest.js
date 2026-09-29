@@ -75,6 +75,72 @@ const validateServerSettings = (rule, where) => {
   return settings;
 };
 
+/**
+ * A `requires` entry names a companion the target needs at runtime but that
+ * this project deliberately does NOT install.
+ *
+ * pi is the reason this exists. pi has no built-in MCP support: the bridge
+ * generates `~/.pi/agent/mcp-adapter.json` and hands it over, but the only
+ * thing that ever reads that file is the `pi-mcp-adapter` package — which
+ * lives in `~/.pi/agent/settings.json`, a `never_touch` path. So the bridge
+ * cannot install it, and — without this declaration — cannot notice it going
+ * away either. The failure is silent by construction: the generated config is
+ * still on disk, still correct, still mode 600, and simply nobody loads it.
+ * MCP and the direct codebase-memory tools disappear while `apply` keeps
+ * reporting success.
+ *
+ * Declaring the requirement turns that into an observable fact. `doctor`
+ * probes it and prints the exact command that fixes it. The probe is a plain
+ * relative path (probed under `home`) so nothing here is pi-specific: any
+ * target may declare any companion, and `unless` names an accepted
+ * alternative location so "installed a second way" is not reported as missing.
+ */
+const REQUIREMENT_KEYS = new Set(['id', 'probe', 'unless', 'install', 'why']);
+
+const validateRequires = (rule, where) => {
+  const raw = rule.requires;
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) {
+    throw businessError('MANIFEST_INVALID', `${where}: "requires" must be an array`);
+  }
+  return raw.map((item, i) => {
+    const at = `${where}#requires[${i}]`;
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      throw businessError('MANIFEST_INVALID', `${at}: must be an object`);
+    }
+    for (const key of Object.keys(item)) {
+      if (!REQUIREMENT_KEYS.has(key)) {
+        throw businessError(
+          'MANIFEST_INVALID',
+          `${at}: unknown field ${JSON.stringify(key)} (allowed: ${[...REQUIREMENT_KEYS].join(', ')})`,
+        );
+      }
+    }
+    const text = (value, field) => {
+      if (typeof value !== 'string' || value.length === 0) {
+        throw businessError('MANIFEST_INVALID', `${at}: "${field}" must be a non-empty string`);
+      }
+      return value;
+    };
+    return {
+      id: text(item.id, 'id'),
+      probe: assertRelative(item.probe, 'probe', at),
+      unless:
+        item.unless === undefined || item.unless === null
+          ? null
+          : assertRelative(item.unless, 'unless', at),
+      install: text(item.install, 'install'),
+      why: text(item.why, 'why'),
+    };
+  });
+};
+
+/** Flatten the per-rule requirements, tagging each with the rule that declared it. */
+const collectRequires = (managed) =>
+  managed.flatMap((rule) =>
+    (rule.requires ?? []).map((req) => ({ ...req, declaredBy: rule.to })),
+  );
+
 const validate = (manifest, file) => {
   const name = manifest.name;
   if (typeof name !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(name)) {
@@ -102,6 +168,7 @@ const validate = (manifest, file) => {
       to: assertRelative(rule.to, 'to', where),
       note: rule.note ?? null,
       serverSettings: validateServerSettings(rule, where),
+      requires: validateRequires(rule, where),
     };
   });
 
@@ -145,6 +212,7 @@ const validate = (manifest, file) => {
     notes: manifest.notes ?? null,
     managed,
     neverTouch,
+    requires: collectRequires(managed),
     gates: validateGates(manifest.gates, file, name),
     file,
   };
