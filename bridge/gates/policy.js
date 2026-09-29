@@ -22,6 +22,15 @@
  * bridge/test/gates.test.js) and the adapters stay small enough to read in one
  * sitting — which matters, because an adapter bug silently disables enforcement.
  *
+ * Language
+ * --------
+ * Identifiers, comments and internal reason strings are English (this is a
+ * published repository). Everything a user READS — the denial text and the
+ * per-turn reminder — is Simplified Chinese, because the person being blocked
+ * is the person who wrote the rules. Keep new checks consistent with that
+ * split, and note that the block text always carries its layer as ASCII
+ * ("Layer 1/2/3"), which is what the tests assert on instead of wording.
+ *
  * Failure policy
  * --------------
  * If the policy cannot be read or parsed, the gate FAILS OPEN (allows the call)
@@ -32,7 +41,12 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, posix, relative, sep } from 'node:path';
+import { dirname, isAbsolute, join, normalize, posix, relative, resolve, sep } from 'node:path';
+
+const WIN32 = process.platform === 'win32';
+
+/** Cached "newest mtime inside the index marker directory", keyed by directory. */
+const mtimeCache = new Map();
 
 export const DEFAULT_CONFIG = {
   /** Absolute paths whose files are in scope. Empty = auto-detect a VCS root. */
@@ -63,6 +77,19 @@ export const DEFAULT_CONFIG = {
   signal_ttl_ms: 60 * 60 * 1000,
   /** Where an index marker directory is expected, for advisory reasons. */
   index_marker: '.codebase-memory',
+  /**
+   * A file counts as newer than the index only if it leads by more than this.
+   * Same-second writes and coarse (FAT, network share) timestamps otherwise
+   * make a freshly built index look stale, and a rule that cries wolf gets
+   * switched off instead of fixed.
+   */
+  index_mtime_epsilon_ms: 2000,
+  /**
+   * How long a computed "newest file inside the marker directory" is trusted.
+   * The scan is a readdir plus a stat per entry; a read-heavy turn would
+   * otherwise repeat it for every read.
+   */
+  index_mtime_ttl_ms: 30000,
 };
 
 export const POLICY_FILENAME = 'policy.json';
@@ -96,6 +123,18 @@ export const normalizePolicy = (raw) => {
   config.max_blocks_per_session = Number.isFinite(config.max_blocks_per_session)
     ? config.max_blocks_per_session
     : DEFAULT_CONFIG.max_blocks_per_session;
+  // Non-negative finite numbers only. A hand-edited policy.json is the normal
+  // way these get set, and a string here would compare as NaN — which is false
+  // for every comparison, i.e. a rule that silently never fires.
+  //
+  // `null` and `undefined` mean "not set", NOT zero: `Number(null)` is 0, and
+  // silently turning an absent value into a disabled epsilon is the class of
+  // bug this coercion exists to prevent. An explicit 0 still means 0.
+  for (const key of ['index_mtime_epsilon_ms', 'index_mtime_ttl_ms']) {
+    const raw = config[key];
+    const n = raw === null || raw === undefined || raw === '' ? NaN : Number(raw);
+    config[key] = Number.isFinite(n) && n >= 0 ? n : DEFAULT_CONFIG[key];
+  }
   return {
     name: typeof raw?.name === 'string' ? raw.name : 'unnamed-gate',
     version: raw?.version ?? 1,
@@ -211,22 +250,22 @@ const withinRoot = (parent, child) => {
  * @returns {{inScope: boolean, reason: string, root: string|null}}
  */
 export const scopeOf = (filePath, { config = DEFAULT_CONFIG, exists }) => {
-  if (!filePath) return { inScope: false, reason: 'no path', root: null };
-  if (!isAbsolute(filePath)) return { inScope: false, reason: 'not an absolute path', root: null };
-  if (!isCodeFile(filePath, config)) return { inScope: false, reason: 'not a code file', root: null };
-  if (isExcluded(filePath, config)) return { inScope: false, reason: 'excluded path', root: null };
+  if (!filePath) return { inScope: false, reason: '没有路径', root: null };
+  if (!isAbsolute(filePath)) return { inScope: false, reason: '不是绝对路径', root: null };
+  if (!isCodeFile(filePath, config)) return { inScope: false, reason: '不是代码文件', root: null };
+  if (isExcluded(filePath, config)) return { inScope: false, reason: '在排除清单内（vendor/依赖/构建产物）', root: null };
 
   if (Array.isArray(config.project_roots) && config.project_roots.length > 0) {
     const root = config.project_roots.find((r) => withinRoot(r, filePath));
     return root
-      ? { inScope: true, reason: 'under a configured project root', root }
-      : { inScope: false, reason: 'outside every configured project root', root: null };
+      ? { inScope: true, reason: '在配置的项目根之下', root }
+      : { inScope: false, reason: '不在任何配置的项目根之下', root: null };
   }
 
   const root = findRepoRoot(filePath, exists, config.repo_markers ? { markers: config.repo_markers } : {});
   return root
-    ? { inScope: true, reason: 'inside a repository', root }
-    : { inScope: false, reason: 'not inside any repository', root: null };
+    ? { inScope: true, reason: '在某个代码仓库内', root }
+    : { inScope: false, reason: '不在任何代码仓库内', root: null };
 };
 
 // ---------------------------------------------------------------------------
@@ -251,17 +290,109 @@ export const newSessionState = () => ({
   announced: new Set(),
 });
 
+/**
+ * One spelling for a path, so "the file I am reading" and "the file I wrote a
+ * turn ago" can be compared at all.
+ *
+ * Why this exists
+ * ---------------
+ * A harness resolves tool paths itself: pi's `read` schema says "relative or
+ * absolute" and resolves the relative form against the session directory. The
+ * rules below refuse relative paths on purpose (an absolute path is the only
+ * thing they can scope), so before this the model could dodge the gate by
+ * spelling a path relatively — `scopeOf` answered "not an absolute path",
+ * `inScope` was false, and the read sailed through. The same mismatch made the
+ * gate fight the model over its own work: `write` recorded one spelling,
+ * `read` came back with another, `written.has(...)` missed, and a file the
+ * session had just created was blocked.
+ *
+ * So both sides of the `written` comparison go through here, and the harness is
+ * responsible for handing `recordWrite` the spelling it will later report.
+ *
+ * What it does, and deliberately does not do
+ * ------------------------------------------
+ *   resolve    a relative path against the directory the harness resolves it
+ *              against (`cwd`), passed in — never read from `process.cwd()`,
+ *              because for a session-shaped harness the process directory is
+ *              not the session directory.
+ *   normalize  collapse `..`, `.` and duplicate separators.
+ *   win32      fold case and the `\\?\` long-path prefix, because Windows
+ *              treats `C:\repo` and `c:\repo` as one file and the model will
+ *              spell them both in consecutive turns.
+ *   NOT        resolving links (needs I/O; this stays a pure function) and NOT
+ *              expanding 8.3 short names.
+ *
+ * Case is folded only on win32: on a case-sensitive filesystem `/Repo/a.ts` and
+ * `/repo/a.ts` really are two files, and conflating them would open a hole.
+ */
+export const normalizePath = (p, cwd = null) => {
+  if (typeof p !== 'string' || p === '') return p ?? null;
+  const resolved = cwd ? resolve(cwd, p) : resolve(p);
+  if (!WIN32) return normalize(resolved);
+  let out = resolved.startsWith('\\\\?\\') ? resolved.slice(4) : resolved;
+  out = out.split('/').join('\\');
+  // Keep the root separator ("C:\") because "C:" alone means "the current
+  // directory on drive C", which is a different thing.
+  if (out.length > 3 && out.endsWith('\\')) out = out.slice(0, -1);
+  return out.toLowerCase();
+};
+
 export const recordSignal = (state, now = Date.now()) => {
   state.signals += 1;
   state.lastSignalAt = now;
 };
 
+/** Record a file the session wrote. The caller passes the normalized spelling. */
 export const recordWrite = (state, path) => {
   if (path) state.written.add(path);
 };
 
 export const hasFreshSignal = (state, ttlMs, now = Date.now()) =>
   state.signals > 0 && now - state.lastSignalAt <= ttlMs;
+
+// ---------------------------------------------------------------------------
+// Index freshness
+// ---------------------------------------------------------------------------
+
+/**
+ * The filesystem facts a check may consult, injected so the rule layer stays
+ * unit-testable off-harness (a harness with a virtual or remote filesystem can
+ * still be policed, and the test suite needs no disk).
+ *
+ * Each probe is TOTAL: it answers, it never throws. A probe that can throw
+ * turns a filesystem hiccup into a dead gate, and a gate that stops existing is
+ * the one failure this whole design is built to avoid.
+ */
+const NO_FS = {
+  exists: () => false,
+  statMtime: () => 0,
+  listDir: () => [],
+};
+
+/** Newest mtime inside a directory, or 0 when it cannot be read. */
+export const newestMtimeIn = (dir, fs, now = Date.now(), ttlMs = 0) => {
+  const hit = mtimeCache.get(dir);
+  // `now >= hit.at` rather than trusting the clock: a backwards clock must not
+  // make a stale answer look fresh. Keeping the comparison on the arguments
+  // (instead of calling Date.now() in here) is what makes the TTL testable
+  // without fake timers.
+  if (hit && now >= hit.at && now - hit.at <= ttlMs) return hit.mtime;
+
+  let newest = 0;
+  for (const name of fs.listDir(dir)) {
+    const m = fs.statMtime(join(dir, name));
+    if (m > newest) newest = m;
+  }
+  mtimeCache.set(dir, { at: now, mtime: newest });
+  return newest;
+};
+
+/**
+ * Module-level on purpose: this caches a fact about the disk, not about a
+ * session's permissions, so a per-session reset must not clear it. Exported for
+ * tests; not part of the policy contract.
+ */
+export const resetMtimeCache = () => mtimeCache.clear();
 
 // ---------------------------------------------------------------------------
 // Checks
@@ -276,6 +407,24 @@ export const hasFreshSignal = (state, ttlMs, now = Date.now()) =>
  *
  * `deps` carries what a check may need from the running harness:
  *   { exists(dir): boolean, state, now: number }
+ *
+ * CASCADE ORDER
+ * -------------
+ * `shouldBlock` stops at the FIRST check that returns a verdict, so the order
+ * of the policy's `checks` array decides which layer speaks. The shipped
+ * policies list the two Layer-2 checks BEFORE `graph-before-read`, because:
+ *
+ *   - an unindexed repository must hear "build the index first", not
+ *     "the index exists, query the graph" — with the reverse order Layer 2 is
+ *     unreachable and the Layer-1 wording is simply false;
+ *   - the reverse order was tried once, on the theory that Layer 2 would
+ *     re-block a session right after its first graph query. It would not: both
+ *     Layer-2 checks short-circuit on a fresh signal, exactly like
+ *     `graph-before-read`. The theory was wrong and the order it produced hid
+ *     the index rules on every unindexed repository.
+ *
+ * A policy that lists only `graph-before-read` remains valid and means "always
+ * ask the graph first"; the cascade is a property of the array, not the code.
  */
 const CHECKS = {
   /** Don't read source before consulting the code graph. */
@@ -288,19 +437,19 @@ const CHECKS = {
     return {
       code: 'GRAPH_FIRST',
       reason: [
-        'Blocked: source files may not be read before the code graph has been consulted.',
-        `  file : ${input.path}`,
-        `  why  : ${scope.reason} (root: ${scope.root ?? 'unknown'})`,
+        '⛔ 三层铁律 · Layer 1 拦截：项目已建立 codebase-memory 索引，但本会话尚未有任何一次成功的图谱查询。',
+        `  文件：${input.path}`,
+        `  依据：${scope.reason}（项目根：${scope.root ?? '未知'}）`,
         '',
-        'Ask the graph first, then read: search_graph / trace_path / get_code_snippet /',
-        'query_graph / get_architecture / search_code. Once any one of those succeeds, this',
-        'gate opens for the rest of the session and line-level reading is fine.',
-        'Reading files this session already wrote is always allowed.',
+        '必须先用查询类工具：search_graph / trace_path / get_code_snippet / query_graph /',
+        'get_architecture / search_code。任何一次成功之后，本会话的闸门即放行，行级阅读不再受限。',
+        '本会话内你自己刚改过的文件不受此限制。',
+        '这是 AGENTS.md 的强制规则（先问图谱，再无细节，最后才读文件），不是可选项。',
       ].join('\n'),
     };
   },
 
-  /** A read that the rule wants gated on a fresh index rather than a query. */
+  /** A read that the rule wants gated on an index existing at all. */
   'index-before-read': (policy, input, deps) => {
     if (input.action !== 'read') return null;
     const scope = scopeOf(input.path, { config: policy.config, exists: deps.exists });
@@ -312,11 +461,62 @@ const CHECKS = {
     return {
       code: 'INDEX_FIRST',
       reason: [
-        'Blocked: this repository has no code-graph index yet.',
-        `  repository : ${scope.root}`,
-        `  expected   : ${marker}`,
+        '⛔ 三层铁律 · Layer 2 拦截：该项目尚未建立 codebase-memory 索引。',
+        `  仓库：${scope.root}`,
+        `  缺少：${marker}`,
         '',
-        'Build the index first (index_repository on that repository), then consult the graph.',
+        `正确动作：先调用 index_repository（repo_path 取 ${scope.root}；模式按规模选 full/moderate/fast）`,
+        '建立索引与 embedding；索引完成后回到 Layer 1 查图谱（search_graph / trace_path /',
+        'get_code_snippet 等），最后才可直读。',
+        '若确属一次性临时片段不值得建索引，向主人说明理由后依赖拦截上限兜底。',
+      ].join('\n'),
+    };
+  },
+
+  /**
+   * The index exists but the file is newer than anything inside it.
+   *
+   * Two independent guards keep a stale timestamp from becoming a stale *rule*:
+   *
+   *   epsilon — only lead by more than `index_mtime_epsilon_ms`. Same-second
+   *             writes and coarse (FAT, network share) timestamps otherwise
+   *             make a freshly built index look stale.
+   *   unknown — an unreadable or empty marker directory yields 0, and 0
+   *             abstains. Filing "I could not read the index" under "the index
+   *             is stale" would block every read in a repository whose index
+   *             lives somewhere the harness cannot stat.
+   *
+   * Note the order: `written` and the fresh-signal test come before any probe.
+   * A check cannot rely on another check having run first, because the `checks`
+   * array is user-editable and the model's own edit is always newer than the
+   * index it is about to consult.
+   */
+  'index-freshness-before-read': (policy, input, deps) => {
+    if (input.action !== 'read') return null;
+    const scope = scopeOf(input.path, { config: policy.config, exists: deps.exists });
+    if (!scope.inScope || !scope.root) return null;
+    if (deps.state.written.has(input.path)) return null;
+    if (hasFreshSignal(deps.state, policy.config.signal_ttl_ms, deps.now)) return null;
+
+    const marker = join(scope.root, policy.config.index_marker);
+    if (!deps.exists(marker)) return null; // index-before-read owns that case
+
+    const mtime = deps.statMtime(input.path);
+    if (!(mtime > 0)) return null; // vanished, unreadable, or a directory: abstain
+    const indexMtime = newestMtimeIn(marker, deps, deps.now, policy.config.index_mtime_ttl_ms);
+    if (!(indexMtime > 0)) return null; // index directory unreadable or empty: abstain
+    if (mtime <= indexMtime + policy.config.index_mtime_epsilon_ms) return null;
+
+    return {
+      code: 'INDEX_STALE',
+      reason: [
+        '⛔ 三层铁律 · Layer 2 拦截：索引疑似过期——目标文件比索引新（embedding 落后于代码变更）。',
+        `  目标：${input.path}`,
+        `  所属已索引项目：${scope.root}`,
+        '',
+        '正确动作：先 detect_changes 检查影响范围，或 index_repository 重新索引；完成后回到',
+        'Layer 1 查图谱，最后才可直读。',
+        '本会话内你自己刚改过的文件不受此拦截。',
       ].join('\n'),
     };
   },
@@ -401,21 +601,27 @@ export const CHECK_NAMES = Object.keys(CHECKS);
  * @param {object} args.policy
  * @param {{action:string, path:string|null, tool:string, content?:string}} args.input
  * @param {object} args.state   from newSessionState()
- * @param {(p:string)=>boolean} args.exists  filesystem probe, injected
+ * @param {(p:string)=>boolean} [args.exists]  filesystem probe, injected
+ * @param {object} [args.fs]    full probe: {exists, statMtime, listDir}. Supersedes `exists`.
  * @param {number} [args.now]
  * @returns {{block: boolean, code: string|null, reason: string|null, capReached: boolean}}
  */
-export const shouldBlock = ({ policy, input, state, exists, now = Date.now() }) => {
+export const shouldBlock = ({ policy, input, state, exists, fs, now = Date.now() }) => {
   const cap = policy.config.max_blocks_per_session;
   if (cap >= 0 && state.blocks >= cap) {
     return { block: false, code: null, reason: null, capReached: true };
   }
 
+  // One probe object, so a check that needs more than `exists` can get it
+  // without each check inventing its own seam. The flat `exists` shape stays
+  // supported because it is what the unit tests and simpler harnesses pass.
+  const probes = fs ?? { ...NO_FS, exists: typeof exists === 'function' ? exists : NO_FS.exists };
+
   const enabled = new Set(policy.checks.length > 0 ? policy.checks : ['graph-before-read']);
   for (const name of enabled) {
     const check = CHECKS[name];
     if (!check) continue; // unknown check names are ignored, not fatal
-    const verdict = check(policy, input, { state, exists, now });
+    const verdict = check(policy, input, { state, exists: probes.exists, fs: probes, ...probes, now });
     if (verdict) {
       state.blocks += 1;
       return { block: true, code: verdict.code, reason: verdict.reason, capReached: false };

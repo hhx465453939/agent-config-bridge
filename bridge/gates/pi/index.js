@@ -9,16 +9,18 @@
  * only translates: pi event -> normalized input -> policy question -> pi result.
  *
  * Install: copy this directory to <pi agent dir>/extensions/enforce-rules/
- * See bridge/gates/install.js for a scripted, dry-run-first install.
+ * Installed by the bridge itself: bridge/lib/gates.js plans these files, so `adopt`
+ * snapshots them and `revoke` removes them again.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   loadPolicy,
   newSessionState,
+  normalizePath,
   policyFromObject,
   recordSignal,
   recordWrite,
@@ -27,6 +29,32 @@ import {
 } from '../policy.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The filesystem probe the policy consults.
+ *
+ * Everything here answers instead of throwing: a probe that throws turns a
+ * filesystem hiccup into a dead gate, and a gate that stops existing is the one
+ * failure this design is built to avoid. `listDir` and `statMtime` exist for
+ * the index-freshness rule; the plain `exists` is what scoping uses.
+ */
+export const realFs = {
+  exists: (p) => existsSync(p),
+  statMtime: (p) => {
+    try {
+      return statSync(p).mtimeMs;
+    } catch {
+      return 0;
+    }
+  },
+  listDir: (dir) => {
+    try {
+      return readdirSync(dir);
+    } catch {
+      return [];
+    }
+  },
+};
 
 /**
  * Where the policy JSON can live.
@@ -113,11 +141,30 @@ export default function enforceRules(pi, options = {}) {
   const state = newSessionState();
   /** Set once per session so the same advisory is not repeated. */
   let noticedPolicyProblem = false;
+  /**
+   * The directory pi resolves a relative tool path against.
+   *
+   * pi's `read` schema accepts "relative or absolute" and resolves the relative
+   * form against the session directory, so a rule that only understands
+   * absolute paths would be dodged by spelling the same file relatively. The
+   * value is captured at session start and refreshed from `ctx` on every call,
+   * because `ctx.cwd` is not guaranteed on every event.
+   *
+   * Left null when nothing has ever supplied one: guessing here would scope a
+   * read into whatever directory the pi process happened to start in, which is
+   * a different repository. Without a cwd the path stays relative, the policy
+   * refuses it, and the gate is inert — the same behaviour as before this was
+   * fixed, and the honest floor.
+   */
+  let sessionCwd = null;
+  const cwdFor = (ctx) =>
+    typeof ctx?.cwd === 'string' && ctx.cwd ? ctx.cwd : sessionCwd;
 
   pi.on('session_start', async (_event, ctx) => {
     state.blocks = 0;
     state.signals = 0;
     state.written.clear();
+    if (typeof ctx?.cwd === 'string' && ctx.cwd) sessionCwd = ctx.cwd;
     if (error) {
       // A gate that cannot load its policy is OFF. Say so loudly: in a headless
       // run there is no UI to notify, so this also goes to stderr. A silent
@@ -140,18 +187,23 @@ export default function enforceRules(pi, options = {}) {
 
   pi.on('tool_call', async (event, ctx) => {
     const name = event.toolName;
+    const cwd = cwdFor(ctx);
 
     // Remember what this session wrote: reading your own output is never a
     // violation, and blocking it would make the gate fight normal development.
+    // The path is normalized on BOTH sides (here and in the read branch below),
+    // so a file written as "src/a.ts" and read back as an absolute path — or
+    // spelled with a different drive case on Windows — is still recognized as
+    // the model's own file.
     if (name === 'write' || name === 'edit') {
-      const path = event.input?.path;
+      const path = normalizePath(event.input?.path ?? null, cwd);
       recordWrite(state, path);
       const content = typeof event.input?.content === 'string' ? event.input.content : null;
       const verdict = shouldBlock({
         policy,
         input: { action: 'write', path, tool: name, content },
         state,
-        exists: existsSync,
+        fs: realFs,
       });
       if (verdict.block) {
         return { block: true, reason: verdict.reason };
@@ -163,9 +215,9 @@ export default function enforceRules(pi, options = {}) {
 
     const verdict = shouldBlock({
       policy,
-      input: { action: 'read', path: event.input?.path ?? null, tool: name },
+      input: { action: 'read', path: normalizePath(event.input?.path ?? null, cwd), tool: name },
       state,
-      exists: existsSync,
+      fs: realFs,
     });
 
     if (verdict.block) {
@@ -192,7 +244,18 @@ export default function enforceRules(pi, options = {}) {
     if (event.isError) return;
     // Only a *successful* graph query unlocks the session. A failed query means
     // the model has not actually learned anything yet.
-    if (isSignalTool(event.toolName)) recordSignal(state);
+    if (isSignalTool(event.toolName)) {
+      recordSignal(state);
+      return;
+    }
+    // pi-mcp-adapter's default proxy mode reports every MCP call as the single
+    // `mcp` tool and names the real tool in the input. Count a successful proxy
+    // call to a graph tool as a query too: without this the gate could never
+    // open on a host whose MCP tools are proxy-only, and it would silently
+    // degrade to "block three reads, then stop enforcing".
+    if (event.toolName === 'mcp' && isSignalTool(String(event.input?.tool ?? ''))) {
+      recordSignal(state);
+    }
   });
 
   pi.on('context', async (event) => {

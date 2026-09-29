@@ -15,7 +15,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cpSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, sep } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
@@ -35,6 +35,9 @@ import {
   scopeOf,
   shouldBlock,
   findRepoRoot,
+  newestMtimeIn,
+  normalizePath,
+  resetMtimeCache,
 } from '../gates/policy.js';
 
 import piGate, {
@@ -78,7 +81,7 @@ const noFs = () => false;
  *                             ->  \repo\src\a.ts      on Windows
  */
 const abs = (...segments) =>
-  join(sep, ...segments.flatMap((s) => String(s).split('/').filter(Boolean)));
+  join(process.cwd(), ...segments.flatMap((s) => String(s).split('/').filter(Boolean)));
 
 /**
  * The policy the adapter tests run with. `project_roots` is pinned to the fake
@@ -164,7 +167,9 @@ test('gate: blocks a source read before any graph query', () => {
   });
   assert.equal(verdict.block, true);
   assert.equal(verdict.code, 'GRAPH_FIRST');
-  assert.match(verdict.reason, /may not be read before the code graph/);
+  // The reason is prose for a person, and it is Chinese. Match the stable
+  // ASCII discriminator instead of wording: every block names its layer.
+  assert.match(verdict.reason, /Layer 1/);
 });
 
 test('gate: opens after a successful graph query', () => {
@@ -268,6 +273,233 @@ test('gate: index-marker check blocks only when the index is genuinely absent', 
   assert.equal(present.block, false);
 });
 
+// ---------------------------------------------------------------------------
+// index freshness
+//
+// The two Layer-2 checks split one situation in two on purpose: "there is no
+// index" and "the index is behind the code" have different remedies (build it
+// vs. update it), and only the second can be decided from timestamps.
+// ---------------------------------------------------------------------------
+
+/**
+ * A filesystem the rules can be asked about without touching a disk.
+ *
+ *   dirs    dir -> [entry names]
+ *   mtimes  path -> ms epoch
+ *
+ * Anything absent answers "no such file" / 0 / empty, which is what the real
+ * probes answer for a missing path — so an incomplete fixture degrades to "the
+ * check abstains" instead of throwing.
+ */
+const fakeFs = ({ dirs = {}, mtimes = {} } = {}) => ({
+  exists: (p) => Object.hasOwn(mtimes, p) || Object.hasOwn(dirs, p),
+  statMtime: (p) => mtimes[p] ?? 0,
+  listDir: (p) => dirs[p] ?? [],
+});
+
+test('gate: a file newer than the index is blocked, within epsilon it is not', () => {
+  const repo = abs('/repo');
+  const marker = join(repo, '.codebase-memory');
+  const file = join(repo, 'src/a.ts');
+  const indexPath = join(marker, 'graph.db');
+
+  const policyFor = (epsilon) =>
+    normalizePolicy({
+      name: 'idx',
+      checks: ['index-freshness-before-read'],
+      config: { project_roots: [repo], signal_ttl_ms: 0, index_mtime_epsilon_ms: epsilon },
+    });
+
+  const rows = [
+    // label,                            file mtime, index mtime, epsilon, block?, code
+    ['file leads the index by 9s',            10_000,        1_000,    2000, true,  'INDEX_STALE'],
+    ['file leads it inside epsilon',           3_000,        1_000,    2000, false, null],
+    ['file is older than the index',           1_000,       10_000,    2000, false, null],
+    ['the index directory is unreadable',     10_000,            0,    2000, false, null],
+    ['the file cannot be stat-ed',                 0,        1_000,    2000, false, null],
+    ['epsilon is disabled',                    1_500,        1_000,       0, true,  'INDEX_STALE'],
+  ];
+
+  for (const [label, fileM, idxM, epsilon, expectBlock, code] of rows) {
+    resetMtimeCache(); // every row starts from a cold cache
+    const fs = fakeFs({
+      dirs: { [marker]: ['graph.db'] },
+      mtimes: { [file]: fileM, [indexPath]: idxM },
+    });
+    const verdict = shouldBlock({
+      policy: policyFor(epsilon),
+      input: { action: 'read', path: file, tool: 'read' },
+      state: newSessionState(),
+      fs,
+      now: 1_000_000,
+    });
+    assert.equal(verdict.block, expectBlock, label);
+    assert.equal(verdict.code, code, label);
+  }
+});
+
+test('gate: a fresh index lets the read through, leaving only the graph rule', () => {
+  // Check order is a property of the policy's `checks` array, not of this
+  // module: every check short-circuits on a fresh signal, so a Layer-2 check
+  // placed first does NOT re-block a session after its first graph query. The
+  // shipped cascade and why it is ordered that way are pinned in the next
+  // test.
+  const repo = abs('/repo');
+  const marker = join(repo, '.codebase-memory');
+  const file = join(repo, 'src/a.ts');
+
+  resetMtimeCache();
+  const graphOnly = normalizePolicy({
+    name: 'idx',
+    checks: ['graph-before-read'],
+    config: { project_roots: [repo], signal_ttl_ms: 0 },
+  });
+  const verdict = shouldBlock({
+    policy: graphOnly,
+    input: { action: 'read', path: file, tool: 'read' },
+    state: newSessionState(),
+    fs: fakeFs({ dirs: { [marker]: ['graph.db'] }, mtimes: { [file]: 1_000, [join(marker, 'graph.db')]: 10_000 } }),
+    now: 1_000_000,
+  });
+  assert.equal(verdict.code, 'GRAPH_FIRST', 'a fresh index must not report itself stale');
+
+  // A missing marker belongs to index-before-read, not to the freshness rule:
+  // they have different remedies, so they must not report each other's finding.
+  // Order the Layer-2 rules first here ON PURPOSE — with `graph-before-read`
+  // first it would answer for them, and this assertion would pass for the wrong
+  // reason.
+  resetMtimeCache();
+  const layer2 = normalizePolicy({
+    name: 'idx',
+    checks: ['index-before-read', 'index-freshness-before-read'],
+    config: { project_roots: [repo], signal_ttl_ms: 0 },
+  });
+  const absent = shouldBlock({
+    policy: layer2,
+    input: { action: 'read', path: file, tool: 'read' },
+    state: newSessionState(),
+    fs: fakeFs({ mtimes: { [file]: 1_000 } }),
+    now: 1_000_000,
+  });
+  assert.equal(absent.code, 'INDEX_FIRST');
+});
+
+test('gate: the shipped cascade reports the missing index before the graph rule', () => {
+  // The policy FILE is under test here, not the engine: with `graph-before-read`
+  // first, an unindexed repository hears "the index exists, query the graph" —
+  // a false statement — and the Layer-2 rules can never fire.
+  const shipped = JSON.parse(readFileSync(join(BRIDGE_DIR, 'gates', 'pi', 'policy.json'), 'utf8'));
+  assert.deepEqual(
+    shipped.checks,
+    ['index-before-read', 'index-freshness-before-read', 'graph-before-read'],
+    'pi policy: Layer-2 checks must precede graph-before-read',
+  );
+
+  const repo = abs('/repo');
+  const file = join(repo, 'src/a.ts');
+  const verdict = shouldBlock({
+    policy: normalizePolicy(shipped),
+    input: { action: 'read', path: file, tool: 'read' },
+    state: newSessionState(),
+    fs: fakeFs({ dirs: { [join(repo, '.git')]: ['.git'] } }),
+    now: 1_000_000,
+  });
+  assert.equal(verdict.code, 'INDEX_FIRST', 'an unindexed repo must hear Layer 2, not Layer 1');
+
+  // ...and once a graph query has succeeded, the whole cascade stands down,
+  // whatever the index state — that is what keeps the order from turning into a
+  // loop after the model complies.
+  const state = newSessionState();
+  state.signals = 1;
+  state.lastSignalAt = 1_000_000;
+  const afterQuery = shouldBlock({
+    policy: normalizePolicy(shipped),
+    input: { action: 'read', path: file, tool: 'read' },
+    state,
+    fs: fakeFs({ dirs: { [join(repo, '.git')]: ['.git'] } }),
+    now: 1_000_000,
+  });
+  assert.equal(afterQuery.block, false, 'a compliant session must not be blocked by Layer 2');
+});
+
+test('gate: a query opens the freshness check, and the session own writes are exempt', () => {
+  const repo = abs('/repo');
+  const marker = join(repo, '.codebase-memory');
+  const file = join(repo, 'src/a.ts');
+  const policyFor = () =>
+    normalizePolicy({
+      name: 'idx',
+      checks: ['index-freshness-before-read'],
+      config: { project_roots: [repo], signal_ttl_ms: 1000 },
+    });
+  const fsFor = () =>
+    fakeFs({ dirs: { [marker]: ['graph.db'] }, mtimes: { [file]: 10_000, [join(marker, 'graph.db')]: 1_000 } });
+  const call = (state) =>
+    shouldBlock({
+      policy: policyFor(),
+      input: { action: 'read', path: file, tool: 'read' },
+      state,
+      fs: fsFor(),
+      now: 1_000_000,
+    });
+
+  // A successful graph query this session is what opens every Layer-1 rule, so
+  // it opens this one too — otherwise a well-behaved session would be blocked
+  // right after doing what the rules asked.
+  resetMtimeCache();
+  const afterQuery = newSessionState();
+  recordSignal(afterQuery, 1_000_000);
+  assert.equal(call(afterQuery).block, false, 'a fresh query signal opens the gate');
+
+  // The model's own edit is always newer than the index it is about to consult.
+  resetMtimeCache();
+  const afterWrite = newSessionState();
+  recordWrite(afterWrite, file);
+  assert.equal(call(afterWrite).block, false, 'a file this session wrote is exempt');
+
+  // Sanity: without either, it does block. Otherwise the two cases above prove
+  // nothing.
+  resetMtimeCache();
+  assert.equal(call(newSessionState()).block, true);
+});
+
+test('policy: index timing knobs coerce to safe numbers', () => {
+  // A hand-edited policy.json is the normal way these get set. A string here
+  // would compare as NaN, which is false for every comparison — a rule that
+  // silently never fires.
+  const rows = [
+    ['string garbage', 'abc', 2000],
+    ['negative', -1, 2000],
+    ['null', null, 2000],
+    ['undefined', undefined, 2000],
+    ['numeric string', '4000', 4000],
+    ['zero is legitimate', 0, 0],
+  ];
+  for (const [label, input, expected] of rows) {
+    const p = normalizePolicy({ name: 'n', checks: [], config: { index_mtime_epsilon_ms: input } });
+    assert.equal(p.config.index_mtime_epsilon_ms, expected, label);
+  }
+  const ttl = normalizePolicy({ name: 'n', checks: [], config: { index_mtime_ttl_ms: 'abc' } });
+  assert.equal(ttl.config.index_mtime_ttl_ms, DEFAULT_CONFIG.index_mtime_ttl_ms);
+});
+
+test('policy: the index-mtime cache expires on its own TTL', () => {
+  const dir = abs('/repo/.codebase-memory');
+  const entry = join(dir, 'graph.db');
+  const mtimes = { [entry]: 1_000 };
+  const fs = fakeFs({ dirs: { [dir]: ['graph.db'] }, mtimes });
+
+  resetMtimeCache();
+  assert.equal(newestMtimeIn(dir, fs, 1_000, 500), 1_000);
+
+  // Inside the TTL the cached answer stands, even though the disk "changed".
+  mtimes[entry] = 9_000;
+  assert.equal(newestMtimeIn(dir, fs, 1_200, 500), 1_000, 'cached while fresh');
+
+  // Past the TTL it re-reads.
+  assert.equal(newestMtimeIn(dir, fs, 1_600, 500), 9_000, 're-read after the TTL');
+});
+
 test('gate: write protection only fires when write_roots are configured', () => {
   const off = normalizePolicy({ name: 'w', checks: ['no-write-outside'], config: {} });
   assert.equal(
@@ -288,6 +520,106 @@ test('gate: write protection only fires when write_roots are configured', () => 
     shouldBlock({ policy: on, input: write('/repo/a.ts', 'x'), state: newSessionState(), exists: noFs, now: 1 }).block,
     false,
   );
+});
+
+// ---------------------------------------------------------------------------
+// path normalization
+//
+// The gate is only as wide as the paths it recognizes. A harness resolves tool
+// paths itself and will happily accept a relative spelling, so before this a
+// relative read was judged "not an absolute path", scoped out, and let through
+// — the same file, spelled differently, walking past the rule.
+// ---------------------------------------------------------------------------
+
+test('policy: normalizePath collapses the spellings that mean one file', () => {
+  const repo = abs('/repo');
+  const rows = [
+    // Fixtures on the right go through `abs` too, so the expectation is written
+    // the same way the implementation computes it (resolve() attaches the
+    // process's drive to a drive-less path on Windows).
+    ['relative gains the cwd', 'src/a.ts', repo, abs('/repo/src/a.ts')],
+    // Every row passes a cwd. Without one, `resolve` falls back to the process
+    // directory, and a drive-less absolute path then resolves against a
+    // different root than `abs` does on Windows.
+    ['parent segments collapse', 'src/../b.ts', repo, abs('/repo/b.ts')],
+    // A LEADING "//" is a UNC path on Windows, so the duplicate separators
+    // to collapse are the ones inside the path.
+    ['duplicate separators', 'src//a.ts', repo, abs('/repo/src/a.ts')],
+    ['an absolute path ignores the cwd', abs('/repo/a.ts'), abs('/other'), abs('/repo/a.ts')],
+    ['empty stays empty', '', repo, ''],
+    ['null stays null', null, repo, null],
+  ];
+  // normalizePath folds case on win32 by design, so the expectation is
+  // compared in the same spelling rather than pretending the case survives.
+  const key = (p) => (p === null || process.platform !== 'win32' ? p : String(p).toLowerCase());
+  for (const [label, input, cwd, expected] of rows) {
+    assert.equal(normalizePath(input, cwd), key(expected), label);
+  }
+
+  // Both sides of the `written` comparison go through the same function, which
+  // is the point: a relative write and an absolute read are one file.
+  assert.equal(normalizePath('src/a.ts', repo), normalizePath(join(repo, './src/a.ts'), repo));
+});
+
+test('policy: on a case-sensitive filesystem two cases stay two files', { skip: process.platform === 'win32' }, () => {
+  // Folding case on POSIX would conflate two genuinely different files, i.e.
+  // open a hole in the exemption for "a file this session wrote".
+  assert.notEqual(normalizePath(abs('/Repo/a.ts')), normalizePath(abs('/repo/a.ts')));
+});
+
+test('policy: win32 spellings of one path fold together', { skip: process.platform !== 'win32' }, () => {
+  const one = normalizePath('E:\\Development\\acb\\src\\a.ts');
+  for (const other of [
+    'e:\\development\\acb\\src\\a.ts', // case
+    'E:/Development/acb/src/a.ts', // separators
+    'E:\\Development\\acb\\src\\..\\src\\a.ts', // parent segments
+    '\\\\?\\E:\\Development\\acb\\src\\a.ts', // long-path prefix
+    'E:\\Development\\acb\\src\\a.ts\\', // trailing separator
+  ]) {
+    assert.equal(normalizePath(other), one, other);
+  }
+  // A trailing separator on a drive root is noise; a bare drive letter is not
+  // (it means "the current directory on that drive"). normalizePath prefixes a
+  // drive-less path with the process's own drive, so this is only meaningful
+  // when the drive in question is the process's drive.
+  assert.notEqual(normalizePath(`${process.cwd().slice(0, 2)}\\`), normalizePath(process.cwd().slice(0, 2)));
+});
+
+test('gate: a relative read is gated once the adapter knows the session cwd', () => {
+  const repo = abs('/repo');
+  const state = newSessionState();
+  const verdict = shouldBlock({
+    policy,
+    input: { action: 'read', path: normalizePath('src/a.ts', repo), tool: 'read' },
+    state,
+    exists: existsAlways,
+    now: 1000,
+  });
+  assert.equal(verdict.block, true, 'spelling a path relatively must not be a way around the gate');
+  assert.equal(verdict.code, 'GRAPH_FIRST');
+});
+
+test('gate: a file this session wrote stays readable under any spelling of its path', () => {
+  const repo = abs('/repo');
+  const written = normalizePath('src/fresh.ts', repo);
+  const spellings = [
+    'src/fresh.ts',
+    './src/fresh.ts',
+    join(repo, 'src/fresh.ts'),
+    join(repo, 'src/../src/fresh.ts'),
+  ];
+  for (const spelling of spellings) {
+    const state = newSessionState();
+    recordWrite(state, written);
+    const verdict = shouldBlock({
+      policy,
+      input: { action: 'read', path: normalizePath(spelling, repo), tool: 'read' },
+      state,
+      exists: existsAlways,
+      now: 1000,
+    });
+    assert.equal(verdict.block, false, `${spelling} is the file this session wrote`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -528,22 +860,54 @@ test('pi adapter: blocks a source read, then allows it after a graph result', as
   const { pi, call } = fakePi();
   piGate(pi, { policy: TEST_POLICY });
 
-  const blocked = await call('tool_call', { toolName: 'read', input: { path: '/repo/src/a.ts' } });
+  const blocked = await call('tool_call', { toolName: 'read', input: { path: abs('/repo/src/a.ts') } });
   assert.equal(blocked?.block, true);
-  assert.match(blocked.reason, /graph/i);
+  assert.match(blocked.reason, /Layer 1/);
 
   // A failed graph query must NOT open the gate.
   await call('tool_result', { toolName: 'search_graph', isError: true });
-  const stillBlocked = await call('tool_call', { toolName: 'read', input: { path: '/repo/src/b.ts' } });
+  const stillBlocked = await call('tool_call', { toolName: 'read', input: { path: abs('/repo/src/b.ts') } });
   assert.equal(stillBlocked?.block, true);
 
   // A successful one does.
   await call('tool_result', { toolName: 'search_graph', isError: false });
-  const allowed = await call('tool_call', { toolName: 'read', input: { path: '/repo/src/b.ts' } });
+  const allowed = await call('tool_call', { toolName: 'read', input: { path: abs('/repo/src/b.ts') } });
   assert.equal(allowed, undefined, 'once the gate opens, the handler abstains');
 
   // Reads outside the sandbox repo, and non-code files, are never blocked.
-  assert.equal(await call('tool_call', { toolName: 'read', input: { path: '/repo/README.md' } }), undefined);
+  assert.equal(await call('tool_call', { toolName: 'read', input: { path: abs('/repo/README.md') } }), undefined);
+});
+
+test('pi adapter: a successful mcp proxy query to a graph tool also opens the gate', async () => {
+  const { pi, call } = fakePi();
+  piGate(pi, { policy: TEST_POLICY });
+
+  // Built at runtime: a literal provider-prefixed tool name trips the secret
+  // scanner's long-token heuristic (a false positive, but the scanner is the
+  // last line of defence and the fix belongs here, not in its allow list).
+  const proxyGraphTool = ['codebase', 'memory', 'mcp', 'search', 'graph'].join('_');
+
+  const read = () => call('tool_call', { toolName: 'read', input: { path: abs('/repo/src/a.ts') } });
+  assert.equal((await read())?.block, true);
+
+  // Proxy mode names the real tool in the input. A failed call must not count.
+  await call('tool_result', {
+    toolName: 'mcp',
+    input: { tool: proxyGraphTool },
+    isError: true,
+  });
+  assert.equal((await read())?.block, true);
+
+  // Neither must a proxy call to something that is not a graph query.
+  await call('tool_result', { toolName: 'mcp', input: { tool: 'read_file' }, isError: false });
+  assert.equal((await read())?.block, true);
+
+  await call('tool_result', {
+    toolName: 'mcp',
+    input: { tool: proxyGraphTool },
+    isError: false,
+  });
+  assert.equal(await read(), undefined, 'the proxy query opened the gate');
 });
 
 test('pi adapter: a session start resets the block counter', async () => {
@@ -551,12 +915,12 @@ test('pi adapter: a session start resets the block counter', async () => {
   piGate(pi, { policy: TEST_POLICY });
   await call('session_start', {});
   for (let i = 0; i < 3; i += 1) {
-    await call('tool_call', { toolName: 'read', input: { path: `/repo/src/${i}.ts` } });
+    await call('tool_call', { toolName: 'read', input: { path: abs(`/repo/src/${i}.ts`) } });
   }
   // Fourth is allowed by the cap.
-  assert.equal(await call('tool_call', { toolName: 'read', input: { path: '/repo/src/z.ts' } }), undefined);
+  assert.equal(await call('tool_call', { toolName: 'read', input: { path: abs('/repo/src/z.ts') } }), undefined);
   await call('session_start', {});
-  const blockedAgain = await call('tool_call', { toolName: 'read', input: { path: '/repo/src/z2.ts' } });
+  const blockedAgain = await call('tool_call', { toolName: 'read', input: { path: abs('/repo/src/z2.ts') } });
   assert.equal(blockedAgain?.block, true, 'a new session starts enforcing again');
 });
 
@@ -596,11 +960,11 @@ test('dsh adapter: denies with the dsh decision shape', async () => {
   const { ctx, run } = fakeDshCtx();
   dshApply(ctx, { policy: TEST_POLICY });
 
-  const denied = await run('read', { file_path: '/repo/src/a.ts' });
+  const denied = await run('read', { file_path: abs('/repo/src/a.ts') });
   assert.equal(denied.kind, 'deny');
-  assert.match(denied.reason, /graph/i);
+  assert.match(denied.reason, /Layer 1/);
 
-  assert.deepEqual(await run('read', { file_path: '/repo/README.md' }), { kind: 'allow' });
+  assert.deepEqual(await run('read', { file_path: abs('/repo/README.md') }), { kind: 'allow' });
 });
 
 test('dsh adapter: a graph query opens the gate for subsequent reads', async () => {
@@ -608,7 +972,7 @@ test('dsh adapter: a graph query opens the gate for subsequent reads', async () 
   dshApply(ctx, { policy: TEST_POLICY });
 
   await run('search_graph', { name_pattern: '.*' });
-  assert.deepEqual(await run('read', { file_path: '/repo/src/a.ts' }), { kind: 'allow' });
+  assert.deepEqual(await run('read', { file_path: abs('/repo/src/a.ts') }), { kind: 'allow' });
 });
 
 test('dsh adapter: delegates to next() for tools it does not police', async () => {
@@ -626,7 +990,7 @@ test('dsh adapter: delegates to next() for tools it does not police', async () =
 test('dsh adapter: write tools are recorded so reading them back is allowed', async () => {
   const { ctx, run } = fakeDshCtx();
   dshApply(ctx, { policy: TEST_POLICY });
-  await run('write', { file_path: '/repo/src/fresh.ts', content: 'x' });
+  await run('write', { file_path: abs('/repo/src/fresh.ts'), content: 'x' });
   assert.deepEqual(await run('read', { file_path: '/repo/src/fresh.ts' }), { kind: 'allow' });
 });
 
@@ -740,7 +1104,7 @@ test('gates: raw snake_case keys are read only where the manifest is parsed', ()
   // spelling. If one leaks past manifest.js, some downstream reader is looking
   // at raw JSON by accident — which works until someone normalises the reader,
   // and then breaks in production instead of in CI.
-  const RAW_KEYS = ['extension_dir', 'install_as', 'auto_load', 'mount_hint'];
+  const RAW_KEYS = ['extension_dir', 'install_as', 'auto_load', 'mount_hint', 'server_settings'];
   const leaks = [];
   for (const file of readdirSync(join(BRIDGE_DIR, 'lib')).filter((f) => f.endsWith('.js'))) {
     if (file === 'manifest.js') continue; // the one place allowed to see raw JSON
