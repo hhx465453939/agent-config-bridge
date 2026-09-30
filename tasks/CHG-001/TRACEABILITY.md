@@ -33,6 +33,8 @@
 | 破坏性恢复 | SS5 | §4.9 | M5 | 删 bridged 端一个 skill → `apply` → 其他端 md5 不变 | 演练记录 | 待实施 |
 | pi 侧 skill 生效（若 adopt pi） | SS6 | §4.3 | M6 | 抽样 5 个 `/skill:<name>` 可见 | 抽样记录 | 待实施 |
 | 私有配置不被改动 | SS7 | §4.3、C10 | M2、M3 | 被 adopt 端 settings.json md5 比对 | 比对报告 | 待实施 |
+| 声明式运行时依赖可被观测 | SS8 / S11 | ADR-004 | M6 | `node --test bridge/test/engine.test.js`（缺失/未桥接/备选位置/校验失败 四类） | 单测输出 | 通过 |
+| 模型上下文窗口元数据一致 | SS9 / S12 | ADR-005 | M6 | `node --test bridge/test/pi-models.test.js`；`node bridge/cli.js doctor` | 单测输出（31 项）+ 真机 doctor 输出 | 通过 |
 
 ## 2. 验收标准 → 证据矩阵
 
@@ -64,6 +66,13 @@
 | PRD §9 | 默认 plan 变更数 = 0 | 自动化 | 集成测试 |
 | PRD §9 | 新增 skill 到全端 ≤ 2 步 | 人工 | 演练记录 |
 | SPEC §6 DoD | 六处文档一致 | 人工 + 脚本 | 文档比对清单 |
+| ADR-004 SS8 | 伴随程序缺失时 `doctor` 必报 `REQUIREMENT_MISSING`（warn） | 自动化 | 单测（移走 → 报警，放回 → 消失） |
+| ADR-004 SS8 | 未桥接的目标端不产生该告警（避免噪音） | 自动化 | 单测 |
+| ADR-005 SS9 | 家族表与 pi **实际发布**的 provider 数据一致（读真实文件，非抄 fixture） | 自动化 | 单测（pi 未装则可见 skip） |
+| ADR-005 SS9 | 家族表边界有**反例**锁死（`glm-5.1`/`opus-4-5` 是 200K、`k3-256k` < `k3`） | 自动化 | 单测 |
+| ADR-005 SS9 | 多源不一致时断言 `null` 而非猜一个数 | 自动化 | 单测（`claude-opus-5` maxTokens=null）+ 校验器 |
+| ADR-005 SS9 | catalog 陈旧值被报出且**不落盘修改** | 自动化 | 单测（doctor 前后文件 deepEqual） |
+| ADR-005 SS9 | 检查在拿不到 pi 数据时**不静默关闭**（与 catalog 检查解耦） | 自动化 | 单测（`checkFamilyAgainstOfficial(null)` 仍报 find） |
 | SPEC §6 DoD | 未纳入项显式 accepted | 人工 | 本文件第 3 节 |
 
 ## 3. 明确接受的遗留（Accepted Residuals）
@@ -80,6 +89,10 @@
 | 源目录备份文件 / 平铺冗余 `.md` 不清理 | accepted | 桥接器显式忽略并报告，不擅自删用户文件 |
 | 既有软链 `~/.agents/skills` 不自动移除 | accepted | 需用户显式授权（SPEC §9） |
 | 快照只保留最近 5 份 | accepted | 磁盘占用可控（PRD §13 Q7 建议） |
+| `qwen3.7-flash` / `Qwen3.8-27B` / `glm-5.2-fast` 不纳入家族表 | accepted | 本机**任何**权威来源都查不到其上下文窗口；编一个数是错的，宁可不覆盖（ADR-005 方案 D） |
+| 家族表会随 pi 发版而过期 | accepted | 这正是「对真实文件比对」的测试存在的理由；外部数据推翻断言时**改表**，不改断言 |
+| 桥接器不重写 `pi-router-catalog.json` | accepted | 那是 pi-smart-router 的运行时状态（`learnScore`/`samples` 由插件持续写入），不是从权威源派生的内容（ADR-005 方案 C） |
+| 自定义 provider 扩展不入库、不做模板下发 | accepted | 它含私有网关端点（违反脱敏铁律）且是一段**程序**而非配置值（ADR-005 方案 A） |
 
 ## 4. 证据回填规则
 

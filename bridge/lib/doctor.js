@@ -30,6 +30,13 @@ import { latestSnapshot, verifySnapshot } from './snapshot.js';
 import { loadSecrets, placeholdersIn } from './secrets.js';
 import { readIfExists } from './mcp.js';
 import { listFiles } from './fs-ops.js';
+import {
+  checkCatalog,
+  checkFamilyAgainstOfficial,
+  piAiDataDir,
+  readCatalog,
+  readOfficialModels,
+} from './pi-models.js';
 
 const PLACEHOLDER_RESIDUE = /\{\{[A-Z_]+\}\}/g;
 
@@ -215,6 +222,26 @@ export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
     }
   }
 
+  // --- pi context-window registry ------------------------------------------
+  //
+  // Two hand-maintained copies of the same facts, in files that never talk to
+  // each other: the custom-provider extension pi actually reads at runtime, and
+  // `pi-router-catalog.json`, whose merge is sticky so a stale value can never
+  // be refreshed. Both can say a 1M model is 128K, and pi will believe it and
+  // compact away context the model really has. Nothing else on the machine
+  // compares them, so this does.
+  //
+  // Reported only when the catalog exists (pi + pi-smart-router installed) and
+  // only for models a source of truth actually covers. Severity is `warn`: the
+  // bridge did not write these files, does not own them, and must not rewrite
+  // them — the finding is information plus a pointer, not an action.
+  //
+  // Pushed directly rather than through `add` because these findings carry
+  // structured extras (`selector`, `expected`, `actual`, `source`) that the
+  // generic shape has no room for, and a machine-readable `--json` report is
+  // only useful if it names the entry that is wrong.
+  for (const finding of checkPiContextWindows(home)) findings.push(finding);
+
   // --- drift --------------------------------------------------------------
   const bridged = listBridged(state).filter((n) => installed.includes(n));
   let drift = null;
@@ -285,6 +312,77 @@ const staleness = (iso) => {
   const then = Date.parse(iso);
   if (Number.isNaN(then)) return null;
   return Math.floor((Date.now() - then) / 86_400_000);
+};
+
+/**
+ * The pi context-window check, kept in one place so `runDoctor` stays readable.
+ *
+ * Three independent questions, in decreasing authority:
+ *
+ *   1. does our own family table still match pi's shipped provider data? (a
+ *      finding here is OUR bug, not the machine's)
+ *   2. does the custom-provider extension declare windows our table disagrees
+ *      with? (this is the file pi actually reads)
+ *   3. does pi-router-catalog.json hold values neither source agrees with? (a
+ *      cache with no invalidation)
+ *
+ * Everything is derived from `home`; no absolute path is embedded, and nothing
+ * is written. A missing file is silence, never a finding — most machines have
+ * no custom provider, no catalog, and no problem.
+ */
+const checkPiContextWindows = (home) => {
+  const out = [];
+  const add = (level, code, message, hint = null, extra = {}) =>
+    out.push({ level, code, message, hint, ...extra });
+
+  // pi's shipped provider data is used for two different jobs, and they must not
+  // be coupled: the table-drift check is MEANINGLESS without it (there is
+  // nothing to compare against), while the catalog check is perfectly able to
+  // run from the family table alone — that table is the citation. Requiring
+  // pi's data for both would mean a machine that cannot see pi-ai silently
+  // stops checking catalogs it can still check.
+  const official = readOfficialModels(piAiDataDir(home));
+
+  if (official) {
+    for (const f of checkFamilyAgainstOfficial(official)) {
+      add(
+        'warn',
+        'PI_MODEL_TABLE_STALE',
+        `bridge: family table disagrees with pi's shipped provider data — ${f.message}`,
+        "fix FAMILY_META in bridge/lib/pi-models.js; the table is this repository's claim, not pi's",
+        { file: f.file },
+      );
+    }
+  }
+
+  const catalogPath = join(home, '.pi', 'agent', 'pi-router-catalog.json');
+  if (!existsSync(catalogPath)) return out;
+  const catalog = readCatalog(catalogPath);
+  if (catalog === undefined) {
+    add(
+      'warn',
+      'PI_CATALOG_UNREADABLE',
+      `${catalogPath} exists but is not valid JSON`,
+      'fix or delete it; pi-smart-router falls back to its shipped seed',
+    );
+    return out;
+  }
+  if (catalog === null) return out;
+
+  for (const f of checkCatalog(catalog, { official })) {
+    // `selector`, `expected`, `actual` and `source` ride along: a report whose
+    // finding says "something is stale" but not WHICH entry is a report the
+    // user has to re-derive by hand.
+    const { level, code, message, ...rest } = f;
+    add(
+      level,
+      code.startsWith('CATALOG_') ? `PI_${code}` : code,
+      `pi-router catalog: ${message}`,
+      'the catalog merge is sticky (an existing value always wins), so this will not self-heal — edit pi-router-catalog.json',
+      rest,
+    );
+  }
+  return out;
 };
 
 const finish = (findings, strict, extra = {}) => {

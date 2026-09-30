@@ -74,7 +74,9 @@ M5 依赖 M3（闸门要走同一套受管路径才能被快照），但不依�
 
 ## M6 doctor / rollback / 可观测
 
-- [ ] `bridge/lib/doctor.js`：状态一致性、清单冲突、占位符残留、敏感模式、快照完整性、软链、陈旧度、**声明的运行时依赖是否存在**（ADR-004）
+- [ ] `bridge/lib/doctor.js`：状态一致性、清单冲突、占位符残留、敏感模式、快照完整性、软链、陈旧度、**声明的运行时依赖是否存在**（ADR-004）、**模型上下文窗口是否与 pi 发布数据一致**（ADR-005）
+- [ ] `bridge/lib/pi-models.js`：按 model id 家族的表（**每行必须带 `source`**）+ 读 pi 发布数据的复验器 + `pi-router-catalog.json` 陈旧检查（只报告，不重写）
+- [ ] `bridge/test/pi-models.test.js`：家族表边界**反例**、对 pi 真实文件比对、catalog 端到端（含「doctor 不改盘」断言）
 - [ ] `bridge/lib/rollback.js`
 - [ ] `last-apply.json` 落盘（`<repo>/.bridge/`）
 - [ ] error / warn 分级与 `--strict` 语义

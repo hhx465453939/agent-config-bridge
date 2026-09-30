@@ -101,6 +101,7 @@ node bridge/cli.js revoke kimi
 | MCP server 声明 | ✅ | 做跨格式转换；密钥走仓库外的 `secrets.env` |
 | **硬闸门（gate）** | ✅ | 仅对有扩展机制的 agent（见下节） |
 | **各端私有设置** | ❌ | 模型选择、主题、快捷键、权限白名单、非 MCP 段配置 —— 原样保留 |
+| **模型上下文窗口元数据** | ❌ 只报告 | 自定义 provider 扩展与 `pi-router-catalog.json` 里各存一份 `contextWindow`，且目录那份**永不自动刷新**；`doctor` 比对后报警，**不重写**（见 `docs/ADR/005`、`docs/USAGE.md` §5.9） |
 | **各端扩展 / 插件** | ❌ | 你自己写的扩展原样保留；本工具只往里面加**它自己那一个子目录** |
 | 会话 / 历史 / 缓存 / 凭据文件 | ❌ | 运行时数据，永不触碰 |
 | output-styles / themes | ❌ | 无对等概念 |
@@ -173,6 +174,7 @@ $EDITOR ~/.config/agent-config-bridge/secrets.env
 * **不做插件市场**：不抓取、不安装第三方 skill，只搬运你本机已有的。
 * **不做运行时数据同步**：会话、历史、缓存、凭据不在范围内。
 * **不做跨机器实时同步**：这是单机工具；换机器时在目标机器上跑同一份 `apply`。
+* **不改别人的模型元数据**：pi 的 `pi-router-catalog.json` 与自定义 provider 扩展都是**它们自己的状态**（一个由插件持续写入，一个是用户写的程序）。`doctor` 发现与 pi 发布数据不一致时只报 `PI_CATALOG_CONTEXT_STALE`，并指出"它不会自己刷新"——修正动作留给你。理由见 `docs/ADR/005`。
 * **不替你做决定**：默认不 adopt 任何 agent；要不要桥接、撤回，都由你显式发起。
 * **平台**：Linux / macOS / Windows 原生均支持。Windows 上的技能链接用 **junction**（无需管理员权限，由工具自己创建），其余受管内容在所有平台走同一套复制 + 哈希比对；CI 在三个平台跑同一套测试。
 

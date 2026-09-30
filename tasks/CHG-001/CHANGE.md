@@ -62,6 +62,8 @@ evidence_date: 2026-09-27
 * S7 **保留私有配置**：桥接只覆盖共享维度，agent 自身特有配置（模型/主题/快捷键/权限/扩展等）原样保留；
 * S8 幂等性、备份与回滚、`--dry-run` 优先的安全语义；
 * S9 自检器：残留占位符、明文凭据模式（正则黑名单）、md5 漂移、快照完整性；
+* S11 **声明式运行时依赖**：受管条目声明它需要的外部程序（`requires`），`doctor` 探测并在缺失时报告——针对「配置在盘上、内容正确、但没有任何程序读它」这类静默失效（ADR-004）；
+* S12 **模型上下文窗口元数据治理**：为走网关的自定义 provider 建一张**有出处**的家族表，并由 `doctor` 比对机器上各份手抄副本（自定义 provider 扩展、`pi-router-catalog.json`），发现陈旧即报——**只报告，不重写**（ADR-005）；
 * S10 **硬闸门（gate）**：把规则文档里最关键的规则抽成策略层（`bridge/gates/policy.js`），并给**有扩展机制的 harness** 铺上适配层（起步：pi、DeepSeek Harness），让规则从"建议"变成"工具级拒绝"；闸门走与其它内容同一套受管路径，因此 adopt 可快照、revoke 可卸载。
 
 **非目标（Non-goals）：**
@@ -76,6 +78,7 @@ evidence_date: 2026-09-27
 ## 5. 受影响模块（Affected Modules）
 
 * 新建仓库 `agent-config-bridge`（`bridge/` CLI、`templates/`、`docs/ADR/`、`tests/`）；
+* `bridge/lib/pi-models.js`（模型元数据表，仅当目标端是 pi 且本机装了 pi 时才被查询）；
 * 本机 5 个 agent 的全局配置目录（只写受管清单内的文件）；
 * 既有一次性脚本（`sync-skill-pool.sh` 等）——**不动**，本项目与其并存，待验证后由用户决定是否淘汰。
 
@@ -115,6 +118,8 @@ evidence_date: 2026-09-27
 * SS5 破坏性试验：删掉某个 bridged agent 的一个 skill 目录后 `apply`，能恢复且**其他 agent 的文件 md5 不变**；
 * SS6 pi 侧 `/skill:<name>` 命令与权威源一一对应（抽样 5 个验证）；
 * SS7 桥接后，被桥接 agent 的私有设置文件（如 pi `settings.json`）md5 不变。
+* SS8 声明了 `requires` 的受管条目，在伴随程序缺失时 `doctor` **必然**报出（假阴性由负向用例锁死：移走包 → 报警，放回 → 消失）；
+* SS9 家族表与 pi 发布数据的一致性由**读真实文件的测试**保证；本机普查 0 条陈旧（此项发现的 `shudie/kimi-k3` 已修）。
 
 ## 10. 未决问题（Unresolved Questions）
 
@@ -147,3 +152,5 @@ evidence_date: 2026-09-27
 | 2026-09-29 | C1 平台约束修订：**Windows 原生纳入支持** | 技能链接改为 junction（免管理员权限），并为 `link` 规则增加自动创建与声明式校验（指向错误仍硬拒）；CI 增加 `windows-latest`。原 C1 中"Windows 明确列为非目标"作废；复制式桥接仍是各端默认，只有 manifest 显式声明的链接才走链接。 |
 | 2026-09-29 | S10 硬闸门落地为三层 fallback（graph-first / index-before-read / index-freshness） | 由真实 Linux 参考实现移植，拦截文案与逐轮提醒为中文，并加入 Windows 路径归一化；同时识别 pi-mcp-adapter 代理模式下的图谱查询。 |
 | 2026-09-29 | pi MCP 目标路径随 pi-mcp-adapter v3 改名 | 适配器 v3 起只读 `~/.pi/agent/mcp-adapter.json`（`mcp.json` 留给 pi 未来的内置 MCP）；manifest、测试与文档同步更新。 |
+| 2026-09-29 | S11 声明式运行时依赖 + `doctor` 探测（ADR-004） | 受管条目可声明 `requires`（探针/备选位置/修复命令/后果）；`doctor` 在「已桥接且产物存在」时探测并报 `REQUIREMENT_MISSING`（warn）。planner 零改动。 |
+| 2026-09-30 | S12 模型上下文窗口元数据治理（ADR-005） | 新增 `bridge/lib/pi-models.js`：按 model id 家族的表（**每条必须带 `source`**）+ 读 pi 发布数据的复验器 + `pi-router-catalog.json` 陈旧值检查。`doctor` 报 `PI_CATALOG_CONTEXT_STALE` / `PI_MODEL_TABLE_STALE`，**只报告不重写**。 |

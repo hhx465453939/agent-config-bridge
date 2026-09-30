@@ -136,6 +136,45 @@ WARN
 
 > 你已经会手动 `pi install` 的话，这条的收益不是"帮你装"，而是把一次**毫无报错的静默失效**变成一条每次跑 `doctor` 都会重刷、且带修复命令的提示。
 
+### 5.9 为什么 1M 上下文的模型显示成 128K
+
+`contextWindow` 在 pi 里**不是装饰**：pi 用它算上下文预算，并据此决定**什么时候压缩会话**。写小了 → 模型明明有 1M，pi 提前把上下文压掉、能力白扔且不报错；写大了 → 请求超限报错。
+
+pi 正常从 provider 学这个数（`pi-ai/dist/providers/data/*.json`）。**但走网关的自定义 provider 不在其中**：它的上下文窗口只能由本机那个 `extension.ts` 手写声明，而网关的 `/v1/models` **只返回 id**，没有任何元数据可读。
+
+更麻烦的是还有第二份副本：pi-smart-router 的 `~/.pi/agent/pi-router-catalog.json`。它的合并逻辑是**粘性**的：
+
+```ts
+contextWindow: existing?.contextWindow ?? info.contextWindow
+```
+
+`existing` 永远赢，而它只在文件为空时才被写入 —— 也就是说，**一个写错的值永远不会被刷新**。
+
+于是同一件事有两个手抄副本，在两个互不通信的文件里。`doctor` 现在会比一遍：
+
+```bash
+node bridge/cli.js doctor
+```
+
+```
+WARN
+  [PI_CATALOG_CONTEXT_STALE] pi-router catalog: shudie/kimi-k3: contextWindow 262144
+  but family "kimi-k3" is 1048576 (pi-ai/dist/providers/data/moonshotai.json + kimi-coding.json)
+      → the catalog merge is sticky (an existing value always wins), so this will not
+        self-heal — edit pi-router-catalog.json
+```
+
+几点刻意的设计：
+
+* **只报告，不重写。** 那两个文件都不是本项目的：一个是用户写的程序，一个是 pi-smart-router 的私有状态。把它们改成跟一个公开仓库里的表一致，正是本项目在别处反复拒绝的"静默权威"；
+* 判定为 **warn** —— 桥接器自己的产物没坏，`apply` 仍是对的；普通 `doctor` 退出 0，`--strict` 才算失败（供 CI 用）；
+* 出处不是"官网写着"，而是**pi 自己发布的那份数据文件**。测试直接读机器上 pi 的真实文件比对，不是读一份抄好的 fixture —— 抄两遍同一个错，测试永远绿；
+* 表里**没有任何网关域名、端口、密钥**。归类只看 model id 前缀，而 id 是公开信息；
+* 反例是被**声明**的，不是碰巧的：`glm-5.1` 是 200K 不是 1M、`claude-opus-4-5` 是 200K 不是 1M、`kimi-k3-256k` 比 `kimi-k3` 小 —— 这几条都有专门的用例钉住；
+* **查不到就不猜。** 本机任何权威来源里都没有的型号（如某些 qwen）不会被报出来，也不会被编一个数字填上。宁可少报。
+
+> 表在 `bridge/lib/pi-models.js`，维护方式见 `docs/ADR/005-pi-model-context-metadata.md`。要加一个家族：加一行（**必须带 `source`**），在 `FAMILY_PROBES` 里加一条探针，测试就自动开始盯它。
+
 ### 5.6 我搞坏了，想退回去
 
 ```bash
@@ -224,6 +263,9 @@ node bridge/cli.js apply
 | 某端完全没被同步 | 它还是 `native`（默认） | 先 `adopt <agent>` |
 | 某端显示"未检测到" | 该 agent 目录不存在 | 先启动一次该 agent，再 `status` 确认 |
 | **`doctor` 报 `REQUIREMENT_MISSING`** | 该端读配置的**程序**没了（配置本身是好的） | 按 `doctor` 给出的 → 命令装回来，例如 `pi install npm:pi-mcp-adapter`；详见 §5.8 |
+| **`doctor` 报 `PI_CATALOG_CONTEXT_STALE`** | pi-smart-router 目录里某个模型的上下文窗口和 pi 发布的数据不一致，且它**不会自己刷新** | 按报错里的 `selector` 与期望值改 `~/.pi/agent/pi-router-catalog.json`；详见 §5.9 |
+| **`doctor` 报 `PI_MODEL_TABLE_STALE`** | 本项目自己的家族表（`bridge/lib/pi-models.js`）跟不上 pi 发布的 provider 数据了 | 这是**仓库的**问题：按报错里的 `file` 与两个数字更新 `FAMILY_META`，并确认 `source` 仍准确 |
+| **`doctor` 报 `PI_CATALOG_UNREADABLE`** | `pi-router-catalog.json` 不是合法 JSON | 修好它，或删掉（pi-smart-router 会回落到自带 seed） |
 | `apply` 报"缺少环境变量 X" | `secrets.env` 未填该变量 | 填上，或从配置里移除该引用 |
 | `revoke` 报"快照不完整" | 快照被手工删改 | 按报错列出的路径手工恢复；不要指望工具硬撑 |
 | pi 里闸门没生效 | 扩展目录未被加载或 pi 未 reload | 重启 pi 或 `/reload`；在 pi 里跑 `/status` 看已加载扩展 |

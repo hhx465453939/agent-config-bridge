@@ -4,7 +4,7 @@
   "detect": [".pi"],
   "home_hint": "~/.pi",
   "verified": true,
-  "notes": "Paths verified against pi's own documentation (skills.md, configuration.md, prompt-templates.md) and the pi-mcp-adapter README (v3.2). Skills are DECLARED AS A LINK rather than copied: pi documents ~/.agents/skills/ as a natively supported location, and sharing it by link gives pi the source's skills with no duplication and no drift to reconcile. The bridge CREATES that link (a symlink on POSIX, a junction on Windows) on the first adopt when it is missing, and recreates it if it was deleted. The rules document goes to ~/AGENTS.md rather than ~/.pi/agent/AGENTS.md because pi loads context files from both the agent directory and the working-directory chain, so a second copy under ~/.pi would make the model read the same rules twice. NOTE: pi 0.87 has no built-in MCP support; MCP reaches pi through the pi-mcp-adapter package, which since v3 reads ~/.pi/agent/mcp-adapter.json (it renamed the file from mcp.json and reserves mcp.json for a future pi built-in). Install or update it with `pi install npm:pi-mcp-adapter`.",
+  "notes": "Paths verified against pi's own documentation (skills.md, configuration.md, prompt-templates.md) and the pi-mcp-adapter README (v3.2). Skills are DECLARED AS A LINK rather than copied: pi documents ~/.agents/skills/ as a natively supported location, and sharing it by link gives pi the source's skills with no duplication and no drift to reconcile. The bridge CREATES that link (a symlink on POSIX, a junction on Windows) on the first adopt when it is missing, and recreates it if it was deleted. The rules document goes to ~/AGENTS.md rather than ~/.pi/agent/AGENTS.md because pi loads context files from both the agent directory and the working-directory chain, so a second copy under ~/.pi would make the model read the same rules twice. NOTE: pi 0.87 has no built-in MCP support; MCP reaches pi through the pi-mcp-adapter package, which since v3 reads ~/.pi/agent/mcp-adapter.json (it renamed the file from mcp.json and reserves mcp.json for a future pi built-in). Install or update it with `pi install npm:pi-mcp-adapter`. NOTE ON MODEL METADATA: pi-smart-router keeps its own copy of every model's contextWindow in ~/.pi/agent/pi-router-catalog.json, and its merge is sticky (an existing value always wins), so a stale number there is permanent. That file is listed under never_touch — the bridge reports a mismatch via `doctor` (PI_CATALOG_CONTEXT_STALE) and deliberately does not rewrite it; see bridge/lib/pi-models.js for why.",
   "managed": [
     {
       "kind": "skill",
@@ -67,6 +67,7 @@
     ".pi/agent/settings.json",
     ".pi/agent/keybindings.json",
     ".pi/agent/models.json",
+    ".pi/agent/models-store.json",
     ".pi/agent/auth.json",
     ".pi/agent/APPEND_SYSTEM.md",
     ".pi/agent/extensions",
@@ -75,6 +76,7 @@
     ".pi/agent/npm",
     ".pi/agent/.debug",
     ".pi/agent/pi-router.json",
+    ".pi/agent/pi-router-catalog.json",
     ".agents/shared"
   ]
 }
