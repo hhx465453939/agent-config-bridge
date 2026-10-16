@@ -1,9 +1,9 @@
 {
   "name": "graph-first-gate",
-  "version": 1,
-  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces: source files may not be read before the code graph has been consulted. Mounted through the `tools/pre-execute` waterfall.",
+  "version": 2,
+  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces: source files may not be read before the code graph has been consulted. Mounted through the `tools/pre-execute` waterfall. v2 (2026-10-16) shares the engine changes: 10-minute session window, scoped unlocks (a query keeps its named files/packages readable for 30 minutes), bash reads are gated where the harness reports them, and the block cap is 30 instead of 3.",
   "reminder": "",
-  "checks": ["graph-before-read"],
+  "checks": ["graph-before-read", "bash-graph-before-read"],
   "config": {
     "project_roots": [],
     "exclude_globs": [
@@ -16,8 +16,10 @@
       "**/.venv/**",
       "**/target/**"
     ],
-    "max_blocks_per_session": 3,
-    "signal_ttl_ms": 3600000,
+    "max_blocks_per_session": 30,
+    "signal_ttl_ms": 600000,
+    "unlock_ttl_ms": 1800000,
+    "bash_read_check": true,
     "index_marker": ".codebase-memory"
   }
 }

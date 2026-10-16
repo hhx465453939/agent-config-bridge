@@ -1,9 +1,9 @@
 {
   "name": "graph-first-gate",
-  "version": 1,
-  "description": "Enforce the rules document instead of trusting the model to follow it: source files may not be read before the code graph has been consulted. Ported from the reference implementation that has been running on the authors' own machines. Reviewed on 2026-09-29 against a real Windows 11 machine, where the gate is installed at ~/.pi/agent/extensions/enforce-rules/.",
-  "reminder": "[system-reminder · 三层代码阅读铁律 · 每轮生效]\nread 代码文件前必须按序走 fallback，禁止跳层：\n  Layer 1 图谱查询：先用 codebase-memory MCP（search_graph / trace_path / get_code_snippet / query_graph / get_architecture / search_code）查代码结构与调用关系；\n  Layer 2 索引保障：项目未索引、或索引/embedding 过期（代码比索引新）时，先 index_repository 建索引 / detect_changes 检查更新，完成后回到 Layer 1 查图谱——不允许索引完直接 read；\n  Layer 3 直读兜底：仅当图谱确实无法满足（非代码文件、图谱查不到、本会话自己改动的文件）才直接 read。\n本会话内图谱查询成功一次后闸门即放行；跳过 Layer 1/2 直接 read 项目代码 = 违规，会被工具闸门拦截。",
-  "checks": ["index-before-read", "index-freshness-before-read", "graph-before-read"],
+  "version": 2,
+  "description": "Enforce the rules document instead of trusting the model to follow it: source files may not be read before the code graph has been consulted. v2 (2026-10-16) closes three holes found on a real Windows 11 machine: (1) one successful query used to unlock an hour of free reading — the session window is now 10 minutes; (2) bash reads (cat/grep/sed -n, and read calls inside python/node one-liners) were completely ungated — they now go through the same Layer-1 rule; (3) a scoped unlock records *what* a query was about (named files / packages / directories) so a targeted query keeps its target readable for 30 minutes without buying a repository-wide pass. The block cap was raised from 3 to 30 because giving up after three blocks made the gate cosmetic.",
+  "reminder": "[system-reminder · 三层代码阅读铁律 · 每轮生效]\nread 代码文件前必须按序走 fallback，禁止跳层：\n  Layer 1 图谱查询：先用 codebase-memory MCP（search_graph / trace_path / get_code_snippet / query_graph / get_architecture / search_code）查代码结构与调用关系；\n  Layer 2 索引保障：项目未索引、或索引/embedding 过期（代码比索引新）时，先 index_repository 建索引 / detect_changes 检查更新，完成后回到 Layer 1 查图谱——不允许索引完直接 read；\n  Layer 3 直读兜底：仅当图谱确实无法满足（非代码文件、图谱查不到、本会话自己改动的文件）才直接 read。\n闸门强度：一次成功的图谱查询给 10 分钟会话窗口；查询里具体提到的文件/包/目录另给 30 分钟作用域解锁（例如查过 client.js，读它不需再查，读别的文件要另查）。\n用 bash 读源码（cat / head / grep / sed -n / python -c \"open(...)\" 等）与用 read 工具同罪，同样被拦截；git status / ls 等不看内容的命令不受影响。\n跳过 Layer 1/2 直接 read 项目代码 = 违规，会被工具闸门拦截。",
+  "checks": ["index-before-read", "index-freshness-before-read", "graph-before-read", "bash-graph-before-read"],
   "config": {
     "project_roots": [],
     "exclude_globs": [
@@ -16,8 +16,10 @@
       "**/.venv/**",
       "**/target/**"
     ],
-    "max_blocks_per_session": 3,
-    "signal_ttl_ms": 3600000,
+    "max_blocks_per_session": 30,
+    "signal_ttl_ms": 600000,
+    "unlock_ttl_ms": 1800000,
+    "bash_read_check": true,
     "index_marker": ".codebase-memory",
     "index_mtime_epsilon_ms": 2000,
     "index_mtime_ttl_ms": 30000

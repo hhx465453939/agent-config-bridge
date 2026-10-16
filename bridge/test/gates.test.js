@@ -389,10 +389,15 @@ test('gate: the shipped cascade reports the missing index before the graph rule'
   // first, an unindexed repository hears "the index exists, query the graph" —
   // a false statement — and the Layer-2 rules can never fire.
   const shipped = JSON.parse(readFileSync(join(BRIDGE_DIR, 'gates', 'pi', 'policy.json'), 'utf8'));
-  assert.deepEqual(
-    shipped.checks,
-    ['index-before-read', 'index-freshness-before-read', 'graph-before-read'],
-    'pi policy: Layer-2 checks must precede graph-before-read',
+  // Assert the ORDER INVARIANT, not a frozen array: v2 added the bash read rule,
+  // and a future rule must not be able to slip in front of Layer 2 either.
+  const layer2 = shipped.checks.filter((c) => c.startsWith('index-'));
+  const layer1 = shipped.checks.filter((c) => c.startsWith('graph-') || c.startsWith('bash-graph-'));
+  assert.ok(layer2.length >= 2, 'pi policy: both Layer-2 checks are present');
+  assert.ok(layer1.length >= 1, 'pi policy: Layer-1 checks are present');
+  assert.ok(
+    shipped.checks.lastIndexOf(layer2[layer2.length - 1]) < shipped.checks.indexOf(layer1[0]),
+    'pi policy: Layer-2 checks must precede every Layer-1 check',
   );
 
   const repo = abs('/repo');

@@ -23,9 +23,11 @@ import {
   normalizePath,
   policyFromObject,
   recordSignal,
+  recordUnlocks,
   recordWrite,
   reminderFor,
   shouldBlock,
+  unlockTokensFromText,
 } from '../policy.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -40,6 +42,13 @@ const HERE = dirname(fileURLToPath(import.meta.url));
  */
 export const realFs = {
   exists: (p) => existsSync(p),
+  isFile: (p) => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  },
   statMtime: (p) => {
     try {
       return statSync(p).mtimeMs;
@@ -164,6 +173,7 @@ export default function enforceRules(pi, options = {}) {
     state.blocks = 0;
     state.signals = 0;
     state.written.clear();
+    state.unlocks.clear();
     if (typeof ctx?.cwd === 'string' && ctx.cwd) sessionCwd = ctx.cwd;
     if (error) {
       // A gate that cannot load its policy is OFF. Say so loudly: in a headless
@@ -211,6 +221,34 @@ export default function enforceRules(pi, options = {}) {
       return;
     }
 
+    // Bash reads count as reads. `cat src/a.ts`, `grep x packages/…` and
+    // `sed -n '1,20p' file` are the same act as the `read` tool; leaving them
+    // ungated was the hole that made the gate cosmetic (2026-10-16).
+    if (name === 'bash') {
+      const verdict = shouldBlock({
+        policy,
+        input: {
+          action: 'bash',
+          path: null,
+          tool: name,
+          command: typeof event.input?.command === 'string' ? event.input.command : '',
+          cwd,
+        },
+        state,
+        fs: realFs,
+      });
+      if (verdict.block) {
+        if (ctx?.hasUI) {
+          ctx.ui.notify(
+            `enforce-rules [${verdict.code}] block ${state.blocks}/${policy.config.max_blocks_per_session}`,
+            'warn',
+          );
+        }
+        return { block: true, reason: verdict.reason };
+      }
+      return;
+    }
+
     if (name !== 'read') return;
 
     const verdict = shouldBlock({
@@ -240,22 +278,43 @@ export default function enforceRules(pi, options = {}) {
     return;
   });
 
+  /** All string leaves of a tool input, so a query's arguments become unlocks. */
+  const inputStrings = (value, out = []) => {
+    if (typeof value === 'string') out.push(value);
+    else if (Array.isArray(value)) for (const item of value) inputStrings(item, out);
+    else if (value && typeof value === 'object') for (const item of Object.values(value)) inputStrings(item, out);
+    return out;
+  };
+
+  /** Text of a tool result, for the shape pi reports (`{content:[{text}]}`). */
+  const resultText = (result) => {
+    if (typeof result === 'string') return result;
+    if (!result || typeof result !== 'object') return '';
+    if (typeof result.text === 'string') return result.text;
+    if (Array.isArray(result.content)) {
+      return result.content
+        .map((block) => (typeof block === 'string' ? block : typeof block?.text === 'string' ? block.text : ''))
+        .join('\n');
+    }
+    return '';
+  };
+
   pi.on('tool_result', async (event) => {
     if (event.isError) return;
-    // Only a *successful* graph query unlocks the session. A failed query means
-    // the model has not actually learned anything yet.
-    if (isSignalTool(event.toolName)) {
-      recordSignal(state);
-      return;
-    }
-    // pi-mcp-adapter's default proxy mode reports every MCP call as the single
-    // `mcp` tool and names the real tool in the input. Count a successful proxy
-    // call to a graph tool as a query too: without this the gate could never
-    // open on a host whose MCP tools are proxy-only, and it would silently
-    // degrade to "block three reads, then stop enforcing".
-    if (event.toolName === 'mcp' && isSignalTool(String(event.input?.tool ?? ''))) {
-      recordSignal(state);
-    }
+    const proxied = event.toolName === 'mcp' ? String(event.input?.tool ?? '') : '';
+    const isGraph =
+      isSignalTool(event.toolName) || (proxied !== '' && isSignalTool(proxied));
+    if (!isGraph) return;
+    // Only a *successful* graph query unlocks. A failed query means the model
+    // has not actually learned anything yet.
+    const now = Date.now();
+    recordSignal(state, now);
+    // …and remember *what the query was about*: arguments plus the result text
+    // become scoped unlocks, so a query about one file/package never buys a
+    // free pass for the whole repository — but the file it named stays readable
+    // for `unlock_ttl_ms` without another round-trip.
+    recordUnlocks(state, unlockTokensFromText(inputStrings(event.input).join('\n')), now);
+    recordUnlocks(state, unlockTokensFromText(resultText(event.result)), now);
   });
 
   pi.on('context', async (event) => {

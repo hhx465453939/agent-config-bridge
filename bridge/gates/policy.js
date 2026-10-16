@@ -40,7 +40,7 @@
  * rules are expressed as explicit checks rather than as "policy failed to load".
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, normalize, posix, relative, resolve, sep } from 'node:path';
 
 const WIN32 = process.platform === 'win32';
@@ -72,9 +72,28 @@ export const DEFAULT_CONFIG = {
   /** Extensionless files that are still source code. */
   code_filenames: ['Dockerfile', 'Containerfile', 'Makefile', 'Rakefile', 'Gemfile', 'Procfile'],
   /** How many times one session may be blocked before the gate gives up. */
-  max_blocks_per_session: 3,
-  /** A graph query newer than this many ms counts as fresh. */
-  signal_ttl_ms: 60 * 60 * 1000,
+  max_blocks_per_session: 30,
+  /**
+   * A graph query newer than this many ms counts as fresh, session-wide.
+   *
+   * Keep this SHORT. The first version let a single query unlock an hour of
+   * reading: the model asked the graph once, then read the tree freely — which
+   * is exactly the failure the gate exists to prevent. Ten minutes covers a
+   * burst of reads and forces the next burst to consult the graph again.
+   */
+  signal_ttl_ms: 10 * 60 * 1000,
+  /**
+   * An *unlock* is stronger evidence than a session signal: the graph query
+   * actually mentioned this file / package / directory, so it stays valid for
+   * longer than the blanket signal.
+   */
+  unlock_ttl_ms: 30 * 60 * 1000,
+  /**
+   * Gate read-like bash commands (`cat`, `grep`, `sed -n`, …) as reads.
+   * Reading source through the shell is the same act as reading it with the
+   * `read` tool, and used to be the one hole that made the gate cosmetic.
+   */
+  bash_read_check: true,
   /** Where an index marker directory is expected, for advisory reasons. */
   index_marker: '.codebase-memory',
   /**
@@ -282,6 +301,12 @@ export const newSessionState = () => ({
   signals: 0,
   /** Timestamp of the most recent signal (ms). */
   lastSignalAt: 0,
+  /**
+   * Scoped unlocks: path tokens that a successful graph query actually named
+   * (file, package dir, module). A read is allowed when its normalized path
+   * contains a fresh unlock — "the graph was asked about this, specifically".
+   */
+  unlocks: new Map(),
   /** Files this session itself wrote; reading them back is always fine. */
   written: new Set(),
   /** How many times the gate has blocked, to bound the damage of a false rule. */
@@ -349,6 +374,172 @@ export const recordWrite = (state, path) => {
 
 export const hasFreshSignal = (state, ttlMs, now = Date.now()) =>
   state.signals > 0 && now - state.lastSignalAt <= ttlMs;
+
+// ---------------------------------------------------------------------------
+// Scoped unlocks: "the graph query actually talked about this file"
+// ---------------------------------------------------------------------------
+
+/** Shortest token kept; below this the substring match starts lying ("a", "js"). */
+const UNLOCK_MIN_LEN = 4;
+/** Hard cap so a huge query result cannot grow the map without bound. */
+const MAX_UNLOCKS = 4000;
+/** Directory names too common to mean anything on their own. */
+const GENERIC_DIR_SEGMENTS = new Set([
+  'packages', 'package', 'src', 'source', 'lib', 'libs', 'test', 'tests', 'spec',
+  'app', 'apps', 'docs', 'doc', 'bridge', 'scripts', 'script', 'bin', 'dist',
+  'build', 'out', 'output', 'node_modules', 'vendor', 'python', 'site-packages',
+  'development', 'projects', 'repos', 'workspace', 'workspaces',
+]);
+
+/** One spelling for a token: forward slashes, no drive prefix, lowercase. */
+export const normalizeUnlockToken = (token) => {
+  if (typeof token !== 'string') return null;
+  const cleaned = token
+    .replace(/\\/g, '/')
+    .replace(/^[a-z]:/i, '')
+    .replace(/^\/+/, '')
+    .trim()
+    .toLowerCase();
+  return cleaned.length >= UNLOCK_MIN_LEN ? cleaned : null;
+};
+
+/**
+ * Turn free text (usually a graph query's arguments or its result) into
+ * unlock tokens.
+ *
+ * The tokens are *path suffixes* — the basename, the last few segments, and
+ * the whole drive-stripped path — never bare generic directories. A query that
+ * mentioned `packages/xyb/client.js` must unlock that file (and its suffix
+ * spellings), not every file under `packages/`: an unlock is evidence about a
+ * named target, and evidence that broad is not evidence.
+ */
+export const unlockTokensFromText = (text, { limit = 400, maxSuffixSegments = 4 } = {}) => {
+  if (typeof text !== 'string' || text === '') return [];
+  const tokens = new Set();
+  const pathish = /[A-Za-z0-9_@.$-]+(?:[\\/][A-Za-z0-9_@.$-]+)+/g;
+  for (const match of text.match(pathish) ?? []) {
+    const key = normalizeUnlockToken(match);
+    if (!key) continue;
+    const segments = key.split('/').filter(Boolean);
+    // Suffixes of the path: basename, last two, last three … up to maxSuffixSegments.
+    // `c:\repo\packages\xyb\client.js` contains `packages/xyb/client.js`, so the
+    // suffix form matches absolute paths on any machine.
+    const max = Math.min(segments.length, maxSuffixSegments);
+    for (let take = 1; take <= max; take += 1) {
+      const suffix = segments.slice(-take).join('/');
+      if (suffix.length >= UNLOCK_MIN_LEN) tokens.add(suffix);
+    }
+    // The immediate parent is useful when the file itself is renamed, but only
+    // when it is specific enough to mean something (see the doc above).
+    const parent = segments[segments.length - 2];
+    if (parent && parent.length >= UNLOCK_MIN_LEN && !GENERIC_DIR_SEGMENTS.has(parent)) tokens.add(parent);
+    if (tokens.size >= limit) break;
+  }
+  return [...tokens].slice(0, limit);
+};
+
+/** Record tokens as unlocks; returns how many were stored. */
+export const recordUnlocks = (state, tokens, now = Date.now()) => {
+  if (!state?.unlocks || !tokens) return 0;
+  let added = 0;
+  for (const raw of tokens) {
+    const key = normalizeUnlockToken(raw);
+    if (!key) continue;
+    state.unlocks.set(key, now);
+    added += 1;
+    if (state.unlocks.size > MAX_UNLOCKS) state.unlocks.delete(state.unlocks.keys().next().value);
+  }
+  return added;
+};
+
+/**
+ * May this path be read right now?
+ *
+ * True when either the whole session has a fresh signal (short TTL — see
+ * DEFAULT_CONFIG) or the path itself was named by a fresh unlock.
+ */
+export const hasUnlock = (state, path, config = DEFAULT_CONFIG, now = Date.now()) => {
+  if (hasFreshSignal(state, config.signal_ttl_ms, now)) return true;
+  if (!path || !state?.unlocks || state.unlocks.size === 0) return false;
+  const norm = String(path).replace(/\\/g, '/').toLowerCase();
+  for (const [key, at] of state.unlocks) {
+    if (now - at > config.unlock_ttl_ms) continue;
+    if (norm.includes(key)) return true;
+  }
+  return false;
+};
+
+// ---------------------------------------------------------------------------
+// bash reads: cat / grep / sed -n / python -c "open(...)" are reads too
+// ---------------------------------------------------------------------------
+
+/** Commands whose arguments are files opened for reading. */
+const BASH_READ_VERBS = new Set([
+  'cat', 'tac', 'head', 'tail', 'sed', 'awk', 'grep', 'egrep', 'fgrep', 'rg',
+  'less', 'more', 'view', 'strings', 'xxd', 'od', 'wc', 'cut', 'sort', 'uniq',
+  'diff', 'cmp', 'comm', 'file', 'bat', 'nl', 'fold', 'paste', 'join', 'tr',
+  'split', 'csplit',
+]);
+
+/** Read-call patterns that hide a path inside a one-liner script. */
+const BASH_READ_CALL = /\b(?:open|read_text|read_text_sync|readFileSync|readFile)\s*\(/;
+
+/** Default file probe; injected in tests so the rule layer stays disk-free. */
+const defaultIsFile = (p) => {
+  try {
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Extract the files a bash command would open for reading.
+ *
+ * Conservative on purpose: only files that exist, look like source and are not
+ * excluded count; globs and URLs are skipped because the rule cannot know what
+ * they hit. Interpreters (`node script.mjs`) are execution, not reading, so
+ * they are not verbs — but an explicit read call inside `-e`/`-c` still counts.
+ */
+export const bashReadTargets = (command, { config = DEFAULT_CONFIG, cwd = null, isFile = defaultIsFile, exists = () => false } = {}) => {
+  if (typeof command !== 'string' || command === '') return [];
+  const spool = [];
+  const push = (token) => {
+    if (!token || token.startsWith('-')) return;
+    if (/^[a-z]+:\/\//i.test(token)) return; // URL
+    if (/[*?[\]{}]/.test(token)) return; // glob: unknowable here
+    const candidate = isAbsolute(token) ? token : join(cwd ?? process.cwd(), token);
+    if (!isFile(candidate)) return;
+    if (!isCodeFile(candidate, config)) return;
+    if (isExcluded(candidate, config)) return;
+    spool.push(normalize(candidate));
+  };
+  for (const segment of command.split(/\s*(?:&&|\|\||;|\n|\|)\s*/)) {
+    const tokens = segment.match(/"[^"]*"|'[^']*'|[^\s]+/g);
+    if (!tokens || tokens.length === 0) continue;
+    const verb = tokens[0].replace(/^.*[\\/]/, '').toLowerCase();
+    const bare = tokens.slice(1).map((t) => t.replace(/^["']|["']$/g, ''));
+    if (BASH_READ_VERBS.has(verb)) {
+      // `sed -n '1,20p' file` / `grep pattern file`: skip non-path operands
+      for (const token of bare) push(token);
+      continue;
+    }
+    if (BASH_READ_CALL.test(segment)) {
+      for (const token of bare) {
+        // The path hides inside a quoted expression: python -c "open('a/b.js')"
+        const quoted = token.match(/'[^']+'|"[^"]+"/g) ?? [];
+        const candidates = quoted.length > 0 ? quoted.map((q) => q.slice(1, -1)) : [token];
+        for (const cand of candidates) {
+          if (!/[\\/]|\.(?:js|mjs|cjs|ts|tsx|py|md|json|html|css|vue|svelte)$/i.test(cand)) continue;
+          push(cand);
+        }
+      }
+    }
+  }
+  // `exists` is accepted for symmetry with the other probes; `isFile` already ran.
+  void exists;
+  return [...new Set(spool)];
+};
 
 // ---------------------------------------------------------------------------
 // Index freshness
@@ -433,19 +624,56 @@ const CHECKS = {
     const scope = scopeOf(input.path, { config: policy.config, exists: deps.exists });
     if (!scope.inScope) return null;
     if (deps.state.written.has(input.path)) return null;
-    if (hasFreshSignal(deps.state, policy.config.signal_ttl_ms, deps.now)) return null;
+    if (hasUnlock(deps.state, input.path, policy.config, deps.now)) return null;
     return {
       code: 'GRAPH_FIRST',
       reason: [
-        '⛔ 三层铁律 · Layer 1 拦截：项目已建立 codebase-memory 索引，但本会话尚未有任何一次成功的图谱查询。',
+        '⛔ 三层铁律 · Layer 1 拦截：本次读取没有图谱依据。',
         `  文件：${input.path}`,
         `  依据：${scope.reason}（项目根：${scope.root ?? '未知'}）`,
         '',
-        '必须先用查询类工具：search_graph / trace_path / get_code_snippet / query_graph /',
-        'get_architecture / search_code。任何一次成功之后，本会话的闸门即放行，行级阅读不再受限。',
+        '解除方式（二选一，都需要**成功**的图谱调用）：',
+        '  a) 针对本文件/本包查一次：search_graph / trace_path / get_code_snippet /',
+        '     query_graph / get_architecture / search_code（查询里提到文件名或包名，',
+        '     命中后 30 分钟内该目标的读取都放行）；',
+        '  b) 任何一次成功的图谱调用会给本会话一个 10 分钟的窗口（窗口很短，',
+        '     过了就要重新查）。',
         '本会话内你自己刚改过的文件不受此限制。',
         '这是 AGENTS.md 的强制规则（先问图谱，再无细节，最后才读文件），不是可选项。',
       ].join('\n'),
+    };
+  },
+
+  /** The same rule for reads that arrive as bash commands (cat/grep/sed -n/…). */
+  'bash-graph-before-read': (policy, input, deps) => {
+    if (input.action !== 'bash') return null;
+    if (policy.config.bash_read_check === false) return null;
+    const targets = bashReadTargets(input.command, {
+      config: policy.config,
+      cwd: input.cwd ?? null,
+      isFile: deps.isFile,
+      exists: deps.exists,
+    });
+    if (targets.length === 0) return null;
+    const target = targets[0];
+    const scope = scopeOf(target, { config: policy.config, exists: deps.exists });
+    if (!scope.inScope) return null;
+    if (deps.state.written.has(normalizePath(target))) return null;
+    if (hasUnlock(deps.state, target, policy.config, deps.now)) return null;
+    return {
+      code: 'GRAPH_FIRST_BASH',
+      reason: [
+        '⛔ 三层铁律 · Layer 1 拦截：用 bash 读源码和用 read 工具读源码是同一件事。',
+        `  命令：${String(input.command).slice(0, 200)}`,
+        `  目标文件：${target}`,
+        targets.length > 1 ? `  （共识别到 ${targets.length} 个目标，只列了第一个）` : '',
+        '',
+        '先查图谱（search_graph / trace_path / get_code_snippet / query_graph /',
+        'get_architecture / search_code），查询里提到该文件或所在包，然后重试。',
+        'git status / git log / ls 等不读内容的命令不受影响。',
+      ]
+        .filter(Boolean)
+        .join('\n'),
     };
   },
 
@@ -455,7 +683,7 @@ const CHECKS = {
     const scope = scopeOf(input.path, { config: policy.config, exists: deps.exists });
     if (!scope.inScope || !scope.root) return null;
     if (deps.state.written.has(input.path)) return null;
-    if (hasFreshSignal(deps.state, policy.config.signal_ttl_ms, deps.now)) return null;
+    if (hasUnlock(deps.state, input.path, policy.config, deps.now)) return null;
     const marker = join(scope.root, policy.config.index_marker);
     if (deps.exists(marker)) return null;
     return {
@@ -496,7 +724,7 @@ const CHECKS = {
     const scope = scopeOf(input.path, { config: policy.config, exists: deps.exists });
     if (!scope.inScope || !scope.root) return null;
     if (deps.state.written.has(input.path)) return null;
-    if (hasFreshSignal(deps.state, policy.config.signal_ttl_ms, deps.now)) return null;
+    if (hasUnlock(deps.state, input.path, policy.config, deps.now)) return null;
 
     const marker = join(scope.root, policy.config.index_marker);
     if (!deps.exists(marker)) return null; // index-before-read owns that case
