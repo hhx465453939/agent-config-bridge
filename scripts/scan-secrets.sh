@@ -67,6 +67,10 @@ ALLOW_PATTERNS=(
   'loopback|(^|[^0-9])127\.0\.0\.1([^0-9]|$)|(^|[^0-9])0\.0\.0\.0([^0-9]|$)'
   'public-hosts|(^|[^a-z0-9-])(github\.com|gitlab\.com|npmjs\.com|nodejs\.org|example\.com|agentskills\.io|opensource\.org|mit\.edu)([^a-z0-9.-]|$)'
   'placeholders|<[^<>[:space:]]+>|\$\{[A-Za-z_][A-Za-z0-9_]*\}|xxxx+|your-|your_'
+  # Benign public code that contains the word "token" followed by ':' or '='.
+  # It exists in v2 history; without this exception a clean history scan is
+  # permanently red on a string that is not a credential.
+  'benign-token-code|One spelling for a token: forward|isAbsolute\(token\)'
 )
 
 ALLOW_RE="$(printf '%s\n' "${ALLOW_PATTERNS[@]}" | cut -d'|' -f2- | paste -sd'|' -)"

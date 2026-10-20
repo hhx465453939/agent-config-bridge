@@ -1,9 +1,15 @@
 {
   "name": "graph-first-gate",
-  "version": 2,
-  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces: source files may not be read before the code graph has been consulted. Mounted through the `tools/pre-execute` waterfall. v2 (2026-10-16) shares the engine changes: 10-minute session window, scoped unlocks (a query keeps its named files/packages readable for 30 minutes), bash reads are gated where the harness reports them, and the block cap is 30 instead of 3.",
+  "version": 3,
+  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces. v3 shares the engine fixes: the cap no longer disables safety checks, shell writes are covered, the bash reader understands cd/git/find/xargs/recursive greps, destructive commands are denied, and empty graph results no longer count. dsh has no result hook and no per-turn context injection, so graph_signal_requires_content stays off and the Layer-0 checks that need result/read evidence (think-before-write, no-blind-retry) are not enabled here. bash reads are now actually gated (v2 listed the check but the adapter never passed bash events).",
   "reminder": "",
-  "checks": ["graph-before-read", "bash-graph-before-read"],
+  "checks": [
+    "no-write-outside",
+    "no-secret-write",
+    "no-destructive-bash",
+    "graph-before-read",
+    "bash-graph-before-read"
+  ],
   "config": {
     "project_roots": [],
     "exclude_globs": [
@@ -20,6 +26,13 @@
     "signal_ttl_ms": 600000,
     "unlock_ttl_ms": 1800000,
     "bash_read_check": true,
-    "index_marker": ".codebase-memory"
+    "index_marker": ".codebase-memory",
+    "graph_signal_requires_content": false,
+    "graph_signal_min_chars": 40,
+    "require_target_evidence": true,
+    "require_conventions": false,
+    "max_identical_failures": 2,
+    "retry_window_ms": 600000,
+    "destructive_allow_patterns": []
   }
 }

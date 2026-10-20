@@ -28,17 +28,22 @@
  *     documented way to contribute prompt text.
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   loadPolicy,
   newSessionState,
+  normalizePath,
   policyFromObject,
+  recordInspection,
+  recordInvestigation,
   recordSignal,
+  recordUnlocks,
   recordWrite,
   shouldBlock,
+  unlockTokensFromText,
 } from '../policy.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -63,6 +68,32 @@ export const firstExistingPolicy = (here, explicit, exists = existsSync) => {
 
 export const name = 'enforce-rules';
 
+/** The full probe set the policy expects, not just `exists`. */
+const realFs = {
+  exists: (p) => existsSync(p),
+  isFile: (p) => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  },
+  statMtime: (p) => {
+    try {
+      return statSync(p).mtimeMs;
+    } catch {
+      return 0;
+    }
+  },
+  listDir: (dir) => {
+    try {
+      return readdirSync(dir);
+    } catch {
+      return [];
+    }
+  },
+};
+
 /** Graph-query tool names that satisfy the "ask the graph first" rule. */
 const SIGNAL_TOOLS = [
   'search_graph',
@@ -73,8 +104,8 @@ const SIGNAL_TOOLS = [
   'search_code',
 ];
 
-const WRITE_TOOLS = new Set(['write', 'edit']);
-const READ_TOOLS = new Set(['read']);
+const WRITE_TOOLS = new Set(['write', 'edit', 'apply_patch', 'str_replace_editor', 'create_file', 'multi_edit']);
+const READ_TOOLS = new Set(['read', 'read_file', 'view', 'open_file']);
 
 const isSignalTool = (toolName) =>
   SIGNAL_TOOLS.some((s) => toolName === s || toolName.endsWith(`_${s}`));
@@ -84,6 +115,12 @@ const str = (args, key) => {
   if (args && typeof args === 'object' && typeof args[key] === 'string') return args[key];
   return null;
 };
+
+const argPath = (args) => str(args, 'file_path') ?? str(args, 'path');
+const argContent = (args) =>
+  ['content', 'new_string', 'newText', 'patch', 'text']
+    .map((key) => str(args, key))
+    .find((value) => value !== null) ?? null;
 
 export function apply(ctx, config = {}) {
   // An inline `policy` object lets a host inject configuration; `policyPath`
@@ -129,31 +166,50 @@ export function apply(ctx, config = {}) {
   ctx.on('tools/pre-execute', async (exec, next) => {
     const toolName = String(exec?.name ?? '');
     const args = exec?.arguments;
+    const cwd = typeof exec?.cwd === 'string' && exec.cwd
+      ? exec.cwd
+      : typeof config.cwd === 'string' && config.cwd
+        ? config.cwd
+        : process.cwd();
 
     if (WRITE_TOOLS.has(toolName)) {
-      const path = str(args, 'file_path');
-      recordWrite(state, path);
+      const path = normalizePath(argPath(args), cwd);
       const verdict = shouldBlock({
         policy,
-        input: {
-          action: 'write',
-          path,
-          tool: toolName,
-          content: str(args, 'content'),
-        },
+        input: { action: 'write', path, tool: toolName, content: argContent(args) },
         state,
-        exists: existsSync,
+        fs: realFs,
       });
       if (verdict.block) return { kind: 'deny', reason: verdict.reason };
+      // Record only after the gate allows: a blocked write is not a file this
+      // session may later read back freely.
+      recordWrite(state, path);
+      recordInvestigation(state);
       return next();
     }
 
     if (READ_TOOLS.has(toolName)) {
+      const path = normalizePath(argPath(args), cwd);
       const verdict = shouldBlock({
         policy,
-        input: { action: 'read', path: str(args, 'file_path'), tool: toolName },
+        input: { action: 'read', path, tool: toolName },
         state,
-        exists: existsSync,
+        fs: realFs,
+      });
+      if (verdict.block) return { kind: 'deny', reason: verdict.reason };
+      // dsh's pre-execute cannot see the result. Recording the inspection here
+      // errs toward opening Layer 0; the denial path above is still exact.
+      recordInspection(state, path);
+      return next();
+    }
+
+    if (toolName === 'bash') {
+      const command = str(args, 'command') ?? '';
+      const verdict = shouldBlock({
+        policy,
+        input: { action: 'bash', path: null, tool: toolName, command, cwd },
+        state,
+        fs: realFs,
       });
       if (verdict.block) return { kind: 'deny', reason: verdict.reason };
       return next();
@@ -161,8 +217,11 @@ export function apply(ctx, config = {}) {
 
     if (isSignalTool(toolName)) {
       // Recorded on the way in; see the file header for why success is not
-      // awaited on this harness.
-      recordSignal(state);
+      // awaited on this harness. Arguments still become scoped unlocks, which
+      // is the best evidence available without a result hook.
+      const now = Date.now();
+      recordSignal(state, now);
+      recordUnlocks(state, unlockTokensFromText(JSON.stringify(args ?? {})), now);
     }
 
     return next();

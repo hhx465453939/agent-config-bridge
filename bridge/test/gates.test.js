@@ -384,20 +384,28 @@ test('gate: a fresh index lets the read through, leaving only the graph rule', (
   assert.equal(absent.code, 'INDEX_FIRST');
 });
 
-test('gate: the shipped cascade reports the missing index before the graph rule', () => {
-  // The policy FILE is under test here, not the engine: with `graph-before-read`
-  // first, an unindexed repository hears "the index exists, query the graph" —
-  // a false statement — and the Layer-2 rules can never fire.
+test('gate: the shipped cascade uses evidence instead of a false index marker', () => {
+  // The policy FILE is under test here, not the engine. v3 makes
+  // `index-before-read` opt-in: a normal codebase-memory index lives in the
+  // tool's own data directory, so `<repo>/.codebase-memory` is absent on a
+  // perfectly indexed repository. Keeping that check on by default blocked
+  // every read until the cap and then switched the whole gate off. Layer 2 is
+  // now enforced by evidence: an empty graph result does not count, so an
+  // unindexed repository cannot buy a read window either.
   const shipped = JSON.parse(readFileSync(join(BRIDGE_DIR, 'gates', 'pi', 'policy.json'), 'utf8'));
-  // Assert the ORDER INVARIANT, not a frozen array: v2 added the bash read rule,
-  // and a future rule must not be able to slip in front of Layer 2 either.
+  // Assert the ORDER INVARIANT, not a frozen array: a future rule must not be
+  // able to slip in front of Layer 2 either.
   const layer2 = shipped.checks.filter((c) => c.startsWith('index-'));
   const layer1 = shipped.checks.filter((c) => c.startsWith('graph-') || c.startsWith('bash-graph-'));
-  assert.ok(layer2.length >= 2, 'pi policy: both Layer-2 checks are present');
+  assert.ok(layer2.length >= 1, 'pi policy keeps the stale-index check');
   assert.ok(layer1.length >= 1, 'pi policy: Layer-1 checks are present');
   assert.ok(
     shipped.checks.lastIndexOf(layer2[layer2.length - 1]) < shipped.checks.indexOf(layer1[0]),
     'pi policy: Layer-2 checks must precede every Layer-1 check',
+  );
+  assert.ok(
+    !shipped.checks.includes('index-before-read'),
+    'index-before-read is opt-in: a global index has no repo marker to verify',
   );
 
   const repo = abs('/repo');
@@ -409,11 +417,10 @@ test('gate: the shipped cascade reports the missing index before the graph rule'
     fs: fakeFs({ dirs: { [join(repo, '.git')]: ['.git'] } }),
     now: 1_000_000,
   });
-  assert.equal(verdict.code, 'INDEX_FIRST', 'an unindexed repo must hear Layer 2, not Layer 1');
+  assert.equal(verdict.code, 'GRAPH_FIRST', 'an unindexed repo hears the evidence rule, not a marker lie');
 
-  // ...and once a graph query has succeeded, the whole cascade stands down,
-  // whatever the index state — that is what keeps the order from turning into a
-  // loop after the model complies.
+  // Once a graph query has succeeded, the research rules stand down. That is
+  // what keeps the cascade from turning into a loop after the model complies.
   const state = newSessionState();
   state.signals = 1;
   state.lastSignalAt = 1_000_000;
@@ -427,7 +434,7 @@ test('gate: the shipped cascade reports the missing index before the graph rule'
   assert.equal(afterQuery.block, false, 'a compliant session must not be blocked by Layer 2');
 });
 
-test('gate: a query opens the freshness check, and the session own writes are exempt', () => {
+test('gate: a query does NOT stand down the stale-index check; the session own writes do', () => {
   const repo = abs('/repo');
   const marker = join(repo, '.codebase-memory');
   const file = join(repo, 'src/a.ts');
@@ -439,22 +446,23 @@ test('gate: a query opens the freshness check, and the session own writes are ex
     });
   const fsFor = () =>
     fakeFs({ dirs: { [marker]: ['graph.db'] }, mtimes: { [file]: 10_000, [join(marker, 'graph.db')]: 1_000 } });
-  const call = (state) =>
+  const call = (state, fs = fsFor()) =>
     shouldBlock({
       policy: policyFor(),
       input: { action: 'read', path: file, tool: 'read' },
       state,
-      fs: fsFor(),
+      fs,
       now: 1_000_000,
     });
 
-  // A successful graph query this session is what opens every Layer-1 rule, so
-  // it opens this one too — otherwise a well-behaved session would be blocked
-  // right after doing what the rules asked.
+  // v2 let a successful query open this check, which made it unreachable: the
+  // model always queries before reading, and a query against a stale index was
+  // exactly the failure the check was meant to catch. v3 keeps it closed until
+  // the index is actually updated.
   resetMtimeCache();
   const afterQuery = newSessionState();
   recordSignal(afterQuery, 1_000_000);
-  assert.equal(call(afterQuery).block, false, 'a fresh query signal opens the gate');
+  assert.equal(call(afterQuery).code, 'INDEX_STALE', 'a query against the old graph is not an index update');
 
   // The model's own edit is always newer than the index it is about to consult.
   resetMtimeCache();
@@ -462,8 +470,16 @@ test('gate: a query opens the freshness check, and the session own writes are ex
   recordWrite(afterWrite, file);
   assert.equal(call(afterWrite).block, false, 'a file this session wrote is exempt');
 
-  // Sanity: without either, it does block. Otherwise the two cases above prove
-  // nothing.
+  // Re-indexing moves the marker newer than the source file, which is the only
+  // thing that should open the check.
+  resetMtimeCache();
+  const rebuilt = fakeFs({
+    dirs: { [marker]: ['graph.db'] },
+    mtimes: { [file]: 10_000, [join(marker, 'graph.db')]: 20_000 },
+  });
+  assert.equal(call(newSessionState(), rebuilt).block, false, 'a rebuilt index opens the check');
+
+  // Sanity: without an update or a session write, it blocks.
   resetMtimeCache();
   assert.equal(call(newSessionState()).block, true);
 });
@@ -1119,4 +1135,179 @@ test('gates: raw snake_case keys are read only where the manifest is parsed', ()
     }
   }
   assert.deepEqual(leaks, [], leaks.join('\n'));
+});
+
+// ---------------------------------------------------------------------------
+// v3: evidence, Layer 0 and shell coverage at the adapter boundary
+// ---------------------------------------------------------------------------
+
+const REPO_ROOT = normalizePath(join(BRIDGE_DIR, '..'));
+const REAL_SOURCE = join(BRIDGE_DIR, 'lib', 'paths.js');
+
+const adapterPolicy = (overrides = {}) => {
+  const { checks, ...configOverrides } = overrides;
+  return normalizePolicy({
+    name: 'adapter-v3',
+    checks: checks ?? ['graph-before-read'],
+    config: {
+      project_roots: [REPO_ROOT],
+      max_blocks_per_session: 10,
+      signal_ttl_ms: 1_000,
+      ...configOverrides,
+    },
+  });
+};
+
+test('pi adapter: the real pi tool_result shape (content blocks) counts as graph evidence', async () => {
+  const { pi, call } = fakePi();
+  piGate(pi, {
+    policy: adapterPolicy({
+      graph_signal_requires_content: true,
+      graph_signal_min_chars: 10,
+    }),
+  });
+  const read = () => call('tool_call', { toolName: 'read', input: { path: REAL_SOURCE } });
+  assert.equal((await read())?.block, true);
+
+  // Real pi puts the result in `event.content`; `event.result` does not exist.
+  // Reading only the legacy field made v3 treat every real graph result as
+  // empty and block all reads — the exact false-negative this test pins.
+  await call('tool_result', {
+    toolName: 'search_graph',
+    isError: false,
+    content: [{ type: 'text', text: '{"total":1,"results":[{"file_path":"bridge/lib/paths.js"}]}' }],
+  });
+  assert.equal(await read(), undefined, 'event.content must count as evidence');
+});
+
+test('pi adapter: an empty graph result does not open the gate; a content-bearing one does', async () => {
+  const { pi, call } = fakePi();
+  piGate(pi, {
+    policy: adapterPolicy({
+      graph_signal_requires_content: true,
+      graph_signal_min_chars: 10,
+    }),
+  });
+  const read = () => call('tool_call', { toolName: 'read', input: { path: REAL_SOURCE } });
+  assert.equal((await read())?.block, true);
+
+  await call('tool_result', {
+    toolName: 'search_graph',
+    isError: false,
+    result: { content: [{ text: '{"total":0,"results":[]}' }] },
+  });
+  assert.equal((await read())?.block, true, 'an empty answer is not evidence');
+
+  await call('tool_result', {
+    toolName: 'search_graph',
+    isError: false,
+    result: { content: [{ text: '{"total":2,"results":[{"file_path":"bridge/lib/paths.js"}]}' }] },
+  });
+  assert.equal(await read(), undefined, 'a result with content opens Layer 1');
+});
+
+test('pi adapter: Layer 0 blocks an unread edit, then opens after a read and a convention', async () => {
+  const { pi, call } = fakePi();
+  piGate(pi, {
+    policy: adapterPolicy({
+      checks: ['think-before-write'],
+      require_target_evidence: true,
+      require_conventions: true,
+      convention_files: ['CONTRIBUTING.md'],
+      signal_ttl_ms: 0,
+    }),
+  });
+  const edit = () =>
+    call('tool_call', {
+      toolName: 'edit',
+      input: { path: REAL_SOURCE, oldText: 'x', newText: 'y' },
+    });
+
+  const first = await edit();
+  assert.equal(first?.block, true);
+  assert.match(first.reason, /Layer 0/);
+  assert.match(first.reason, /没有看过这个文件/);
+
+  // Reading the exact file satisfies target evidence...
+  await call('tool_result', { toolName: 'read', isError: false, input: { path: REAL_SOURCE } });
+  const second = await edit();
+  assert.equal(second?.block, true, 'conventions are still missing');
+  assert.match(second.reason, /约定/);
+
+  // ...and reading a convention document satisfies the last gap.
+  const convention = join(REPO_ROOT, 'CONTRIBUTING.md');
+  await call('tool_result', { toolName: 'read', isError: false, input: { path: convention } });
+  assert.equal(await edit(), undefined, 'the edit is allowed once both gaps are closed');
+});
+
+test('pi adapter: edit scans the inserted text for credentials', async () => {
+  const { pi, call } = fakePi();
+  piGate(pi, { policy: adapterPolicy({ checks: ['no-secret-write'] }) });
+  const secret = `API_KEY = "${'b'.repeat(24)}"`;
+  const verdict = await call('tool_call', {
+    toolName: 'edit',
+    input: { path: REAL_SOURCE, oldText: 'x', newText: secret },
+  });
+  assert.equal(verdict?.block, true);
+  assert.match(verdict.reason, /credential/);
+});
+
+test('pi adapter: a blocked write is not remembered as this session own file', async () => {
+  const { pi, call } = fakePi();
+  piGate(pi, {
+    policy: adapterPolicy({
+      checks: ['graph-before-read', 'think-before-write'],
+      require_target_evidence: true,
+      require_conventions: false,
+    }),
+  });
+
+  const write = await call('tool_call', {
+    toolName: 'write',
+    input: { path: REAL_SOURCE, content: 'x' },
+  });
+  assert.equal(write?.block, true);
+  assert.match(write.reason, /Layer 0/);
+
+  // If the blocked write had been recorded as `written`, this read would be
+  // exempt and sail through. It must still hear Layer 1.
+  const read = await call('tool_call', { toolName: 'read', input: { path: REAL_SOURCE } });
+  assert.equal(read?.block, true);
+  assert.match(read.reason, /Layer 1/);
+});
+
+test('pi adapter: repeated failed shell commands are gated until investigation', async () => {
+  const { pi, call } = fakePi();
+  piGate(pi, {
+    policy: adapterPolicy({
+      checks: ['no-blind-retry'],
+      max_identical_failures: 2,
+      retry_window_ms: 60_000,
+    }),
+  });
+  const command = 'node --test does-not-exist.js';
+  await call('tool_result', { toolName: 'bash', isError: true, input: { command } });
+  await call('tool_result', { toolName: 'bash', isError: true, input: { command } });
+
+  const blocked = await call('tool_call', { toolName: 'bash', input: { command } });
+  assert.equal(blocked?.block, true);
+  assert.match(blocked.reason, /Layer 0/);
+
+  // A successful read is investigation; the retry is then allowed.
+  await call('tool_result', { toolName: 'read', isError: false, input: { path: REAL_SOURCE } });
+  assert.equal(await call('tool_call', { toolName: 'bash', input: { command } }), undefined);
+});
+
+test('dsh adapter: bash reads are actually gated now, and a graph query opens them', async () => {
+  const { ctx, run } = fakeDshCtx();
+  dshApply(ctx, {
+    policy: adapterPolicy({ checks: ['graph-before-read', 'bash-graph-before-read'] }),
+  });
+  const command = `cat "${REAL_SOURCE}"`;
+  const denied = await run('bash', { command });
+  assert.equal(denied.kind, 'deny');
+  assert.match(denied.reason, /Layer 1/);
+
+  await run('search_graph', { name_pattern: '.*' });
+  assert.deepEqual(await run('bash', { command }), { kind: 'allow' });
 });

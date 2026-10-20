@@ -18,15 +18,24 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  bashReadTargets,
+  graphResultIsEvidence,
+  isConventionDoc,
   loadPolicy,
   newSessionState,
   normalizePath,
   policyFromObject,
+  recordCommandResult,
+  recordDocRead,
+  recordInspection,
+  recordInvestigation,
   recordSignal,
   recordUnlocks,
   recordWrite,
   reminderFor,
+  resetMtimeCache,
   shouldBlock,
+  unlockTokensFromQualifiedName,
   unlockTokensFromText,
 } from '../policy.js';
 
@@ -99,13 +108,24 @@ const SIGNAL_TOOLS = [
   'search_code',
 ];
 
-/** pi tool name -> normalized action the policy understands. */
-const ACTION_BY_TOOL = {
-  read: 'read',
-  write: 'write',
-  edit: 'write',
-  bash: 'bash',
-};
+/**
+ * Tool-name aliases. pi's own tools are read/write/edit/bash, but extensions
+ * and other harnesses reuse the same policy with `read_file`, `apply_patch`,
+ * `str_replace_editor` and friends. An unknown write tool used to fall through
+ * the adapter untouched — a silent bypass for Layer 0 and the secret rule.
+ */
+const READ_TOOLS = new Set(['read', 'read_file', 'view', 'open_file']);
+const WRITE_TOOLS = new Set([
+  'write', 'edit', 'apply_patch', 'str_replace_editor', 'create_file', 'multi_edit', 'notebook_edit',
+]);
+
+/** The path spelling a tool input uses, whichever harness it came from. */
+const inputPath = (input) => input?.path ?? input?.file_path ?? null;
+
+/** The text a write tool is about to insert, across the common schemas. */
+const inputContent = (input) =>
+  [input?.content, input?.newText, input?.new_string, input?.patch, input?.text]
+    .find((v) => typeof v === 'string') ?? null;
 
 const isSignalTool = (name) =>
   SIGNAL_TOOLS.some((s) => name === s || name.endsWith(`_${s}`));
@@ -174,6 +194,10 @@ export default function enforceRules(pi, options = {}) {
     state.signals = 0;
     state.written.clear();
     state.unlocks.clear();
+    state.inspected.clear();
+    state.docReads.clear();
+    state.failedCommands.clear();
+    state.lastInvestigationAt = 0;
     if (typeof ctx?.cwd === 'string' && ctx.cwd) sessionCwd = ctx.cwd;
     if (error) {
       // A gate that cannot load its policy is OFF. Say so loudly: in a headless
@@ -201,14 +225,15 @@ export default function enforceRules(pi, options = {}) {
 
     // Remember what this session wrote: reading your own output is never a
     // violation, and blocking it would make the gate fight normal development.
-    // The path is normalized on BOTH sides (here and in the read branch below),
-    // so a file written as "src/a.ts" and read back as an absolute path — or
-    // spelled with a different drive case on Windows — is still recognized as
-    // the model's own file.
-    if (name === 'write' || name === 'edit') {
-      const path = normalizePath(event.input?.path ?? null, cwd);
-      recordWrite(state, path);
-      const content = typeof event.input?.content === 'string' ? event.input.content : null;
+    // The record happens only AFTER the checks pass. Recording first (as v2
+    // did) would put the target in `written` and exempt the very write that
+    // Layer 0 was supposed to question.
+    const writeLike =
+      WRITE_TOOLS.has(name) ||
+      (!READ_TOOLS.has(name) && typeof inputPath(event.input) === 'string' && typeof inputContent(event.input) === 'string');
+    if (writeLike) {
+      const path = normalizePath(inputPath(event.input), cwd);
+      const content = inputContent(event.input);
       const verdict = shouldBlock({
         policy,
         input: { action: 'write', path, tool: name, content },
@@ -216,8 +241,16 @@ export default function enforceRules(pi, options = {}) {
         fs: realFs,
       });
       if (verdict.block) {
+        if (ctx?.hasUI) {
+          ctx.ui.notify(
+            `enforce-rules [${verdict.code}] block ${state.blocks}/${policy.config.max_blocks_per_session}`,
+            'warn',
+          );
+        }
         return { block: true, reason: verdict.reason };
       }
+      recordWrite(state, path);
+      recordInvestigation(state);
       return;
     }
 
@@ -249,11 +282,11 @@ export default function enforceRules(pi, options = {}) {
       return;
     }
 
-    if (name !== 'read') return;
+    if (!READ_TOOLS.has(name)) return;
 
     const verdict = shouldBlock({
       policy,
-      input: { action: 'read', path: normalizePath(event.input?.path ?? null, cwd), tool: name },
+      input: { action: 'read', path: normalizePath(inputPath(event.input), cwd), tool: name },
       state,
       fs: realFs,
     });
@@ -299,14 +332,64 @@ export default function enforceRules(pi, options = {}) {
     return '';
   };
 
-  pi.on('tool_result', async (event) => {
-    if (event.isError) return;
+  pi.on('tool_result', async (event, ctx) => {
+    const cwd = cwdFor(ctx);
+    const command = typeof event.input?.command === 'string' ? event.input.command : '';
+
+    if (event.isError) {
+      // A failed shell command feeds the blind-retry rule. A failed graph query
+      // must not record a signal — the model has learned nothing yet.
+      if (event.toolName === 'bash') recordCommandResult(state, command, true);
+      return;
+    }
+
+    // A successful read is evidence about the exact file, which is what Layer 0
+    // needs before an edit. Convention documents additionally satisfy the
+    // "project conventions" question.
+    const path = normalizePath(inputPath(event.input), cwd);
+    if (READ_TOOLS.has(event.toolName) && path) {
+      recordInspection(state, path);
+      if (isConventionDoc(path, policy.config)) recordDocRead(state, path);
+    }
+
+    if (event.toolName === 'bash') {
+      recordCommandResult(state, command, false);
+      for (const target of bashReadTargets(command, {
+        config: policy.config,
+        cwd,
+        isFile: realFs.isFile,
+        exists: realFs.exists,
+      })) {
+        recordInspection(state, normalizePath(target));
+      }
+      // `cat CONTRIBUTING.md` satisfies the convention rule just like `read`.
+      for (const token of command.match(/"[^"]+"|'[^']+'|[^\s;&|]+/g) ?? []) {
+        const candidate = normalizePath(token.replace(/^["']|["']$/g, ''), cwd);
+        if (candidate && isConventionDoc(candidate, policy.config) && realFs.isFile(candidate)) {
+          recordDocRead(state, candidate);
+        }
+      }
+    }
+
     const proxied = event.toolName === 'mcp' ? String(event.input?.tool ?? '') : '';
+    const effective = proxied || event.toolName;
+    // Re-indexing changes the marker's mtime; a cached "newest" from before the
+    // rebuild would keep reporting a freshly indexed tree as stale.
+    if (effective === 'index_repository' || effective.endsWith('_index_repository')) resetMtimeCache();
+
     const isGraph =
       isSignalTool(event.toolName) || (proxied !== '' && isSignalTool(proxied));
     if (!isGraph) return;
-    // Only a *successful* graph query unlocks. A failed query means the model
-    // has not actually learned anything yet.
+
+    // A successful call is not enough: an empty result ("total":0) used to buy
+    // a full read window without telling the model anything. Only evidence
+    // counts; the policy can turn this off when a harness cannot see results.
+    // pi reports a tool result as `event.content` (plus optional
+    // `structuredContent`), not `event.result`. Prefer the legacy field when a
+    // harness supplies it, then the real pi event shape.
+    const resultBody = resultText(event.result ?? event);
+    if (!graphResultIsEvidence(resultBody, policy.config)) return;
+
     const now = Date.now();
     recordSignal(state, now);
     // …and remember *what the query was about*: arguments plus the result text
@@ -314,7 +397,10 @@ export default function enforceRules(pi, options = {}) {
     // free pass for the whole repository — but the file it named stays readable
     // for `unlock_ttl_ms` without another round-trip.
     recordUnlocks(state, unlockTokensFromText(inputStrings(event.input).join('\n')), now);
-    recordUnlocks(state, unlockTokensFromText(resultText(event.result)), now);
+    if (typeof event.input?.qualified_name === 'string') {
+      recordUnlocks(state, unlockTokensFromQualifiedName(event.input.qualified_name), now);
+    }
+    recordUnlocks(state, unlockTokensFromText(resultBody), now);
   });
 
   pi.on('context', async (event) => {

@@ -330,17 +330,22 @@ bridge/gates/<harness>/     适配层（薄：native 事件 ⇄ 规范化问句 
 | `auto_load` | `true` = harness 会自动加载该目录；`false` = 已安装但需用户手动挂载，`status` 与生成的 README 必须明确写出 |
 | 不可用 harness | 清单里 `gates.supported = false` 并给出原因，`status` 显示"该端无硬闸门，规则仅为建议"，不静默跳过 |
 | 策略加载失败 | **fail open** + 告警（见 D16） |
-| 会话内拦截上限 | `max_blocks_per_session`（默认 3），超出后放行，避免一条错规则卡死 agent |
+| 会话内拦截上限 | `max_blocks_per_session`（默认 30）只约束研究规则（Layer 0/1/2）；**凭据写入、越界写入、破坏性命令不受上限影响**，否则烧满额度即可绕过安全规则 |
 | 作用域 | 默认按 "配置了 `project_roots` 就用配置，否则沿目录向上找 `.git`" 判定；不硬编码任何人家目录 |
 
 **检查项（策略层内置，可按 policy.json 选配）**：
 
 | 名称 | 作用 | 默认启用 |
 |---|---|---|
-| `graph-before-read` | 读源码前必须先有一次成功的图谱查询 | ✅ |
-| `index-before-read` | 仓库无索引标记（`.codebase-memory`）时先建索引 | 可选 |
-| `no-write-outside` | 仅在配置了 `write_roots` 时生效，限制写入范围 | 可选 |
-| `no-secret-write` | 写入内容命中凭据模式时拦截 | 可选 |
+| `graph-before-read` | 读源码前必须先有一次**有内容**的图谱查询（空结果不算） | ✅ |
+| `bash-graph-before-read` | bash 的读取命令（cat / grep -r / git show / find -exec / xargs / 重定向输入…）与 read 同罪 | ✅ |
+| `index-freshness-before-read` | 目标文件比索引新时先更新索引；一次查询不能短路本检查 | ✅ |
+| `think-before-write` | Layer 0：改已存在文件前，本会话必须读过它或被图谱点名；有项目约定文档时还要先读一个 | ✅ pi / 可选 dsh |
+| `no-blind-retry` | Layer 0：同一条失败命令原样重试第 3 次前，必须先调查 | ✅ pi / 可选 dsh |
+| `no-destructive-bash` | Layer 0：`git reset --hard`、`git clean -f`、`rm -rf` 源码目录、强推等破坏性命令直接拒绝；构建产物可清理 | ✅ |
+| `no-secret-write` | 写入内容命中凭据模式时拦截；shell 重定向、tee、sed -i 也算写入 | ✅ |
+| `no-write-outside` | 仅在配置了 `write_roots` 时生效，限制写入范围（含 shell 写入） | 可选 |
+| `index-before-read` | 仓库无 `.codebase-memory` 持久化标记时先建索引；全局索引无此标记，默认关闭，误开会把整个会话拦到上限 | 可选 |
 
 ### 4.9 上线与回滚
 

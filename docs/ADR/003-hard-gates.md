@@ -127,6 +127,26 @@ bridge/gates/
 **路径后缀**（basename / 末 2–4 段 / 末段目录），并使用通用目录名拒绝表
 （`packages`、`src`、`test`…不算证据）。
 
+## 更新：v3（2026-10-20）—— 从“拦读取”扩展到“拦动手”，并按本机实况核对
+
+v3 的起点是一次本机核对：仓库已经是 v2，但本机 `~/.pi/agent/extensions/enforce-rules` 装的还是 v1（1 小时窗口、拦 3 次、无 bash 检查）。把 v2 装上去之前又发现了几类“看起来在拦、实际拦不住”的问题，一并修掉：
+
+| # | 洞 | 症状 | v3 修法 |
+|---|----|------|--------|
+| 1 | 封顶后安全规则一起失效 | 烧满 30 次拦截后，`no-secret-write` / `no-write-outside` 也放行，等于给凭据写入发了通行证 | `HARD_CHECKS` 不受 `max_blocks_per_session` 约束；封顶只让研究规则退场 |
+| 2 | 写/编辑完全不做“动脑子”检查 | 查一次图谱后可以改任意文件，没看过、没判根因 | 新增 `think-before-write`：已存在文件必须有本会话读取记录或作用域图谱命中；有约定文档时还要先读一个 |
+| 3 | bash 写入绕过所有写检查 | `echo secret > file`、`tee`、`sed -i`、`cp/mv/rm` 不进 `no-secret-write` / `no-write-outside` | bash 写目标解析后走同一套检查；写入文本也做凭据扫描 |
+| 4 | bash 读取仍可绕过 | `cd x && cat a`、`git show HEAD:a`、`git diff`、`find -exec cat`、`grep -r dir`、glob、`xargs` | 重写静态解析器：跟踪 cd、git 子命令、find/xargs、递归目录、glob、输入重定向、解释器一行内 read 调用 |
+| 5 | 空图谱结果也算合规 | `search_graph` 返回 `{"total":0}` 也能解锁 10 分钟 | `graphResultIsEvidence`：空结果 / 无内容不算信号；pi 适配层在记录信号前验证结果 |
+| 6 | 一次查询就洗白陈旧索引 | 对旧索引查询成功后，`index-freshness` 直接短路，检查永远到不了 | 新鲜度检查不再被图谱信号短路；只有索引真的更新或本会话自己写的文件才放行 |
+| 7 | 索引标记误判 | 全局 codebase-memory 索引没有 `<repo>/.codebase-memory`，默认开启会每会话误拦到上限 | `index-before-read` 改为可选；Layer 2 靠“空结果不算证据”强制执行；保留检查给使用持久化产物的团队 |
+| 8 | dsh 的 bash 检查是死配置 | policy 里写了 `bash-graph-before-read`，适配层从不传 bash 事件 | dsh 适配层接入 bash、补全 fs 探针、相对路径归一化、写前不记账 |
+| 9 | 工具别名 / 编辑内容漏检 | 未知写工具直接穿透；`edit` 只扫 `content`，不扫 `newText` | 读写工具别名表；内容取 `content/newText/new_string/patch/text` |
+| 10 | 破坏性清理无门 | `git reset --hard`、`git clean -fdx`、`rm -rf src`、强推可以自动执行 | `no-destructive-bash`：硬拦；`node_modules` / `dist` / `.venv` 等构建产物仍可清理 |
+| 11 | 失败命令机械重试 | 同一条失败命令可以无限原样重跑 | `no-blind-retry`：第 3 次前必须有读取 / 图谱 / 真实修改作为调查证据 |
+
+本机核对结论：v1 的提示文案（“查询成功一次后闸门即放行”）与仓库 v2 已不一致；本次用 `apply --targets pi` 把 v3 装到本机，并核对安装副本的 `policy.json` 版本、检查项与全局拦截上限。
+
 ## 相关
 
 * `bridge/gates/policy.js`（策略层）、`bridge/gates/pi/`、`bridge/gates/dsh/`（适配层）

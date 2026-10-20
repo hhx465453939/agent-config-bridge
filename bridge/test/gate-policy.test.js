@@ -19,23 +19,39 @@ import { join } from 'node:path';
 
 import {
   DEFAULT_CONFIG,
+  HARD_CHECKS,
+  bashDestructiveFinding,
+  bashReadDirs,
   bashReadTargets,
+  bashWriteTargets,
+  graphResultIsEvidence,
   hasUnlock,
+  isConventionDoc,
   loadPolicy,
   newSessionState,
   normalizePath,
   policyFromObject,
+  recordCommandResult,
+  recordDocRead,
+  recordInspection,
   recordSignal,
   recordUnlocks,
+  recordWrite,
   shouldBlock,
+  unlockTokensFromQualifiedName,
   unlockTokensFromText,
 } from '../gates/policy.js';
 
 const WIN32 = process.platform === 'win32';
-const ROOT = WIN32 ? 'C:\\repo' : '/repo';
+// Normalise the fixture root the same way the policy normalises tool paths.
+// Without this, a Windows `C:\repo` fixture and a lower-cased `c:\repo\…`
+// target are two different strings to the fake filesystem, and the tests stop
+// reaching the code they were written to check.
+const ROOT = normalizePath(WIN32 ? 'C:\\repo' : '/repo');
 const FILE = join(ROOT, 'packages', 'xyb', 'client.js');
 const OTHER = join(ROOT, 'packages', 'other', 'index.js');
 const NOTE = join(ROOT, 'notes.txt');
+const AGENTS = join(ROOT, 'AGENTS.md');
 
 const TTL = 600_000; // signal window
 const UNLOCK_TTL = 1_800_000; // scoped unlock window
@@ -52,11 +68,23 @@ const policy = (overrides = {}) =>
     },
   }).policy;
 
+const FS_DIRS = new Set(
+  [ROOT, join(ROOT, '.git'), join(ROOT, 'packages'), join(ROOT, 'packages', 'xyb')].map((p) => normalizePath(p)),
+);
+const FS_FILES = new Set([FILE, OTHER].map((p) => normalizePath(p)));
+
 const fs = {
-  exists: (p) => p === join(ROOT, '.git') || p === FILE || p === OTHER,
-  isFile: (p) => p === FILE || p === OTHER,
+  exists: (p) => FS_DIRS.has(normalizePath(p)) || FS_FILES.has(normalizePath(p)),
+  isFile: (p) => FS_FILES.has(normalizePath(p)),
   statMtime: () => 0,
   listDir: () => [],
+};
+
+/** The same layout plus one convention document, for the Layer-0 checks. */
+const conventionFs = {
+  ...fs,
+  exists: (p) => normalizePath(p) === normalizePath(AGENTS) || fs.exists(p),
+  isFile: (p) => normalizePath(p) === normalizePath(AGENTS) || fs.isFile(p),
 };
 
 const readVerdict = (path, state = newSessionState(), now = Date.now(), p = policy()) =>
@@ -170,14 +198,14 @@ test('bash: allowed after the graph named the file', () => {
   assert.equal(bashVerdict(`cat "${FILE}"`, state, t0 + 1000).block, false);
 });
 
-test('bashReadTargets: quotes, options, chains; globs are skipped', () => {
+test('bashReadTargets: quotes, options, chains; globs are gated too', () => {
   const targets = bashReadTargets(`head -n 20 "packages/xyb/client.js" && grep -c x packages/xyb/*.js`, {
     config: DEFAULT_CONFIG,
     cwd: ROOT,
     isFile: fs.isFile,
     exists: fs.exists,
   }).map((t) => normalizePath(t));
-  assert.deepEqual(targets, [normalizePath(FILE)]);
+  assert.deepEqual(targets, [normalizePath(FILE), normalizePath(join(ROOT, 'packages', 'xyb', '*.js'))]);
 });
 
 test('bashReadTargets: a read call inside a one-liner counts', () => {
@@ -221,4 +249,232 @@ test('shipped policies: the strengthened values are actually in the JSON', () =>
     assert.ok(p.checks.includes('bash-graph-before-read'), `${p.name}: bash check must be enabled`);
   }
   assert.ok(pi.checks.includes('index-freshness-before-read'), 'pi keeps the Layer-2 checks');
+  assert.ok(pi.checks.includes('think-before-write'), 'pi enables the Layer-0 write rule');
+  assert.ok(pi.checks.includes('no-destructive-bash'), 'pi enables the destructive-command rule');
+  assert.ok(pi.checks.includes('no-blind-retry'), 'pi enables the blind-retry rule');
+  assert.equal(pi.config.graph_signal_requires_content, true, 'pi verifies graph results have content');
+  assert.equal(pi.config.require_conventions, true, 'pi asks for the project conventions');
+  assert.ok(!pi.checks.includes('index-before-read'), 'a global index has no marker, so the check is opt-in');
+  assert.equal(dsh.config.graph_signal_requires_content, false, 'dsh cannot see results; its asymmetry is documented');
+  assert.ok(dsh.checks.includes('bash-graph-before-read'), 'dsh now actually wires bash reads to the policy');
+  assert.ok(dsh.checks.includes('no-destructive-bash'), 'dsh keeps the safety rule');
+});
+
+// ---------------------------------------------------------------------------
+// v3: Layer 0 (think before acting) and the safety cap
+// ---------------------------------------------------------------------------
+
+test('cap: safety checks keep running after the research cap', () => {
+  const p = policyFromObject({
+    name: 'safety',
+    checks: ['no-secret-write', 'graph-before-read'],
+    config: { max_blocks_per_session: 0 },
+  }).policy;
+  const state = newSessionState();
+  const secret = `API_KEY = "${'b'.repeat(24)}"`;
+  const write = shouldBlock({
+    policy: p,
+    state,
+    input: { action: 'write', path: join(ROOT, 'config.js'), tool: 'write', content: secret },
+    fs,
+    now: 1,
+  });
+  assert.equal(write.block, true, 'a credential write must not be excused by the cap');
+  assert.equal(write.code, 'SECRET_WRITE');
+  const read = readVerdict(FILE, state, 1, p);
+  assert.equal(read.block, false, 'the research rule is capped');
+  assert.equal(read.capReached, true);
+  assert.deepEqual([...HARD_CHECKS].sort(), ['no-destructive-bash', 'no-secret-write', 'no-write-outside']);
+});
+
+test('think: an existing file needs a read or a scoped graph hit, not a session signal', () => {
+  const p = policyFromObject({
+    name: 'think',
+    checks: ['think-before-write'],
+    config: {
+      project_roots: [ROOT],
+      require_target_evidence: true,
+      require_conventions: false,
+      max_blocks_per_session: 10,
+      signal_ttl_ms: TTL,
+    },
+  }).policy;
+  const w = (state) =>
+    shouldBlock({
+      policy: p,
+      state,
+      input: { action: 'write', path: FILE, tool: 'edit', content: 'x' },
+      fs,
+      now: 1_000_000,
+    });
+
+  assert.equal(w(newSessionState()).code, 'THINK_TARGET', 'no evidence at all');
+
+  const signalOnly = newSessionState();
+  recordSignal(signalOnly, 1_000_000);
+  assert.equal(w(signalOnly).code, 'THINK_TARGET', 'a query about something else is not evidence about this file');
+
+  const inspected = newSessionState();
+  recordInspection(inspected, FILE, 1_000_000);
+  assert.equal(w(inspected).block, false, 'a read of the exact file is evidence');
+
+  const graphed = newSessionState();
+  recordUnlocks(graphed, unlockTokensFromText('packages/xyb/client.js'), 1_000_000);
+  assert.equal(w(graphed).block, false, 'a graph hit naming the file is evidence');
+
+  const own = newSessionState();
+  recordWrite(own, FILE);
+  assert.equal(w(own).block, false, 'the session own file stays editable');
+
+  const freshFile = shouldBlock({
+    policy: p,
+    state: newSessionState(),
+    input: { action: 'write', path: join(ROOT, 'packages', 'xyb', 'new.js'), tool: 'write', content: 'x' },
+    fs,
+    now: 1_000_000,
+  });
+  assert.equal(freshFile.block, false, 'a new file has nothing to inspect; do not brick greenfield work');
+});
+
+test('think: project conventions are required when they exist', () => {
+  const p = policyFromObject({
+    name: 'think',
+    checks: ['think-before-write'],
+    config: {
+      project_roots: [ROOT],
+      require_target_evidence: false,
+      require_conventions: true,
+      convention_files: ['AGENTS.md'],
+      signal_ttl_ms: 0,
+    },
+  }).policy;
+  const state = newSessionState();
+  const call = (s) =>
+    shouldBlock({
+      policy: p,
+      state: s,
+      input: { action: 'write', path: FILE, tool: 'edit', content: 'x' },
+      fs: conventionFs,
+      now: 1,
+    });
+  assert.equal(call(state).code, 'THINK_CONVENTIONS');
+  recordDocRead(state, AGENTS, 2);
+  assert.equal(call(state).block, false, 'reading the convention document satisfies the rule');
+
+  // A repository without conventions is not punished for it.
+  const noDocs = policyFromObject({
+    name: 'think',
+    checks: ['think-before-write'],
+    config: { project_roots: [ROOT], require_target_evidence: false, require_conventions: true },
+  }).policy;
+  assert.equal(
+    shouldBlock({
+      policy: noDocs,
+      state: newSessionState(),
+      input: { action: 'write', path: FILE, tool: 'edit', content: 'x' },
+      fs,
+      now: 1,
+    }).block,
+    false,
+  );
+});
+
+test('bash writes: redirection secrets and outside roots are hard-blocked', () => {
+  const secret = `API_KEY = "${'b'.repeat(24)}"`;
+  const secretPolicy = policyFromObject({ name: 's', checks: ['no-secret-write'], config: {} }).policy;
+  const secretVerdict = shouldBlock({
+    policy: secretPolicy,
+    state: newSessionState(),
+    input: { action: 'bash', command: `echo '${secret}' > packages/xyb/new.js`, cwd: ROOT, tool: 'bash' },
+    fs,
+    now: 1,
+  });
+  assert.equal(secretVerdict.code, 'SECRET_WRITE', 'a shell redirection is a write');
+
+  const writePolicy = policyFromObject({ name: 'w', checks: ['no-write-outside'], config: { write_roots: [ROOT] } }).policy;
+  const outside = shouldBlock({
+    policy: writePolicy,
+    state: newSessionState(),
+    input: { action: 'bash', command: 'echo hi > /outside/x', cwd: ROOT, tool: 'bash' },
+    fs,
+    now: 1,
+  });
+  assert.equal(outside.code, 'WRITE_OUTSIDE', 'shell writes must obey write_roots');
+});
+
+test('bashReadTargets: closes cd/git/find/xargs/recursive/glob bypasses', () => {
+  const opts = { config: DEFAULT_CONFIG, cwd: ROOT, isFile: fs.isFile, exists: fs.exists };
+  const norm = (list) => list.map((p) => normalizePath(p));
+
+  assert.deepEqual(norm(bashReadTargets('cd packages && cat xyb/client.js', opts)), [normalizePath(FILE)]);
+  assert.deepEqual(norm(bashReadTargets('git show HEAD:packages/xyb/client.js', opts)), [normalizePath(FILE)]);
+  assert.deepEqual(norm(bashReadTargets('xargs -0 cat packages/xyb/client.js', opts)), [normalizePath(FILE)]);
+  assert.deepEqual(norm(bashReadDirs('grep -rn foo packages', opts)), [normalizePath(join(ROOT, 'packages'))]);
+  assert.deepEqual(norm(bashReadDirs('find packages -exec cat {} +', opts)), [normalizePath(join(ROOT, 'packages'))]);
+
+  const glob = bashReadTargets('cat packages/xyb/*.js', opts);
+  assert.equal(glob.length, 1);
+  assert.match(glob[0], /\*\.js$/);
+
+  assert.deepEqual(bashReadTargets('sed -i s/a/b/ packages/xyb/client.js', opts), []);
+  assert.deepEqual(
+    norm(bashWriteTargets('sed -i s/a/b/ packages/xyb/client.js', opts)),
+    [normalizePath(FILE)],
+    'in-place sed is a write, not a read',
+  );
+});
+
+test('bashDestructiveFinding: build output allowed, source/history denied', () => {
+  assert.equal(bashDestructiveFinding('rm -rf node_modules', { cwd: ROOT }), null);
+  assert.ok(bashDestructiveFinding('rm -rf src', { cwd: ROOT }));
+  assert.ok(bashDestructiveFinding('git reset --hard', { cwd: ROOT }));
+  assert.ok(bashDestructiveFinding('git push --force origin main', { cwd: ROOT }));
+  assert.ok(bashDestructiveFinding("bash -c 'git reset --hard'", { cwd: ROOT }));
+  assert.equal(bashDestructiveFinding('echo "git reset --hard"', { cwd: ROOT }), null);
+  assert.equal(bashDestructiveFinding('git restore --staged .', { cwd: ROOT }), null);
+});
+
+test('graphResultIsEvidence: an empty answer is not compliance', () => {
+  const config = { ...DEFAULT_CONFIG, graph_signal_requires_content: true, graph_signal_min_chars: 10 };
+  assert.equal(graphResultIsEvidence('{"total":0,"results":[]}', config), false);
+  assert.equal(graphResultIsEvidence('{"total_nodes":0}', config), false);
+  assert.equal(graphResultIsEvidence('not found', config), false);
+  assert.equal(graphResultIsEvidence('{"total":1,"results":[{"file_path":"a/b.js"}]}', config), true);
+  assert.equal(graphResultIsEvidence('short', { ...config, graph_signal_requires_content: false }), true);
+});
+
+test('unlockTokensFromQualifiedName: dotted symbol names unlock their file', () => {
+  const tokens = unlockTokensFromQualifiedName('E-Development-agent-config-bridge.bridge.lib.gates.gateStatus');
+  assert.ok(tokens.includes('bridge/lib/gates'), 'the module directory is a suffix token');
+  assert.ok(tokens.includes('gates/gatestatus'), 'the tail is a suffix token (normalised to lower case)');
+});
+
+test('no-blind-retry: the third identical failure needs investigation first', () => {
+  const p = policyFromObject({
+    name: 'retry',
+    checks: ['no-blind-retry'],
+    config: { max_identical_failures: 2, retry_window_ms: 60_000, max_blocks_per_session: 10 },
+  }).policy;
+  const state = newSessionState();
+  recordCommandResult(state, 'npm test', true, 1_000);
+  recordCommandResult(state, 'npm test', true, 2_000);
+  const blocked = shouldBlock({
+    policy: p,
+    state,
+    input: { action: 'bash', command: 'npm   test', cwd: ROOT, tool: 'bash' },
+    fs,
+    now: 3_000,
+  });
+  assert.equal(blocked.code, 'BLIND_RETRY');
+  recordInspection(state, FILE, 2_500);
+  assert.equal(
+    shouldBlock({
+      policy: p,
+      state,
+      input: { action: 'bash', command: 'npm test', cwd: ROOT, tool: 'bash' },
+      fs,
+      now: 3_000,
+    }).block,
+    false,
+  );
 });
