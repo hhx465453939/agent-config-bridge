@@ -102,7 +102,7 @@ node bridge/cli.js revoke kimi
 | **硬闸门（gate）** | ✅ | 仅对有扩展机制的 agent（见下节） |
 | **各端私有设置** | ❌ | 模型选择、主题、快捷键、权限白名单、非 MCP 段配置 —— 原样保留 |
 | **模型上下文窗口元数据** | ❌ 只报告 | 自定义 provider 扩展与 `pi-router-catalog.json` 里各存一份 `contextWindow`，且目录那份**永不自动刷新**；`doctor` 比对后报警，**不重写**（见 `docs/ADR/005`、`docs/USAGE.md` §5.9） |
-| **各端扩展 / 插件** | ❌ | 你自己写的扩展原样保留；本工具只往里面加**它自己那一个子目录** |
+| **各端扩展 / 插件** | ❌ | 你自己写的扩展原样保留；本工具只往里面加**它自己那一个子目录**。仓库还提供一个**可选**的长任务续跑扩展，由独立脚本显式安装（见下节），不进 `managed` 清单 |
 | 会话 / 历史 / 缓存 / 凭据文件 | ❌ | 运行时数据，永不触碰 |
 | output-styles / themes | ❌ | 无对等概念 |
 
@@ -157,6 +157,35 @@ bridge/gates/
 * **改文件前必须有证据**：本会话读过该文件，或图谱查询点名过它；改的是新文件时不强制。
 * 用不着"我的项目在某个固定目录"这种硬编码：作用范围按"配置优先，否则沿目录向上找 `.git`"判定。
 * 闸门文件走和其它内容**完全一样的受管路径**：`adopt` 时被快照，`revoke` 时被卸载，只动它自己那个目录，你写的其它扩展原样保留。
+
+## 可选能力：长任务续跑（pi）
+
+> 与桥接无关，**默认不装**，不影响 adopt / revoke / rollback。
+
+pi 每一轮回复结束都会把控制权交回用户 —— 这是对话协议的边界，不是配置项。
+对「一个里程碑连跑十几轮」的开发方式，每轮手动回车是纯损耗。
+
+本仓库附带一个 pi 扩展做续跑：在 `turn_end` 边界追加一条输入并请求继续。
+
+```bash
+node scripts/install-pi-auto-continue.js            # 干跑，先看会写哪个文件
+node scripts/install-pi-auto-continue.js --apply    # 安装（已存在会先备份）
+# 然后在 pi 里：
+#   /reload
+#   /auto on          # 不限轮数
+#   /auto off         # 随时停
+```
+
+| 项 | 说明 |
+|---|---|
+| 默认 | 不安装；安装器是显式命令，不进 `apply` 流程 |
+| 停机条件 | **只有三个**：`/auto off`、目标文件 `state: DONE`、输出 `<promise>COMPLETE</promise>` |
+| 轮数 | 无上限（`remaining: -1`）；也可 `/auto on 20` 限轮 |
+| 实现 | 返回 `{ continue: true, entries: [{ type: "custom_message" }] }`，**不调** `sendUserMessage`（turn_end 时 agent 仍在处理，会抛 `already processing`） |
+| 加载 | `.pi/extensions/` 是 pi 的自动发现目录，**不要**再写进 `.pi/settings.json`（会重复加载） |
+| 卸载 | `rm ~/.pi/agent/extensions/auto-continue.ts`（单文件，无其它副作用） |
+
+细节、两个已踩过的坑、与桥接的边界：见 [`docs/PI-AUTO-CONTINUE.md`](docs/PI-AUTO-CONTINUE.md)。
 
 ## 敏感信息处理
 
