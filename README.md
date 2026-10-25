@@ -165,7 +165,11 @@ bridge/gates/
 pi 每一轮回复结束都会把控制权交回用户 —— 这是对话协议的边界，不是配置项。
 对「一个里程碑连跑十几轮」的开发方式，每轮手动回车是纯损耗。
 
-本仓库附带一个 pi 扩展做续跑：在 `turn_end` 边界追加一条输入并请求继续。
+本仓库附带**两个**可选的 pi 扩展做续跑，**二选一，不要同时开启**。
+
+### 方案 A：auto-continue（无轮数上限）
+
+在 `turn_end` 边界追加一条输入并请求继续。
 
 ```bash
 node scripts/install-pi-auto-continue.js            # 干跑，先看会写哪个文件
@@ -186,6 +190,32 @@ node scripts/install-pi-auto-continue.js --apply    # 安装（已存在会先�
 | 卸载 | `rm ~/.pi/agent/extensions/auto-continue.ts`（单文件，无其它副作用） |
 
 细节、两个已踩过的坑、与桥接的边界：见 [`docs/PI-AUTO-CONTINUE.md`](docs/PI-AUTO-CONTINUE.md)。
+
+### 方案 B：goal-mode（带预算与空转保护）
+
+在 `agent_before_settle` 边界续跑，默认 **400 轮 / 12 小时**上限，连续 3 轮零工具调用即停；
+完成信号由模型显式调用 `goal_complete` 工具发出，按 Esc 中止时不会自动续跑。
+
+```bash
+node scripts/install-pi-goal-mode.js            # 干跑
+node scripts/install-pi-goal-mode.js --apply    # 安装（已存在会先备份）
+# 然后在 pi 里：
+#   /reload
+#   /goal <任务描述>   # 启动目标模式
+#   /goal              # 看状态
+#   /goal stop         # 随时停
+```
+
+| 项 | 说明 |
+|---|---|
+| 默认 | 不安装；与方案 A 二选一 |
+| 停机条件 | Esc 中止、`/goal stop`、`/goal done`、`goal_complete` 工具、轮数/时长上限、连续 3 轮空转 |
+| 轮数 | 默认 400（`/goal max N` 可调） |
+| 时长 | 默认 12h（`/goal hours N` 可调） |
+| 实现 | 走 `agent_before_settle` boundary entries，不调 `sendUserMessage` |
+| 卸载 | `rm ~/.pi/agent/extensions/goal-mode.ts`（单文件，无其它副作用） |
+
+细节、与 auto-continue 的差异、三个已踩过的坑：见 [`docs/PI-GOAL-MODE.md`](docs/PI-GOAL-MODE.md)。
 
 ## 敏感信息处理
 
