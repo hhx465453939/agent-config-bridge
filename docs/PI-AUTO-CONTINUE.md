@@ -34,7 +34,8 @@ node scripts/install-pi-auto-continue.js --apply
 | `/auto off` | 立即停止 |
 | `/auto status` | 查看状态与剩余轮数（`∞` = 不限） |
 
-状态文件：`<项目>/.pi/auto-continue.json`（运行时产物，建议 gitignore；模板见 `.pi/auto-continue.example.json`）。
+状态文件：`<项目>/.pi/auto-continue.json`（运行时产物，建议 gitignore）。
+默认 prompt 是通用的，不假设任何项目结构；要针对某个仓库定制续跑指令，在该文件的 `prompt` 字段里写即可，`/auto on` 会读它。
 
 ## 停机条件（只有三个，**没有轮数上限**）
 

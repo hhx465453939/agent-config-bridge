@@ -36,10 +36,9 @@ const DEFAULT_STATE: AutoState = {
   enabled: false,
   remaining: -1,
   prompt:
-    "继续执行 CHG-20261024-xuanji-founding 的下一个未完成里程碑。" +
-    "先读 tasks/CHG-20261024-xuanji-founding/goal-state.yaml 与 TRACEABILITY.md 确认进度，" +
-    "然后按 SPEC 实现、跑 bash scripts/check.sh 与 xuanji verify --all，" +
-    "全绿后提交并推送。全部里程碑完成时输出 <promise>COMPLETE</promise>。" +
+    "继续执行当前任务的下一个未完成步骤。" +
+    "先查看仓库里的进度记录（如 tasks/、TODO、CHANGELOG 或上一轮的交付说明）确认做到哪一步，" +
+    "然后直接实现、验证并提交。全部完成时输出 <promise>COMPLETE</promise>。" +
     "不要问我问题，不要停在中途汇报。",
 };
 
