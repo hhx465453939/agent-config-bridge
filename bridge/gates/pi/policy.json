@@ -40,10 +40,10 @@
     "convention_files": ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", ".cursorrules"],
     "require_chg_contract": true,
     "chg_contract_globs": [
-      "**/tasks/chg-*/spec.md",
-      "**/tasks/chg-*/prd.md",
-      "**/tasks/chg-*/change.md",
-      "**/tasks/chg-*/traceability.md"
+      "**/tasks/CHG-*/SPEC.md",
+      "**/tasks/CHG-*/PRD.md",
+      "**/tasks/CHG-*/CHANGE.md",
+      "**/tasks/CHG-*/TRACEABILITY.md"
     ],
     "max_identical_failures": 2,
     "retry_window_ms": 600000,

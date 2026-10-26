@@ -68,8 +68,12 @@ const policy = (overrides = {}) =>
     },
   }).policy;
 
+const TASKS_DIR = join(ROOT, 'tasks');
+const CHG_DIR = join(TASKS_DIR, 'CHG-001-foo');
 const FS_DIRS = new Set(
-  [ROOT, join(ROOT, '.git'), join(ROOT, 'packages'), join(ROOT, 'packages', 'xyb')].map((p) => normalizePath(p)),
+  [ROOT, join(ROOT, '.git'), join(ROOT, 'packages'), join(ROOT, 'packages', 'xyb'), TASKS_DIR, CHG_DIR].map(
+    (p) => normalizePath(p),
+  ),
 );
 const FS_FILES = new Set([FILE, OTHER].map((p) => normalizePath(p)));
 
@@ -77,7 +81,9 @@ const fs = {
   exists: (p) => FS_DIRS.has(normalizePath(p)) || FS_FILES.has(normalizePath(p)),
   isFile: (p) => FS_FILES.has(normalizePath(p)),
   statMtime: () => 0,
-  listDir: () => [],
+  // 项目适用性判据：`tasks/` 下有无 `CHG-*` 子目录。默认为「采纳 CHG」，
+  // 以便既有用例继续守着「未读契约必须拦」。
+  listDir: (p) => (normalizePath(p) === normalizePath(TASKS_DIR) ? ['CHG-001-foo'] : []),
 };
 
 /** The same layout plus one convention document, for the Layer-0 checks. */
@@ -344,6 +350,81 @@ test('ai-spec: 改代码前未读 CHG 契约则拦，读过 SPEC 才放行', () 
     now: 1_000_000,
   });
   assert.equal(offRes.block, false, 'require_chg_contract=false 时不拦');
+});
+
+test('ai-spec: glob 大小写不敏感（大写 / 混写 / 全大写都生效）', () => {
+  const mk = (globs) =>
+    policyFromObject({
+      name: 'chg-case',
+      checks: ['chg-contract-before-edit'],
+      config: {
+        project_roots: [ROOT],
+        require_chg_contract: true,
+        require_target_evidence: false,
+        require_conventions: false,
+        chg_contract_globs: globs,
+      },
+    }).policy;
+
+  const write = (p, state = newSessionState()) =>
+    shouldBlock({
+      policy: p,
+      state,
+      input: { action: 'write', path: FILE, tool: 'edit', content: 'x' },
+      fs,
+      now: 1_000_000,
+    });
+
+  // 大写 glob 必须真的生效 —— 首版要求配置全小写，门控因此静默失效。
+  const upper = mk(['**/tasks/CHG-*/SPEC.md']);
+  assert.equal(write(upper).code, 'CHG_CONTRACT', '大写 glob 必须生效');
+
+  // 路径大小写混写也应命中
+  const mixed = newSessionState();
+  recordDocRead(mixed, join(ROOT, 'tasks', 'Chg-001-Foo', 'Spec.md'), 1_000_000);
+  assert.equal(write(upper, mixed).block, false, '路径大小写混写也应匹配');
+
+  // 全大写路径同样解锁
+  const allUpper = newSessionState();
+  recordDocRead(allUpper, join(ROOT, 'TASKS', 'CHG-001-FOO', 'SPEC.MD'), 1_000_000);
+  assert.equal(write(upper, allUpper).block, false, '全大写路径也应匹配');
+
+  // 小写配置大小写也生效（向后兼容）
+  const lower = mk(['**/tasks/chg-*/spec.md']);
+  assert.equal(write(lower).code, 'CHG_CONTRACT', '小写 glob 与混写路径仍生效');
+});
+
+test('ai-spec: 不用 CHG 体系的仓库不被拦（项目适用性）', () => {
+  const p = policyFromObject({
+    name: 'chg-scope',
+    checks: ['chg-contract-before-edit'],
+    config: {
+      project_roots: [ROOT],
+      require_chg_contract: true,
+      require_target_evidence: false,
+      require_conventions: false,
+    },
+  }).policy;
+
+  const write = (f) =>
+    shouldBlock({
+      policy: p,
+      state: newSessionState(),
+      input: { action: 'write', path: FILE, tool: 'edit', content: 'x' },
+      fs: f,
+      now: 1_000_000,
+    });
+
+  // 没有 tasks/ → 本项目不采纳 CHG → 不拦（否则任何非 CHG 仓库都改不了代码）
+  const noTasks = { ...fs, exists: (x) => normalizePath(x) !== normalizePath(TASKS_DIR) && fs.exists(x) };
+  assert.equal(write(noTasks).block, false, '无 tasks/ 不拦');
+
+  // 有 tasks/ 但没有 CHG-* 子目录 → 同样不拦（ADR 体系仓库）
+  const noChg = { ...fs, listDir: () => [] };
+  assert.equal(write(noChg).block, false, '有 tasks/ 无 CHG-* 不拦');
+
+  // 有 CHG-* 且未读契约 → 仍拦（防退化）
+  assert.equal(write(fs).code, 'CHG_CONTRACT', '有 CHG-* 未读契约仍拦');
 });
 
 test('think: an existing file needs a read or a scoped graph hit, not a session signal', () => {

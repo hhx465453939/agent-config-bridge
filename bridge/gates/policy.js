@@ -156,13 +156,12 @@ export const DEFAULT_CONFIG = {
    * 只约束代码文件（isCodeFile），文档与数据文件不拦。
    */
   require_chg_contract: true,
-  // ⚠️ glob 必须**全小写**：normalizePath 会把路径小写化（Windows 下还转反斜杠，
-  // 而 matchesAnyGlob 前会 toPosix）。写成 `CHG-*/SPEC.md` 会永不匹配——门控静默失效。
+  // 大小写不敏感（`isChgContract` 对两侧统一小写化），可写成自然的大写形态。
   chg_contract_globs: [
-    '**/tasks/chg-*/spec.md',
-    '**/tasks/chg-*/prd.md',
-    '**/tasks/chg-*/change.md',
-    '**/tasks/chg-*/traceability.md',
+    '**/tasks/CHG-*/SPEC.md',
+    '**/tasks/CHG-*/PRD.md',
+    '**/tasks/CHG-*/CHANGE.md',
+    '**/tasks/CHG-*/TRACEABILITY.md',
   ],
 
   /**
@@ -522,11 +521,14 @@ export const isConventionDoc = (path, config = DEFAULT_CONFIG) => {
  * 与 `isConventionDoc` 分开是故意的：约定文档是「怎么做事」，CHG 契约是
  * 「这次做什么、做到什么算完」。缺少前者只能提醒，缺少后者**不允许改代码**。
  *
- * 注意：normalizePath 会小写化路径，所以 `chg_contract_globs` 必须全小写。
+ * 大小写不敏感：`normalizePath` 会把**路径**小写化，而 glob 是人手写的，
+ * `tasks/CHG-<id>/SPEC.md` 是自然写法。两侧统一小写化后再比——不让
+ * 「配置怎么写」决定门控是否生效。历史事故：曾要求配置全小写，门控因此静默失效。
  */
 export const isChgContract = (path, config = DEFAULT_CONFIG) => {
   if (typeof path !== 'string' || path === '') return false;
-  return matchesAnyGlob(toPosix(path).toLowerCase(), config.chg_contract_globs ?? []);
+  const globs = (config.chg_contract_globs ?? []).map((g) => String(g).toLowerCase());
+  return matchesAnyGlob(toPosix(path).toLowerCase(), globs);
 };
 
 /** Record a file the session wrote. The caller passes the normalized spelling. */
@@ -1332,6 +1334,16 @@ const CHECKS = {
     if (!scope.inScope || !scope.root) return null;
     // 只约束代码：改文档 / 数据 / 台账不要求 CHG 契约。
     if (!isCodeFile(norm, config)) return null;
+
+    // 项目适用性：不用 CHG 体系的项目（如以 ADR 管理的仓库）不该被这条拦死。
+    // 判据取文件系统事实：`tasks/` 存在且含 `CHG-*` 子目录，才认为本项目采纳了 CHG。
+    // 不跳过的后果：任何不用 CHG 的仓库都改不了代码 —— 死锁。
+    const tasksDir = join(scope.root, 'tasks');
+    if (!deps.exists(tasksDir)) return null;
+    if (typeof deps.listDir === 'function') {
+      const entries = deps.listDir(tasksDir) ?? [];
+      if (!entries.some((name) => /^CHG-/i.test(String(name)))) return null;
+    }
 
     const read = [...deps.state.docReads].some((p) =>
       isChgContract(normalizePath(p), config),
