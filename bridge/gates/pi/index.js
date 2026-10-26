@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import {
   bashReadTargets,
   graphResultIsEvidence,
+  isChgContract,
   isConventionDoc,
   loadPolicy,
   newSessionState,
@@ -349,7 +350,9 @@ export default function enforceRules(pi, options = {}) {
     const path = normalizePath(inputPath(event.input), cwd);
     if (READ_TOOLS.has(event.toolName) && path) {
       recordInspection(state, path);
-      if (isConventionDoc(path, policy.config)) recordDocRead(state, path);
+      if (isConventionDoc(path, policy.config) || isChgContract(path, policy.config)) {
+        recordDocRead(state, path);
+      }
     }
 
     if (event.toolName === 'bash') {
@@ -365,7 +368,11 @@ export default function enforceRules(pi, options = {}) {
       // `cat CONTRIBUTING.md` satisfies the convention rule just like `read`.
       for (const token of command.match(/"[^"]+"|'[^']+'|[^\s;&|]+/g) ?? []) {
         const candidate = normalizePath(token.replace(/^["']|["']$/g, ''), cwd);
-        if (candidate && isConventionDoc(candidate, policy.config) && realFs.isFile(candidate)) {
+        if (
+          candidate &&
+          (isConventionDoc(candidate, policy.config) || isChgContract(candidate, policy.config)) &&
+          realFs.isFile(candidate)
+        ) {
           recordDocRead(state, candidate);
         }
       }

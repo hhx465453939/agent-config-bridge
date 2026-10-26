@@ -284,7 +284,66 @@ test('cap: safety checks keep running after the research cap', () => {
   const read = readVerdict(FILE, state, 1, p);
   assert.equal(read.block, false, 'the research rule is capped');
   assert.equal(read.capReached, true);
-  assert.deepEqual([...HARD_CHECKS].sort(), ['no-destructive-bash', 'no-secret-write', 'no-write-outside']);
+  assert.deepEqual(
+    [...HARD_CHECKS].sort(),
+    ['chg-contract-before-edit', 'no-destructive-bash', 'no-secret-write', 'no-write-outside'],
+  );
+});
+
+test('ai-spec: 改代码前未读 CHG 契约则拦，读过 SPEC 才放行', () => {
+  const p = policyFromObject({
+    name: 'chg-gate',
+    checks: ['chg-contract-before-edit'],
+    config: {
+      project_roots: [ROOT],
+      require_chg_contract: true,
+      require_target_evidence: false,
+      require_conventions: false,
+      max_blocks_per_session: 10,
+      chg_contract_globs: ['**/tasks/chg-*/spec.md'],
+    },
+  }).policy;
+  const w = (state, path = FILE) =>
+    shouldBlock({
+      policy: p,
+      state,
+      input: { action: 'write', path, tool: 'edit', content: 'x' },
+      fs,
+      now: 1_000_000,
+    });
+
+  const bare = w(newSessionState());
+  assert.equal(bare.block, true, '未读 CHG 契约必须拦');
+  assert.equal(bare.code, 'CHG_CONTRACT');
+
+  // 读约定文档不算读 CHG 契约：两者是不同问题（怎么做事 vs 这次做什么）
+  const docs = newSessionState();
+  recordDocRead(docs, AGENTS, 1_000_000);
+  assert.equal(w(docs).code, 'CHG_CONTRACT', '读 AGENTS.md ≠ 读 CHG 契约');
+
+  // 读了该 CHG 的 SPEC 才放行
+  const ok = newSessionState();
+  recordDocRead(ok, join(ROOT, 'tasks', 'CHG-001-foo', 'SPEC.md'), 1_000_000);
+  assert.equal(w(ok).block, false, '读过 SPEC 即放行');
+
+  // 非代码文件不受约束：改 notes.txt 不要求 CHG 契约
+  const note = w(newSessionState(), NOTE);
+  assert.equal(note.block, false, '非代码文件不要求 CHG 契约');
+
+  // 关闭开关时完全不拦
+  const off = policyFromObject({
+    name: 'chg-off',
+    checks: ['chg-contract-before-edit'],
+    config: { project_roots: [ROOT], require_chg_contract: false },
+  }).policy;
+  const offRes = shouldBlock({
+    policy: off,
+    state: newSessionState(),
+    input: { action: 'write', path: FILE, tool: 'edit', content: 'x' },
+    fs,
+    now: 1_000_000,
+  });
+  assert.equal(offRes.block, false, 'require_chg_contract=false 时不拦');
 });
 
 test('think: an existing file needs a read or a scoped graph hit, not a session signal', () => {

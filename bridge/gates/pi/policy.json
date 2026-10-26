@@ -2,7 +2,7 @@
   "name": "graph-first-gate",
   "version": 3,
   "description": "Enforce the rules document instead of trusting the model to follow it. v3 (2026-10-20) hardens the v2 gate on a real Windows host: (1) the per-session block cap no longer switches off the secret/write/destructive checks; (2) a new Layer-0 think-before-write rule requires evidence that the model looked at the exact file (or a graph query named it) and read the project conventions before editing; (3) shell writes (redirection, tee, sed -i, cp/mv/rm) are checked by the write and secret rules; (4) the bash reader understands cd, git show/diff/grep, find -exec, xargs, recursive greps and globs; (5) an empty graph result no longer counts as a query; (6) a successful query no longer stands down the stale-index check; (7) index-before-read is opt-in because a global codebase-memory index has no repo marker. The block cap stays at 30 for research rules; safety rules are uncapped.",
-  "reminder": "[system-reminder · 三层代码阅读 + 动脑子铁律 · 每轮生效]\nLayer 0 动脑子：改代码前先回答五问——项目约定？环境现状？字面背后的真实需求？任务目的？产出价值？没读过目标文件、没判根因，不要动手。\nLayer 1 图谱：read 代码文件前先用 codebase-memory MCP（search_graph / trace_path / get_code_snippet / query_graph / get_architecture / search_code）查结构与调用关系。空结果不算合规：先查 index_status / 重新索引，回图谱重查。\nLayer 2 索引：项目未索引或索引过期（代码比索引新）时，先 index_repository / detect_changes，完成后回到 Layer 1——不允许索引完直接 read。\nLayer 3 直读：仅当重索引后图谱仍无法满足（非代码文件、图谱查不到、本会话自己改动的文件）才直读。\n闸门强度：有内容的图谱查询给 10 分钟窗口；查询点名的文件/包另给 30 分钟作用域解锁。bash 的 cat / grep -r / git show / find -exec / sed -i / 重定向写文件同样受管。\n改已存在文件需要：本会话读过它，或图谱点名过它；改之前还要读项目约定（AGENTS.md / CLAUDE.md / CONTRIBUTING.md / .cursorrules，存在才要求）。\n破坏性命令（git reset --hard / git clean -f / rm -rf 源码目录 / 强推等）一律拦截；同一条失败命令原样重试第 3 次也会被拦。\n拦截上限只作用于研究规则；凭据写入、越界写入、破坏性命令永远生效。",
+  "reminder": "[system-reminder · 三层代码阅读 + 动脑子铁律 · 每轮生效]\nLayer 0 动脑子：改代码前先回答五问——项目约定？环境现状？字面背后的真实需求？任务目的？产出价值？没读过目标文件、没判根因，不要动手。\nLayer 1 图谱：read 代码文件前先用 codebase-memory MCP（search_graph / trace_path / get_code_snippet / query_graph / get_architecture / search_code）查结构与调用关系。空结果不算合规：先查 index_status / 重新索引，回图谱重查。\nLayer 2 索引：项目未索引或索引过期（代码比索引新）时，先 index_repository / detect_changes，完成后回到 Layer 1——不允许索引完直接 read。\nLayer 3 直读：仅当重索引后图谱仍无法满足（非代码文件、图谱查不到、本会话自己改动的文件）才直读。\n闸门强度：有内容的图谱查询给 10 分钟窗口；查询点名的文件/包另给 30 分钟作用域解锁。bash 的 cat / grep -r / git show / find -exec / sed -i / 重定向写文件同样受管。\n改已存在文件需要：本会话读过它，或图谱点名过它；改之前还要读项目约定（AGENTS.md / CLAUDE.md / CONTRIBUTING.md / .cursorrules，存在才要求）。\n破坏性命令（git reset --hard / git clean -f / rm -rf 源码目录 / 强推等）一律拦截；同一条失败命令原样重试第 3 次也会被拦。\n拦截上限只作用于研究规则；凭据写入、越界写入、破坏性命令永远生效。\n\n[ai-spec 门控 · 改代码前必过]\n改任何代码文件前，本会话必须读过对应立项 CHG 的契约（tasks/CHG-*/SPEC.md 或 PRD.md）。\n五问：属于哪个 CHG？四件套齐吗？目标文件在独占清单里吗？改完哪条 AC 变绿？先判根因还是打补丁？\n开发中发现的问题当场修，不许留给「后续」；收尾必须达成该 CHG 的预定功能目标，而不是「大部分做完」。",
   "checks": [
     "no-write-outside",
     "no-secret-write",
@@ -11,6 +11,7 @@
     "graph-before-read",
     "bash-graph-before-read",
     "think-before-write",
+    "chg-contract-before-edit",
     "no-blind-retry"
   ],
   "config": {
@@ -37,6 +38,13 @@
     "require_target_evidence": true,
     "require_conventions": true,
     "convention_files": ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", ".cursorrules"],
+    "require_chg_contract": true,
+    "chg_contract_globs": [
+      "**/tasks/chg-*/spec.md",
+      "**/tasks/chg-*/prd.md",
+      "**/tasks/chg-*/change.md",
+      "**/tasks/chg-*/traceability.md"
+    ],
     "max_identical_failures": 2,
     "retry_window_ms": 600000,
     "destructive_allow_patterns": []

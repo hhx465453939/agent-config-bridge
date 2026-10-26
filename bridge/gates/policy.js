@@ -145,6 +145,27 @@ export const DEFAULT_CONFIG = {
   convention_files: ['AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md', '.cursorrules'],
 
   /**
+   * ai-spec 层：改代码前必须确认本次改动对应哪个立项 CHG，且本会话读过它的契约。
+   *
+   * 为什么必须做成硬门控：AGENTS.md 说「按 CHG 推进」只是建议。实测教训
+   * （2026-10-29，40 个 CHG 批量开发）：31 个缺 PRD、28 个缺 TRACEABILITY，
+   * 先合并的 CHG 用「全局状态断言」把后合并的合法改动判红——全部源于
+   * 「没先核对契约就动手」。
+   *
+   * 判定只看一件事：`state.docReads` 里是否有一条落在 `chg_contract_globs`。
+   * 只约束代码文件（isCodeFile），文档与数据文件不拦。
+   */
+  require_chg_contract: true,
+  // ⚠️ glob 必须**全小写**：normalizePath 会把路径小写化（Windows 下还转反斜杠，
+  // 而 matchesAnyGlob 前会 toPosix）。写成 `CHG-*/SPEC.md` 会永不匹配——门控静默失效。
+  chg_contract_globs: [
+    '**/tasks/chg-*/spec.md',
+    '**/tasks/chg-*/prd.md',
+    '**/tasks/chg-*/change.md',
+    '**/tasks/chg-*/traceability.md',
+  ],
+
+  /**
    * Layer 0: retrying an identical failing command is the mechanical loop the
    * thinking rule exists to stop. Two failures are tolerated (a flaky test, a
    * transient tool); the third needs investigation (read or graph) first.
@@ -493,6 +514,19 @@ export const isConventionDoc = (path, config = DEFAULT_CONFIG) => {
   if (typeof path !== 'string' || path === '') return false;
   const name = toPosix(path).split('/').pop() ?? '';
   return (config.convention_files ?? []).some((n) => n.toLowerCase() === name.toLowerCase());
+};
+
+/**
+ * Does this path name a CHG contract document (`tasks/CHG-<id>/SPEC|PRD|CHANGE|TRACEABILITY`)?
+ *
+ * 与 `isConventionDoc` 分开是故意的：约定文档是「怎么做事」，CHG 契约是
+ * 「这次做什么、做到什么算完」。缺少前者只能提醒，缺少后者**不允许改代码**。
+ *
+ * 注意：normalizePath 会小写化路径，所以 `chg_contract_globs` 必须全小写。
+ */
+export const isChgContract = (path, config = DEFAULT_CONFIG) => {
+  if (typeof path !== 'string' || path === '') return false;
+  return matchesAnyGlob(toPosix(path).toLowerCase(), config.chg_contract_globs ?? []);
 };
 
 /** Record a file the session wrote. The caller passes the normalized spelling. */
@@ -1279,6 +1313,59 @@ const CHECKS = {
    * and requiring a graph hit would brick the first file in an empty repo. The
    * convention check still applies to them.
    */
+  /**
+   * ai-spec Layer 0.5：改代码前必须核对该改动对应的立项 CHG 契约。
+   *
+   * 与 `think-before-write` 的分工：
+   *   - `think-before-write` 管「你看过这个文件吗」（图层/证据）
+   *   - 本检查管「这个改动属于哪个 CHG、那个 CHG 契约齐全吗」（契约/范围）
+   *
+   * 两者都过，才允许改代码。缺前者 = 篡改；缺后者 = 跑偏。
+   */
+  'chg-contract-before-edit': (policy, input, deps) => {
+    if (input.action !== 'write') return null;
+    const config = policy.config;
+    if (config.require_chg_contract === false) return null;
+
+    const norm = normalizePath(input.path);
+    const scope = scopeOf(norm, { config, exists: deps.exists });
+    if (!scope.inScope || !scope.root) return null;
+    // 只约束代码：改文档 / 数据 / 台账不要求 CHG 契约。
+    if (!isCodeFile(norm, config)) return null;
+
+    const read = [...deps.state.docReads].some((p) =>
+      isChgContract(normalizePath(p), config),
+    );
+    if (read) return null;
+
+    return {
+      code: 'CHG_CONTRACT',
+      reason: [
+        '⛔ ai-spec 门控：改代码前没有核对立项 CHG 的契约。',
+        `  目标：${norm}`,
+        '  缺口：本会话没有读过任何 tasks/CHG-*/ 下的 SPEC / PRD / CHANGE / TRACEABILITY。',
+        '',
+        '先做（按序，缺一不可）：',
+        '  1) 定位本次开发属于哪个 CHG：ls tasks/CHG-*/（按 date-slug 判定）',
+        '  2) 读它的四件套（至少 SPEC）：',
+        '     read tasks/CHG-<id>/SPEC.md          # 目标 / 独占文件 / 验收断言 / 绝不做什么',
+        '     read tasks/CHG-<id>/PRD.md           # 承诺什么、不承诺什么',
+        '     read tasks/CHG-<id>/TRACEABILITY.md  # 每条 AC 的证据在哪',
+        '  3) 五问自检再动手：',
+        '     · 这个改动属于哪个 CHG？（答不出 = 不许改）',
+        '     · 该 CHG 四件套齐全吗？（缺哪件就先补，缺料不许开工）',
+        '     · 目标文件在该 CHG 的「独占文件」清单里吗？（不在 = 可能越界）',
+        '     · 改完哪条 AC 会从红变绿？（答不出 = 没有验收目标）',
+        '     · 是先用第一性原理判了根因，还是照症状打补丁？',
+        '',
+        '开发中发现的问题必须当场修，不许留给「后续」；',
+        '收尾必须让该 CHG 的预定功能目标达成，而不是「大部分做完」。',
+        '',
+        '这条不是建议：未核对契约的代码改动一律拒绝。',
+      ].join('\n'),
+    };
+  },
+
   'think-before-write': (policy, input, deps) => {
     if (input.action !== 'write' && input.action !== 'bash') return null;
     const config = policy.config;
@@ -1667,6 +1754,8 @@ export const HARD_CHECKS = new Set([
   'no-write-outside',
   'no-secret-write',
   'no-destructive-bash',
+  // ai-spec 契约门控：不得因拦截上限而失效——它守的是「不跑偏」，与安全同级。
+  'chg-contract-before-edit',
 ]);
 
 // ---------------------------------------------------------------------------
