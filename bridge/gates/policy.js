@@ -65,14 +65,35 @@ export const DEFAULT_CONFIG = {
   code_extensions: [
     'ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs',
     'py', 'pyi', 'rs', 'go', 'java', 'c', 'h', 'cc', 'cpp', 'hpp', 'hh',
-    'rb', 'php', 'sql', 'sh', 'bash', 'zsh', 'scala', 'kt', 'kts',
+    'rb', 'php', 'sql', 'sh', 'bash', 'zsh', 'ps1', 'psm1', 'scala', 'kt', 'kts',
     'swift', 'lua', 'vue', 'svelte', 'r', 'jl', 'cs', 'fs', 'ex', 'exs',
-    'toml', 'proto', 'gradle', 'tf',
+    'toml', 'proto', 'gradle', 'tf', 'tfvars', 'hcl', 'nix', 'dart', 'groovy',
+    'yml', 'yaml', 'ipynb', 'json5',
   ],
   /** Extensionless files that are still source code. */
   code_filenames: ['Dockerfile', 'Containerfile', 'Makefile', 'Rakefile', 'Gemfile', 'Procfile'],
-  /** How many times one session may be blocked before the gate gives up. */
-  max_blocks_per_session: 30,
+  /**
+   * How many times one session may be blocked before the research rules give up.
+   *
+   * v4 raised this from 30 to 200. Thirty was reached by ordinary read-heavy
+   * sessions, and after that point every Layer-0/1/2 rule stood down for the
+   * rest of the session — the gate looked installed and was inert. Safety checks
+   * remain uncapped (`HARD_CHECKS`).
+   */
+  max_blocks_per_session: 200,
+  /**
+   * Sliding window for the block cap. Once the first block is older than this,
+   * the counter resets, so a long session never permanently loses its research
+   * rules. 0 disables the reset (old behaviour).
+   */
+  block_cap_reset_ms: 30 * 60 * 1000,
+  /**
+   * How long a successful read counts as evidence for `think-before-write`.
+   * A read used to unlock the file for the entire session; that turned "look
+   * before you edit" into a one-time ritual. -1 means "never expire" for users
+   * who intentionally want the old behaviour.
+   */
+  inspected_ttl_ms: 30 * 60 * 1000,
   /**
    * A graph query newer than this many ms counts as fresh, session-wide.
    *
@@ -163,6 +184,14 @@ export const DEFAULT_CONFIG = {
     '**/tasks/CHG-*/CHANGE.md',
     '**/tasks/CHG-*/TRACEABILITY.md',
   ],
+  /**
+   * Optional narrowing for the CHG-contract rule. Empty = every code file in a
+   * CHG-governed repository needs one contract read per session (v3 behaviour).
+   * Set it to e.g. 'bridge/**' when only part of the repository is actually
+   * governed by CHGs; historical `tasks/CHG-*` directories otherwise keep the
+   * whole tree gated forever.
+   */
+  chg_contract_scope_globs: [],
 
   /**
    * Layer 0: retrying an identical failing command is the mechanical loop the
@@ -171,6 +200,21 @@ export const DEFAULT_CONFIG = {
    */
   max_identical_failures: 2,
   retry_window_ms: 10 * 60 * 1000,
+
+  /**
+   * Turn-level anti-slack (v4). A tool-call gate cannot see a reply that does no
+   * work at all — "I'll finish it later" is the most common shape of that, and
+   * it used to pass untouched. The adapter checks the assistant's final text at
+   * `turn_end` and asks for one more turn when it finds a first-person deferral.
+   *
+   * This is deliberately narrow: it must never punish ordinary Q&A or a plan the
+   * user explicitly asked for. Extra patterns may be added per machine through
+   * `slack_patterns` (array of RegExp sources).
+   */
+  slack_check: true,
+  /** Hard stop so a false positive cannot loop the agent forever. */
+  slack_max_continues: 2,
+  slack_patterns: [],
 
   /**
    * Layer 0: destructive shell operations never run automatically. Paths that
@@ -382,7 +426,7 @@ export const newSessionState = () => ({
    * than a scoped unlock for the same file: it proves the model looked at the
    * exact target it is about to overwrite.
    */
-  inspected: new Set(),
+  inspected: new Map(),
   /** Project convention documents this session read (normalized). */
   docReads: new Set(),
   /**
@@ -402,6 +446,12 @@ export const newSessionState = () => ({
   written: new Set(),
   /** How many times the gate has blocked, to bound the damage of a false rule. */
   blocks: 0,
+  /** When the current cap window started; 0 = no block yet. */
+  firstBlockAt: 0,
+  /** Successful `index_repository` / `detect_changes` calls this session. */
+  lastIndexRefreshAt: 0,
+  /** How many no-slack continuations have been issued this session. */
+  slackContinues: 0,
   /** Reasons already surfaced, so the user is not shouted at every turn. */
   announced: new Set(),
 });
@@ -462,7 +512,39 @@ export const recordSignal = (state, now = Date.now()) => {
 /** Record that this session read a file, whatever tool performed the read. */
 export const recordInspection = (state, path, now = Date.now()) => {
   if (!path || !state?.inspected) return;
-  state.inspected.add(path);
+  // v4: a Map<path, timestamp> so the evidence can expire. A Set unlocked the
+  // file for the whole session, which made "look before you edit" a one-time
+  // ritual performed at turn 2 and forgotten by turn 40.
+  if (typeof state.inspected.set === 'function') state.inspected.set(path, now);
+  else state.inspected.add(path); // tolerate older/custom state objects
+  state.lastInvestigationAt = now;
+};
+
+/** Is a read of `path` still fresh enough to justify an edit? */
+export const hasFreshInspection = (state, path, config = DEFAULT_CONFIG, now = Date.now()) => {
+  const inspected = state?.inspected;
+  if (!inspected) return false;
+  let at = null;
+  if (typeof inspected.get === 'function') at = inspected.get(path) ?? null;
+  else if (typeof inspected.has === 'function' && inspected.has(path)) at = 0;
+  if (at === null) return false;
+  const ttl = config.inspected_ttl_ms ?? DEFAULT_CONFIG.inspected_ttl_ms;
+  if (ttl < 0) return true;
+  if (!(at > 0)) return false; // legacy Set entry: cannot prove freshness
+  return now - at <= ttl;
+};
+
+/**
+ * Record a successful index refresh (`index_repository` / `detect_changes`).
+ *
+ * Layer 2 used to key off `<repo>/.codebase-memory`, which only exists when the
+ * indexer was asked to persist its artifact. A normal global index therefore
+ * made the stale-check abstain forever. The session's own refresh timestamp is
+ * evidence that works regardless of where the index lives.
+ */
+export const recordIndexRefresh = (state, now = Date.now()) => {
+  if (!state) return;
+  state.lastIndexRefreshAt = now;
   state.lastInvestigationAt = now;
 };
 
@@ -1224,6 +1306,187 @@ export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd =
 
 
 // ---------------------------------------------------------------------------
+// PowerShell: the same read/write semantics, different verb names
+// ---------------------------------------------------------------------------
+
+const PS_READ_VERBS = new Set([
+  'get-content', 'gc', 'cat', 'type', 'select-string', 'sls', 'format-hex', 'fhx',
+  'get-item', 'gi', 'get-itemproperty', 'gp', 'resolve-path', 'rvpa', 'get-filehash',
+]);
+const PS_SCAN_VERBS = new Set(['get-childitem', 'gci', 'ls', 'dir']);
+const PS_WRITE_VERBS = new Set([
+  'set-content', 'sc', 'add-content', 'ac', 'out-file', 'tee-object', 'tee',
+  'new-item', 'ni', 'copy-item', 'cpi', 'cp', 'copy', 'move-item', 'mi', 'mv', 'move',
+  'rename-item', 'rni', 'ren', 'remove-item', 'ri', 'rm', 'del', 'erase', 'rmdir',
+  'clear-content', 'clc', 'export-csv', 'export-clixml', 'set-item', 'si',
+]);
+/** Flags whose next token is a path. */
+const PS_PATH_FLAGS = new Set(['-path', '-filepath', '-literalpath', '-destination', '-outfile', '-target', '-name']);
+/** Flags whose next token is a value (content, encoding, pattern), never a path. */
+const PS_VALUE_FLAGS = new Set([
+  '-value', '-encoding', '-delimiter', '-pattern', '-inputobject', '-width', '-totalcount',
+  '-head', '-tail', '-first', '-last', '-replace', '-credential', '-pipelinevariable',
+  '-filter', '-include', '-exclude', '-erroraction', '-warningaction', '-verbose',
+]);
+/** Verbs where every operand after the first is a destination. */
+const PS_MULTI_PATH_VERBS = new Set(['copy-item', 'cpi', 'cp', 'copy', 'move-item', 'mi', 'mv', 'move', 'rename-item', 'rni', 'ren']);
+
+const psFlag = (value) => String(value).toLowerCase().split(':')[0];
+
+/**
+ * Static parser for the PowerShell shapes that overlap with file work.
+ *
+ * Like the bash parser this is deliberately conservative: it understands the
+ * common read/write/scan verbs and `-Path`-style flags, and skips anything it
+ * cannot resolve. It never executes a command.
+ */
+const parsePowerShell = (
+  command,
+  { config = DEFAULT_CONFIG, cwd = null, isFile = defaultIsFile, exists = () => false } = {},
+) => {
+  const files = [];
+  const dirs = [];
+  const writes = [];
+  if (typeof command !== 'string' || command === '') return { files, dirs, writes };
+  let activeCwd = cwd;
+
+  const pushFile = (raw) => {
+    const candidate = resolveShellPath(raw, activeCwd);
+    if (!candidate || !isCodeFile(candidate, config) || isExcluded(candidate, config)) return;
+    if (isFile(candidate)) files.push(candidate);
+  };
+  const pushDir = (raw) => {
+    const candidate = resolveShellPath(raw, activeCwd);
+    if (!candidate || !exists(candidate)) return;
+    const scope = scopeOf(join(candidate, '.gate-probe.ts'), { config, exists });
+    if (scope.inScope) dirs.push(candidate);
+  };
+  const pushWrite = (raw) => {
+    const candidate = resolveShellPath(raw, activeCwd);
+    if (!candidate) return;
+    const base = candidate.replace(/\\/g, '/').split('/').pop()?.toLowerCase();
+    if (['/dev/null', 'nul', '/dev/stdout', '/dev/stderr'].includes(base)) return;
+    writes.push(candidate);
+  };
+
+  for (const rawSegment of splitShellSegments(command)) {
+    const segment = rawSegment.trim();
+    if (!segment) continue;
+    const tokens = shellTokens(segment);
+    if (tokens.length === 0) continue;
+    const { verb, args } = parseCommandHead(tokens);
+    if (!verb) continue;
+
+    // Nested invocation: `powershell -Command "Get-Content x"`.
+    if (['powershell', 'pwsh'].includes(verb)) {
+      const at = args.findIndex((a) => ['-c', '-command', '/c'].includes(a.value.toLowerCase()));
+      if (at >= 0 && args[at + 1]) {
+        const nested = args.slice(at + 1).map((a) => a.raw).join(' ');
+        const inner = parsePowerShell(nested, { config, cwd: activeCwd, isFile, exists });
+        files.push(...inner.files);
+        dirs.push(...inner.dirs);
+        writes.push(...inner.writes);
+      }
+      continue;
+    }
+
+    if (verb === 'cd' || verb === 'set-location' || verb === 'sl') {
+      const target = args.find((a) => a.quoted || !a.value.startsWith('-'));
+      const resolved = target ? resolveShellPath(target.value, activeCwd) : null;
+      if (resolved) activeCwd = resolved;
+      continue;
+    }
+
+    // Redirection: `... > file`, `... >> file`, `2> file`.
+    for (const m of segment.matchAll(/(?:^|\s)(?:\d?>>?)\s*("[^"]+"|'[^']+'|\S+)/g)) {
+      pushWrite(m[1]);
+    }
+
+    const isRead = PS_READ_VERBS.has(verb);
+    const isScan = PS_SCAN_VERBS.has(verb);
+    const isWrite = PS_WRITE_VERBS.has(verb);
+    if (!isRead && !isScan && !isWrite) continue;
+
+    const operands = [];
+    for (let i = 0; i < args.length; i += 1) {
+      const value = args[i].value;
+      if (!args[i].quoted && value.startsWith('-')) {
+        const flag = psFlag(value);
+        if (PS_PATH_FLAGS.has(flag) && args[i + 1]) {
+          operands.push(args[i + 1].value);
+          i += 1;
+        } else if (PS_VALUE_FLAGS.has(flag) && args[i + 1]) {
+          i += 1;
+        }
+        continue;
+      }
+      operands.push(value);
+    }
+
+    if (isScan) {
+      pushDir(operands[0] ?? activeCwd ?? '.');
+      continue;
+    }
+
+    if (isRead) {
+      // Positional `Select-String <pattern> <path>`: the first operand is the pattern.
+      const hasPathFlag = args.some((a) => PS_PATH_FLAGS.has(psFlag(a.value)));
+      const start = (verb === 'select-string' || verb === 'sls') && !hasPathFlag ? 1 : 0;
+      for (const p of operands.slice(start)) pushFile(p);
+      continue;
+    }
+
+    if (PS_MULTI_PATH_VERBS.has(verb)) {
+      const [source, ...dests] = operands;
+      if (source) pushFile(source);
+      for (const d of dests) pushWrite(d);
+      continue;
+    }
+
+    // Set-Content / Out-File / New-Item / Remove-Item: first operand is the path,
+    // later operands are content or values and must not be judged as paths.
+    if (operands[0]) pushWrite(operands[0]);
+  }
+
+  const unique = (list) => [...new Set(list)];
+  return { files: unique(files), dirs: unique(dirs), writes: unique(writes) };
+};
+
+export const powershellReadTargets = (command, opts = {}) => parsePowerShell(command, opts).files;
+export const powershellReadDirs = (command, opts = {}) => parsePowerShell(command, opts).dirs;
+export const powershellWriteTargets = (command, opts = {}) => parsePowerShell(command, opts).writes;
+
+export const powershellDestructiveFinding = (command, opts = {}) => {
+  const base = bashDestructiveFinding(command, opts);
+  if (base) return base; // Remove-Item -Recurse / del /s are already covered there
+  const { config = DEFAULT_CONFIG, cwd = null } = opts;
+  for (const segment of splitShellSegments(command)) {
+    const tokens = shellTokens(segment);
+    if (tokens.length === 0) continue;
+    const { verb, args } = parseCommandHead(tokens);
+    if (verb !== 'clear-content' && verb !== 'clc') continue;
+    const target = args.map((a) => a.value).find((v) => !v.startsWith('-'));
+    if (target && !isDisposablePath(target, cwd, config)) {
+      return { why: `${verb} wipes file contents`, segment: segment.trim().slice(0, 200) };
+    }
+  }
+  return null;
+};
+
+/** Shell-agnostic dispatch: one seam so every check handles both shells. */
+const shellOf = (input) => (input?.shell === 'powershell' ? 'powershell' : 'bash');
+export const shellReadTargets = (input, opts = {}) =>
+  shellOf(input) === 'powershell' ? powershellReadTargets(input.command, opts) : bashReadTargets(input.command, opts);
+export const shellReadDirs = (input, opts = {}) =>
+  shellOf(input) === 'powershell' ? powershellReadDirs(input.command, opts) : bashReadDirs(input.command, opts);
+export const shellWriteTargets = (input, opts = {}) =>
+  shellOf(input) === 'powershell' ? powershellWriteTargets(input.command, opts) : bashWriteTargets(input.command, opts);
+export const shellDestructiveFinding = (input, opts = {}) =>
+  shellOf(input) === 'powershell'
+    ? powershellDestructiveFinding(input.command, opts)
+    : bashDestructiveFinding(input.command, opts);
+
+// ---------------------------------------------------------------------------
 // Index freshness
 // ---------------------------------------------------------------------------
 
@@ -1334,6 +1597,9 @@ const CHECKS = {
     if (!scope.inScope || !scope.root) return null;
     // 只约束代码：改文档 / 数据 / 台账不要求 CHG 契约。
     if (!isCodeFile(norm, config)) return null;
+    // 可选收窄：只在真正受 CHG 治理的目录里要求契约。
+    const scopeGlobs = (config.chg_contract_scope_globs ?? []).map((g) => String(g).toLowerCase());
+    if (scopeGlobs.length > 0 && !matchesAnyGlob(toPosix(norm).toLowerCase(), scopeGlobs)) return null;
 
     // 项目适用性：不用 CHG 体系的项目（如以 ADR 管理的仓库）不该被这条拦死。
     // 判据取文件系统事实：`tasks/` 存在且含 `CHG-*` 子目录，才认为本项目采纳了 CHG。
@@ -1404,7 +1670,7 @@ const CHECKS = {
         if (deps.state.written.has(norm)) continue;
         // A directory or a path that does not exist yet: nothing to inspect.
         if (!deps.isFile(norm)) continue;
-        if (deps.state.inspected.has(norm)) continue;
+        if (hasFreshInspection(deps.state, norm, config, deps.now)) continue;
         if (hasScopedUnlock(deps.state, norm, config, deps.now)) continue;
         return {
           code: 'THINK_TARGET',
@@ -1492,7 +1758,7 @@ const CHECKS = {
    */
   'no-destructive-bash': (policy, input, deps) => {
     if (input.action !== 'bash') return null;
-    const finding = bashDestructiveFinding(input.command, {
+    const finding = shellDestructiveFinding(input, {
       config: policy.config,
       cwd: input.cwd ?? null,
     });
@@ -1547,8 +1813,8 @@ const CHECKS = {
       isFile: deps.isFile,
       exists: deps.exists,
     };
-    const targets = bashReadTargets(input.command, opts);
-    const dirs = bashReadDirs(input.command, opts);
+    const targets = shellReadTargets(input, opts);
+    const dirs = shellReadDirs(input, opts);
     if (targets.length === 0 && dirs.length === 0) return null;
 
     const blockedFile = targets.find((target) => {
@@ -1633,14 +1899,21 @@ const CHECKS = {
     if (!scope.inScope || !scope.root) return null;
     if (deps.state.written.has(input.path)) return null;
 
-    const marker = join(scope.root, policy.config.index_marker);
-    if (!deps.exists(marker)) return null; // index-before-read owns that case
-
     const mtime = deps.statMtime(input.path);
     if (!(mtime > 0)) return null; // vanished, unreadable, or a directory: abstain
-    const indexMtime = newestMtimeIn(marker, deps, deps.now, policy.config.index_mtime_ttl_ms);
-    if (!(indexMtime > 0)) return null; // index directory unreadable or empty: abstain
-    if (mtime <= indexMtime + policy.config.index_mtime_epsilon_ms) return null;
+
+    // Prefer a real persisted marker when the indexer created one. Otherwise
+    // fall back to the session's own successful index refresh: the default
+    // codebase-memory index lives in a global data directory, so requiring a
+    // repo-local marker made this check abstain on every normal project.
+    const marker = join(scope.root, policy.config.index_marker);
+    let evidenceAt = 0;
+    if (deps.exists(marker)) {
+      evidenceAt = newestMtimeIn(marker, deps, deps.now, policy.config.index_mtime_ttl_ms);
+    }
+    if (!(evidenceAt > 0)) evidenceAt = deps.state.lastIndexRefreshAt ?? 0;
+    if (!(evidenceAt > 0)) return null; // no evidence either way: abstain (graph rule still gates)
+    if (mtime <= evidenceAt + policy.config.index_mtime_epsilon_ms) return null;
 
     return {
       code: 'INDEX_STALE',
@@ -1664,7 +1937,7 @@ const CHECKS = {
     if (allowed.length === 0) return null;
     const targets = input.action === 'write'
       ? [input.path].filter(Boolean)
-      : bashWriteTargets(input.command, {
+      : shellWriteTargets(input, {
           config: policy.config,
           cwd: input.cwd ?? null,
           isFile: deps.isFile,
@@ -1696,7 +1969,7 @@ const CHECKS = {
     if (isBash) {
       // Only scan when the command actually writes; `git commit -m "..."` is
       // not a file write and must not be judged as one.
-      const writes = bashWriteTargets(input.command, {
+      const writes = shellWriteTargets(input, {
         config: policy.config,
         cwd: input.cwd ?? null,
         isFile: deps.isFile,
@@ -1727,10 +2000,13 @@ const CHECKS = {
  * repository scanner uses, so the two cannot disagree about "what is a secret". */
 const SECRET_PATTERNS = [
   ['private key block', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
-  ['api key assignment', /(api[_-]?key|apikey|token|secret|password|passwd)["'`]?\s*[:=]\s*["'`]?[A-Za-z0-9_\-]{16,}/i],
+  ['api key assignment', /(api[_-]?key|apikey|token|secret|password|passwd)['"`]?\s*[:=]\s*["'`]?[A-Za-z0-9_\-]{16,}/i],
   ['long opaque token', /(^|[^A-Za-z0-9_+=])[A-Za-z0-9_+=]{40,}([^A-Za-z0-9_+=]|$)/],
-  ['email address', /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/],
 ];
+
+/** A bare mailbox is not a credential. It only matters next to a credential field. */
+const EMAIL_ADDRESS = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+const CREDENTIAL_FIELD = /(?:api[_-]?key|apikey|token|secret|password|passwd|credential)['"`]?\s*[:=]/i;
 
 export const scanForSecrets = (text, config = DEFAULT_CONFIG) => {
   const allowed = config.secret_allow_patterns ?? [
@@ -1746,6 +2022,18 @@ export const scanForSecrets = (text, config = DEFAULT_CONFIG) => {
     if (m && !allow.test(m[0])) {
       const sample = m[0].length > 40 ? `${m[0].slice(0, 20)}…` : m[0];
       hits.push(`${label}: ${sample.replace(/\s+/g, ' ')}`);
+    }
+  }
+  // v4: a mailbox alone is ordinary prose (READMEs, examples, contact info).
+  // It is a credential signal only when a credential field sits next to it.
+  const mail = EMAIL_ADDRESS.exec(text);
+  if (mail && !allow.test(mail[0])) {
+    const from = Math.max(0, mail.index - 40);
+    const to = mail.index + mail[0].length + 40;
+    const around = text.slice(from, to);
+    if (CREDENTIAL_FIELD.test(around)) {
+      const sample = mail[0].length > 40 ? `${mail[0].slice(0, 20)}…` : mail[0];
+      hits.push(`credential email: ${sample}`);
     }
   }
   return hits;
@@ -1788,6 +2076,14 @@ export const HARD_CHECKS = new Set([
  */
 export const shouldBlock = ({ policy, input, state, exists, fs, now = Date.now() }) => {
   const cap = policy.config.max_blocks_per_session;
+  // v4: the cap is a sliding window, not a lifetime sentence. A long session
+  // used to spend 30 blocks on ordinary reads and then lose every research rule
+  // for the rest of its life.
+  const resetMs = policy.config.block_cap_reset_ms ?? 0;
+  if (resetMs > 0 && state.blocks > 0 && state.firstBlockAt > 0 && now - state.firstBlockAt > resetMs) {
+    state.blocks = 0;
+    state.firstBlockAt = 0;
+  }
   const overCap = cap >= 0 && state.blocks >= cap;
 
   // One probe object, so a check that needs more than `exists` can get it
@@ -1806,10 +2102,79 @@ export const shouldBlock = ({ policy, input, state, exists, fs, now = Date.now()
     const verdict = check(policy, input, { state, exists: probes.exists, fs: probes, ...probes, now });
     if (verdict) {
       state.blocks += 1;
+      if (!(state.firstBlockAt > 0)) state.firstBlockAt = now;
       return { block: true, code: verdict.code, reason: verdict.reason, capReached: false };
     }
   }
   return { block: false, code: null, reason: null, capReached: overCap };
+};
+
+// ---------------------------------------------------------------------------
+// Turn-level anti-slack: "I'll do it later" is not a delivery
+// ---------------------------------------------------------------------------
+
+/**
+ * First-person deferrals about the current task. Kept deliberately narrow:
+ * ordinary Q&A ("next you can run node --test") must not match, and text inside
+ * code fences / blockquotes is documentation rather than a promise.
+ */
+const SLACK_PATTERNS = [
+  /(?:我|我们)\s*(?:先|暂时|暂且)\s*(?:不|不做|不处理|跳过|略过)/,
+  /(?:稍后|后续|之后|下一轮|下次|明天|下周|下个版本)\s*(?:再|继续)\s*(?:做|补|实现|处理|完善|修复|跟进|优化)/,
+  /(?:我|我们)\s*(?:会|将|准备|打算|计划)\s*(?:在)?\s*(?:稍后|后续|之后|下一轮|下次|明天|下周|下个版本)/,
+  /(?:留待|留到|留给|放到)\s*(?:后续|下次|下一轮|之后)/,
+  /(?:还有|仍有|留有|存在)\s*(?:TODO|FIXME|待办|未完成|占位)/,
+  /\bI(?:'ll| will| am going to| plan to)\b[^.\n]{0,50}\b(?:later|next turn|afterwards|tomorrow|next week|next version)\b/i,
+  /\b(?:leave|defer|deferring)\b[^.\n]{0,30}\b(?:for later|to the next|afterwards)\b/i,
+];
+
+/**
+ * Decide whether an assistant reply is a deferral instead of a delivery.
+ * @returns {{code:string, excerpt:string, reason:string}|null}
+ */
+export const slackFinding = (text, config = DEFAULT_CONFIG) => {
+  if (config.slack_check === false) return null;
+  // CJK text is information-dense: "这个我稍后再补完。" is 9 characters and a
+  // complete deferral. A 12-character floor (borrowed from English intuition)
+  // made the rule miss exactly the short replies it exists to catch.
+  if (typeof text !== 'string' || text.trim().length < 6) return null;
+  const prose = text
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/`[^`\n]*`/g, '')
+    .split('\n')
+    .filter((line) => !/^\s*>/.test(line))
+    .join('\n');
+  if (prose.trim().length < 6) return null;
+  const extra = (config.slack_patterns ?? [])
+    .map((src) => {
+      try {
+        return new RegExp(src, 'i');
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  for (const re of [...SLACK_PATTERNS, ...extra]) {
+    const m = re.exec(prose);
+    if (!m) continue;
+    const at = Math.max(0, m.index - 10);
+    const excerpt = prose.slice(at, m.index + m[0].length + 20).replace(/\s+/g, ' ').trim();
+    return {
+      code: 'NO_SLACK',
+      excerpt,
+      reason: [
+        '⛔ 不偷懒铁律 · 轮次级拦截：检测到「把本任务留给以后」的承诺，而不是交付。',
+        `  命中：…${excerpt}…`,
+        '',
+        '这一轮必须二选一：',
+        '  a) 直接调用工具把它做完（不要只复述计划）；',
+        '  b) 如果确实被外部条件阻塞（缺少凭据、服务不可用、需要用户决策），',
+        '     把阻塞点和已尝试的动作写清楚，并明确说明「这不是交付」。',
+        '不要用「稍后再补 / 后续处理 / 先不实现」结束这一轮。',
+      ].join('\n'),
+    };
+  }
+  return null;
 };
 
 /**

@@ -27,7 +27,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { businessError } from './errors.js';
 import { planFileOp } from './fs-ops.js';
-import { targetPath } from './paths.js';
+import { machineGateConfigFile, targetPath } from './paths.js';
 
 export const gatesSourceDir = (repo) => join(repo, 'bridge', 'gates');
 
@@ -81,8 +81,36 @@ const readme = (manifest) => {
   return lines.join('\n');
 };
 
+/**
+ * Read the optional machine-local override.
+ *
+ * The public repository must never contain one person's absolute paths, but the
+ * gate is far more useful when non-git working directories (scripts, MCP source,
+ * skill trees) are in scope. So the machine supplies only `config` from
+ * `~/.config/agent-config-bridge/gate-policy.json`; `checks` and the rule text
+ * stay owned by the repository. A malformed file is a hard error, never a
+ * silent no-op.
+ */
+const readMachineOverride = (home) => {
+  if (!home) return {};
+  const file = machineGateConfigFile(home);
+  if (!existsSync(file)) return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (err) {
+    throw businessError('GATE_POLICY_INVALID', `${file}: not valid JSON (${err.message})`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw businessError('GATE_POLICY_INVALID', `${file}: must contain a JSON object`);
+  }
+  return parsed.config && typeof parsed.config === 'object' && !Array.isArray(parsed.config)
+    ? parsed.config
+    : {};
+};
+
 /** Merge the shipped policy for this adapter with the manifest's override. */
-export const resolvePolicy = ({ repo, manifest }) => {
+export const resolvePolicy = ({ repo, manifest, home = null }) => {
   const shipped = join(gatesSourceDir(repo), manifest.gates.adapter, 'policy.json');
   let base = {};
   if (existsSync(shipped)) {
@@ -93,10 +121,11 @@ export const resolvePolicy = ({ repo, manifest }) => {
     }
   }
   const override = manifest.gates.policy ?? {};
+  const machineConfig = readMachineOverride(home);
   return {
     ...base,
     ...override,
-    config: { ...(base.config ?? {}), ...(override.config ?? {}) },
+    config: { ...(base.config ?? {}), ...(override.config ?? {}), ...machineConfig },
     checks: override.checks ?? base.checks ?? [],
   };
 };
@@ -144,7 +173,7 @@ export const planGateInstall = ({ repo, home, manifest }) => {
     contentAction(join(dest, 'index.js'), PI_ENTRY, 'pi directory entry point');
   }
 
-  const policy = resolvePolicy({ repo, manifest });
+  const policy = resolvePolicy({ repo, manifest, home });
   contentAction(join(dest, 'policy.json'), `${JSON.stringify(policy, null, 2)}\n`, 'gate policy');
   contentAction(join(dest, 'README.md'), readme(manifest), 'gate readme');
 

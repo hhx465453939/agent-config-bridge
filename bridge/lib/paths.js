@@ -32,6 +32,13 @@ export const claudeJson = (home) => join(home, '.claude.json');
 /** Where the user keeps real secret values. Outside the repo, by design. */
 export const secretsFile = (home) => join(home, '.config', 'agent-config-bridge', 'secrets.env');
 
+/**
+ * Per-machine gate overrides. Outside the repo (public), so machine-specific
+ * absolute paths never have to be committed. Only `config` is honoured.
+ */
+export const machineGateConfigDir = (home) => join(home, '.config', 'agent-config-bridge');
+export const machineGateConfigFile = (home) => join(machineGateConfigDir(home), 'gate-policy.json');
+
 /** Per-machine state, snapshots and backups live inside the repo checkout. */
 export const stateDir = (repo) => join(repo, '.bridge');
 export const stateFile = (repo) => join(stateDir(repo), 'state.json');

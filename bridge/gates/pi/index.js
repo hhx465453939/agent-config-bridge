@@ -20,6 +20,10 @@ import { fileURLToPath } from 'node:url';
 import {
   bashReadTargets,
   graphResultIsEvidence,
+  powershellReadTargets,
+  recordIndexRefresh,
+  shellReadTargets,
+  slackFinding,
   isChgContract,
   isConventionDoc,
   loadPolicy,
@@ -118,6 +122,7 @@ const SIGNAL_TOOLS = [
 const READ_TOOLS = new Set(['read', 'read_file', 'view', 'open_file']);
 const WRITE_TOOLS = new Set([
   'write', 'edit', 'apply_patch', 'str_replace_editor', 'create_file', 'multi_edit', 'notebook_edit',
+  'write_file', 'append_file', 'delete_file',
 ]);
 
 /** The path spelling a tool input uses, whichever harness it came from. */
@@ -131,13 +136,24 @@ const inputContent = (input) =>
 const isSignalTool = (name) =>
   SIGNAL_TOOLS.some((s) => name === s || name.endsWith(`_${s}`));
 
+/**
+ * Fallback when policy.json cannot be read.
+ *
+ * v4 fails CLOSED for the safety rules instead of returning `checks: []`.
+ * A malformed policy used to make the gate disappear silently — the one failure
+ * mode this whole design exists to prevent. Research rules stay off (they need
+ * reliable session state), but secrets, out-of-scope writes and destructive
+ * commands keep being enforced, and the session is told it is degraded.
+ */
 const fallback = (why) => ({
   policy: {
     name: 'enforce-rules',
     version: 1,
-    description: 'built-in fallback because the policy could not be read',
-    reminded: '',
-    checks: [],
+    description: 'degraded safety-only policy because the policy file could not be read',
+    reminded:
+      `[system-reminder · 门控降级] policy.json 读取失败，完整规则已停用；` +
+      `安全底线仍在（凭据写入 / 越界写入 / 破坏性命令）。请修复：${why}`,
+    checks: ['no-write-outside', 'no-secret-write', 'no-destructive-bash'],
     config: { max_blocks_per_session: 0, signal_ttl_ms: 0 },
   },
   error: why,
@@ -192,7 +208,10 @@ export default function enforceRules(pi, options = {}) {
 
   pi.on('session_start', async (_event, ctx) => {
     state.blocks = 0;
+    state.firstBlockAt = 0;
     state.signals = 0;
+    state.lastIndexRefreshAt = 0;
+    state.slackContinues = 0;
     state.written.clear();
     state.unlocks.clear();
     state.inspected.clear();
@@ -221,7 +240,14 @@ export default function enforceRules(pi, options = {}) {
   });
 
   pi.on('tool_call', async (event, ctx) => {
-    const name = event.toolName;
+    // MCP gateway: the real tool and its arguments live under input.tool/args.
+    // Before v4 the adapter returned early for every `mcp` call, so a proxied
+    // write/read/bash was silently exempt from every rule below.
+    const proxied =
+      event.toolName === 'mcp' && typeof event.input?.tool === 'string' ? event.input.tool : '';
+    const name = proxied || event.toolName;
+    const input = proxied ? (event.input?.args ?? {}) : event.input;
+    const shell = name === 'powershell' ? 'powershell' : 'bash';
     const cwd = cwdFor(ctx);
 
     // Remember what this session wrote: reading your own output is never a
@@ -231,10 +257,10 @@ export default function enforceRules(pi, options = {}) {
     // Layer 0 was supposed to question.
     const writeLike =
       WRITE_TOOLS.has(name) ||
-      (!READ_TOOLS.has(name) && typeof inputPath(event.input) === 'string' && typeof inputContent(event.input) === 'string');
+      (!READ_TOOLS.has(name) && typeof inputPath(input) === 'string' && typeof inputContent(input) === 'string');
     if (writeLike) {
-      const path = normalizePath(inputPath(event.input), cwd);
-      const content = inputContent(event.input);
+      const path = normalizePath(inputPath(input), cwd);
+      const content = inputContent(input);
       const verdict = shouldBlock({
         policy,
         input: { action: 'write', path, tool: name, content },
@@ -255,17 +281,20 @@ export default function enforceRules(pi, options = {}) {
       return;
     }
 
-    // Bash reads count as reads. `cat src/a.ts`, `grep x packages/…` and
-    // `sed -n '1,20p' file` are the same act as the `read` tool; leaving them
-    // ungated was the hole that made the gate cosmetic (2026-10-16).
-    if (name === 'bash') {
+    // Bash/PowerShell reads count as reads. `cat src/a.ts`, `grep x packages/…`,
+    // `sed -n '1,20p' file` and `Get-Content src/a.ts` are the same act as the
+    // `read` tool; leaving them ungated was the hole that made the gate
+    // cosmetic (2026-10-16). PowerShell was added in v4 because enabling that
+    // tool used to be a full bypass on Windows.
+    if (name === 'bash' || name === 'powershell') {
       const verdict = shouldBlock({
         policy,
         input: {
           action: 'bash',
           path: null,
           tool: name,
-          command: typeof event.input?.command === 'string' ? event.input.command : '',
+          shell,
+          command: typeof input?.command === 'string' ? input.command : '',
           cwd,
         },
         state,
@@ -287,7 +316,7 @@ export default function enforceRules(pi, options = {}) {
 
     const verdict = shouldBlock({
       policy,
-      input: { action: 'read', path: normalizePath(inputPath(event.input), cwd), tool: name },
+      input: { action: 'read', path: normalizePath(inputPath(input), cwd), tool: name },
       state,
       fs: realFs,
     });
@@ -305,7 +334,7 @@ export default function enforceRules(pi, options = {}) {
     if (verdict.capReached && ctx?.hasUI && !noticedPolicyProblem) {
       noticedPolicyProblem = true;
       ctx.ui.notify(
-        'enforce-rules: block cap reached, the gate is now inactive for this session',
+        'enforce-rules: block cap reached for this window; research rules resume after the reset window',
         'warn',
       );
     }
@@ -335,29 +364,37 @@ export default function enforceRules(pi, options = {}) {
 
   pi.on('tool_result', async (event, ctx) => {
     const cwd = cwdFor(ctx);
-    const command = typeof event.input?.command === 'string' ? event.input.command : '';
+    // Unwrap the MCP gateway once; every branch below works on the real tool.
+    const proxied =
+      event.toolName === 'mcp' && typeof event.input?.tool === 'string' ? event.input.tool : '';
+    const toolName = proxied || event.toolName;
+    const input = proxied ? (event.input?.args ?? {}) : event.input;
+    const command = typeof input?.command === 'string' ? input.command : '';
+    const shell = toolName === 'powershell' ? 'powershell' : 'bash';
 
     if (event.isError) {
       // A failed shell command feeds the blind-retry rule. A failed graph query
       // must not record a signal — the model has learned nothing yet.
-      if (event.toolName === 'bash') recordCommandResult(state, command, true);
+      if (toolName === 'bash' || toolName === 'powershell') {
+        recordCommandResult(state, command, true);
+      }
       return;
     }
 
     // A successful read is evidence about the exact file, which is what Layer 0
     // needs before an edit. Convention documents additionally satisfy the
     // "project conventions" question.
-    const path = normalizePath(inputPath(event.input), cwd);
-    if (READ_TOOLS.has(event.toolName) && path) {
+    const path = normalizePath(inputPath(input), cwd);
+    if (READ_TOOLS.has(toolName) && path) {
       recordInspection(state, path);
       if (isConventionDoc(path, policy.config) || isChgContract(path, policy.config)) {
         recordDocRead(state, path);
       }
     }
 
-    if (event.toolName === 'bash') {
+    if (toolName === 'bash' || toolName === 'powershell') {
       recordCommandResult(state, command, false);
-      for (const target of bashReadTargets(command, {
+      for (const target of shellReadTargets({ command, shell }, {
         config: policy.config,
         cwd,
         isFile: realFs.isFile,
@@ -378,15 +415,20 @@ export default function enforceRules(pi, options = {}) {
       }
     }
 
-    const proxied = event.toolName === 'mcp' ? String(event.input?.tool ?? '') : '';
-    const effective = proxied || event.toolName;
-    // Re-indexing changes the marker's mtime; a cached "newest" from before the
-    // rebuild would keep reporting a freshly indexed tree as stale.
-    if (effective === 'index_repository' || effective.endsWith('_index_repository')) resetMtimeCache();
+    // A successful index refresh is Layer-2 evidence that works even when the
+    // index lives in a global data directory (no repo-local marker). Re-indexing
+    // also changes a marker's mtime, so a cached value must be dropped.
+    if (
+      toolName === 'index_repository' ||
+      toolName.endsWith('_index_repository') ||
+      toolName === 'detect_changes' ||
+      toolName.endsWith('_detect_changes')
+    ) {
+      resetMtimeCache();
+      recordIndexRefresh(state);
+    }
 
-    const isGraph =
-      isSignalTool(event.toolName) || (proxied !== '' && isSignalTool(proxied));
-    if (!isGraph) return;
+    if (!isSignalTool(toolName)) return;
 
     // A successful call is not enough: an empty result ("total":0) used to buy
     // a full read window without telling the model anything. Only evidence
@@ -403,11 +445,50 @@ export default function enforceRules(pi, options = {}) {
     // become scoped unlocks, so a query about one file/package never buys a
     // free pass for the whole repository — but the file it named stays readable
     // for `unlock_ttl_ms` without another round-trip.
-    recordUnlocks(state, unlockTokensFromText(inputStrings(event.input).join('\n')), now);
-    if (typeof event.input?.qualified_name === 'string') {
-      recordUnlocks(state, unlockTokensFromQualifiedName(event.input.qualified_name), now);
+    recordUnlocks(state, unlockTokensFromText(inputStrings(input).join('\n')), now);
+    if (typeof input?.qualified_name === 'string') {
+      recordUnlocks(state, unlockTokensFromQualifiedName(input.qualified_name), now);
     }
     recordUnlocks(state, unlockTokensFromText(resultBody), now);
+  });
+
+  /**
+   * Turn-level anti-slack (v4).
+   *
+   * A tool-call gate cannot see a reply that does no work at all. `turn_end` is
+   * the boundary where the assistant's final text is available; returning
+   * `continue: true` asks for one more turn instead of handing a promise to the
+   * user as if it were a delivery. Bounded by `slack_max_continues` so a false
+   * positive cannot loop the agent forever.
+   */
+  pi.on('turn_end', async (event, ctx) => {
+    if (event.message?.role !== 'assistant') return;
+    if (policy.config.slack_check === false) return;
+    const max = policy.config.slack_max_continues ?? 0;
+    if (max <= 0 || state.slackContinues >= max) return;
+
+    const finding = slackFinding(resultText(event.message), policy.config);
+    if (!finding) return;
+
+    state.slackContinues += 1;
+    if (ctx?.hasUI) {
+      ctx.ui.notify(
+        `enforce-rules [${finding.code}] continue ${state.slackContinues}/${max}`,
+        'warn',
+      );
+    }
+    return {
+      continue: true,
+      entries: [
+        ...(event.entries ?? []),
+        {
+          type: 'custom_message',
+          customType: 'enforce-rules-no-slack',
+          content: finding.reason,
+          display: false,
+        },
+      ],
+    };
   });
 
   pi.on('context', async (event) => {

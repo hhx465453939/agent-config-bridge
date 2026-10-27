@@ -1,8 +1,8 @@
 {
   "name": "graph-first-gate",
-  "version": 3,
-  "description": "Enforce the rules document instead of trusting the model to follow it. v3 (2026-10-20) hardens the v2 gate on a real Windows host: (1) the per-session block cap no longer switches off the secret/write/destructive checks; (2) a new Layer-0 think-before-write rule requires evidence that the model looked at the exact file (or a graph query named it) and read the project conventions before editing; (3) shell writes (redirection, tee, sed -i, cp/mv/rm) are checked by the write and secret rules; (4) the bash reader understands cd, git show/diff/grep, find -exec, xargs, recursive greps and globs; (5) an empty graph result no longer counts as a query; (6) a successful query no longer stands down the stale-index check; (7) index-before-read is opt-in because a global codebase-memory index has no repo marker. The block cap stays at 30 for research rules; safety rules are uncapped.",
-  "reminder": "[system-reminder · 三层代码阅读 + 动脑子铁律 · 每轮生效]\nLayer 0 动脑子：改代码前先回答五问——项目约定？环境现状？字面背后的真实需求？任务目的？产出价值？没读过目标文件、没判根因，不要动手。\nLayer 1 图谱：read 代码文件前先用 codebase-memory MCP（search_graph / trace_path / get_code_snippet / query_graph / get_architecture / search_code）查结构与调用关系。空结果不算合规：先查 index_status / 重新索引，回图谱重查。\nLayer 2 索引：项目未索引或索引过期（代码比索引新）时，先 index_repository / detect_changes，完成后回到 Layer 1——不允许索引完直接 read。\nLayer 3 直读：仅当重索引后图谱仍无法满足（非代码文件、图谱查不到、本会话自己改动的文件）才直读。\n闸门强度：有内容的图谱查询给 10 分钟窗口；查询点名的文件/包另给 30 分钟作用域解锁。bash 的 cat / grep -r / git show / find -exec / sed -i / 重定向写文件同样受管。\n改已存在文件需要：本会话读过它，或图谱点名过它；改之前还要读项目约定（AGENTS.md / CLAUDE.md / CONTRIBUTING.md / .cursorrules，存在才要求）。\n破坏性命令（git reset --hard / git clean -f / rm -rf 源码目录 / 强推等）一律拦截；同一条失败命令原样重试第 3 次也会被拦。\n拦截上限只作用于研究规则；凭据写入、越界写入、破坏性命令永远生效。\n\n[ai-spec 门控 · 改代码前必过]\n改任何代码文件前，本会话必须读过对应立项 CHG 的契约（tasks/CHG-*/SPEC.md 或 PRD.md）。\n五问：属于哪个 CHG？四件套齐吗？目标文件在独占清单里吗？改完哪条 AC 变绿？先判根因还是打补丁？\n开发中发现的问题当场修，不许留给「后续」；收尾必须达成该 CHG 的预定功能目标，而不是「大部分做完」。",
+  "version": 4,
+  "description": "Enforce the rules document instead of trusting the model to follow it. v4 (2026-10-31) closes the gaps found in a full audit of a real host: (1) a turn-level no-slack rule at turn_end catches 'I'll do it later' replies that use no tools at all; (2) read evidence now expires (inspected_ttl_ms) instead of unlocking a file for the whole session; (3) Layer 2 index freshness works without a repo-local .codebase-memory marker by using the session's successful index_repository/detect_changes timestamp; (4) the block cap is a 30-minute sliding window of 200, not a lifetime 30; (5) PowerShell and MCP-gateway calls go through the same read/write/destructive checks as bash; (6) machine-local project_roots can override the policy from ~/.config/agent-config-bridge/gate-policy.json without putting paths in this public repo; (7) a bare email is no longer treated as a credential, only a credential field next to one; (8) an unreadable policy degrades to safety-only checks instead of disappearing.",
+  "reminder": "[system-reminder · 三层代码阅读 + 动脑子 + 不偷懒 · 每轮生效]\nLayer 0 动脑子：改代码前先回答五问——项目约定？环境现状？字面背后的真实需求？任务目的？产出价值？没读过目标文件、没判根因，不要动手。\nLayer 1 图谱：read 代码文件前先用 codebase-memory MCP（search_graph / trace_path / get_code_snippet / query_graph / get_architecture / search_code）查结构与调用关系。空结果不算合规：先查 index_status / 重新索引，回图谱重查。\nLayer 2 索引：项目未索引或索引过期（代码比索引新）时，先 index_repository / detect_changes，完成后回到 Layer 1——不允许索引完直接 read。\nLayer 3 直读：仅当重索引后图谱仍无法满足（非代码文件、图谱查不到、本会话自己改动的文件）才直读。\n闸门强度：有内容的图谱查询给 10 分钟窗口；查询点名的文件/包另给 30 分钟作用域解锁。bash 的 cat / grep -r / git show / find -exec / sed -i / 重定向写文件同样受管；PowerShell 的 Get-Content / Set-Content / Remove-Item 同样受管。\n改已存在文件需要：本会话在有效期内读过它（默认 30 分钟），或图谱点名过它；改之前还要读项目约定（AGENTS.md / CLAUDE.md / CONTRIBUTING.md / .cursorrules，存在才要求）。\n破坏性命令（git reset --hard / git clean -f / rm -rf 源码目录 / Remove-Item -Recurse / 强推等）一律拦截；同一条失败命令原样重试第 3 次也会被拦。\n轮次级不偷懒：一轮结束时只输出「稍后再补 / 后续再做 / 先不实现」而不动工具，会被要求继续做完；确实阻塞就写清阻塞点。\n拦截上限只作用于研究规则，且按 30 分钟窗口重置；凭据写入、越界写入、破坏性命令永远生效。门控配置读不出来时降级为安全底线并显式告警。\n\n[ai-spec 门控 · 改代码前必过]\n改任何代码文件前，本会话必须读过对应立项 CHG 的契约（tasks/CHG-*/SPEC.md 或 PRD.md）。\n五问：属于哪个 CHG？四件套齐吗？目标文件在独占清单里吗？改完哪条 AC 变绿？先判根因还是打补丁？\n开发中发现的问题当场修，不许留给「后续」；收尾必须达成该 CHG 的预定功能目标，而不是「大部分做完」。",
   "checks": [
     "no-write-outside",
     "no-secret-write",
@@ -26,9 +26,11 @@
       "**/.venv/**",
       "**/target/**"
     ],
-    "max_blocks_per_session": 30,
+    "max_blocks_per_session": 200,
+    "block_cap_reset_ms": 1800000,
     "signal_ttl_ms": 600000,
     "unlock_ttl_ms": 1800000,
+    "inspected_ttl_ms": 1800000,
     "bash_read_check": true,
     "index_marker": ".codebase-memory",
     "index_mtime_epsilon_ms": 2000,
@@ -45,8 +47,12 @@
       "**/tasks/CHG-*/CHANGE.md",
       "**/tasks/CHG-*/TRACEABILITY.md"
     ],
+    "chg_contract_scope_globs": [],
     "max_identical_failures": 2,
     "retry_window_ms": 600000,
+    "slack_check": true,
+    "slack_max_continues": 2,
+    "slack_patterns": [],
     "destructive_allow_patterns": []
   }
 }

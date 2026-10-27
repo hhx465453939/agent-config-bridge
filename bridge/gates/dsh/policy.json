@@ -1,7 +1,7 @@
 {
   "name": "graph-first-gate",
-  "version": 3,
-  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces. v3 shares the engine fixes: the cap no longer disables safety checks, shell writes are covered, the bash reader understands cd/git/find/xargs/recursive greps, destructive commands are denied, and empty graph results no longer count. dsh has no result hook and no per-turn context injection, so graph_signal_requires_content stays off and the Layer-0 checks that need result/read evidence (think-before-write, no-blind-retry) are not enabled here. bash reads are now actually gated (v2 listed the check but the adapter never passed bash events).",
+  "version": 4,
+  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces. v4 inherits the engine fixes that do not depend on harness hooks: the block cap is now a 30-minute sliding window of 200 instead of a lifetime 30, PowerShell/MCP-aware helpers exist in the shared engine, and a bare email is no longer treated as a credential. dsh still has no result hook and no per-turn context injection, so graph_signal_requires_content stays off and the checks that need result/read evidence (think-before-write, no-blind-retry, chg-contract-before-edit) are intentionally NOT enabled here. bash reads remain gated.",
   "reminder": "",
   "checks": [
     "no-write-outside",
@@ -22,9 +22,11 @@
       "**/.venv/**",
       "**/target/**"
     ],
-    "max_blocks_per_session": 30,
+    "max_blocks_per_session": 200,
+    "block_cap_reset_ms": 1800000,
     "signal_ttl_ms": 600000,
     "unlock_ttl_ms": 1800000,
+    "inspected_ttl_ms": 1800000,
     "bash_read_check": true,
     "index_marker": ".codebase-memory",
     "graph_signal_requires_content": false,
