@@ -138,12 +138,13 @@ bridge/gates/
 | 检查项 | 作用 | 默认 |
 |---|---|---|
 | `graph-before-read` | 读源码前必须先有一次**有结果**的图谱查询（空结果不算） | ✅ |
-| `bash-graph-before-read` | `cat` / `grep -r` / `git show` / `find -exec` / `xargs` 等 shell 读取同样受 Layer 1 管 | ✅ |
-| `index-freshness-before-read` | 目标文件比索引新时，先 `detect_changes` / `index_repository`；一次查询不再能绕过它 | ✅ |
-| `think-before-write` | 动脑子铁律：改已存在文件前必须读过它（或被图谱点名），并读过项目约定文档（存在才要求） | ✅ pi |
+| `bash-graph-before-read` | `cat` / `grep -r` / `git show` / `find -exec` / `xargs` / PowerShell 的 `Get-Content` 等 shell 读取同样受 Layer 1 管 | ✅ |
+| `index-freshness-before-read` | 目标文件比**最近一次索引刷新**新时，先 `detect_changes` / `index_repository`；不再依赖仓库内 `.codebase-memory` 标记 | ✅ |
+| `think-before-write` | 动脑子铁律：改已存在文件前必须**在有效期内**读过它（默认 30 分钟）或被图谱点名，并读过项目约定（存在才要求） | ✅ pi |
 | `no-blind-retry` | 同一条失败命令原样重试第 3 次前，必须先做调查（读代码 / 查图谱 / 真改） | ✅ pi |
-| `no-destructive-bash` | `git reset --hard` / `git clean -f` / `rm -rf` 源码目录 / 强推等破坏性命令一律拦截；构建产物目录可清理 | ✅ |
-| `no-secret-write` | 写入内容命中凭据模式时拦截；**shell 重定向、tee、sed -i 也算写入** | ✅ |
+| `no-slack`（轮次级） | 一轮结束时若只输出「稍后再补 / 后续再做 / 先不实现」等第一人称拖延承诺，强制继续一轮（有次数上限） | ✅ pi |
+| `no-destructive-bash` | `git reset --hard` / `git clean -f` / `rm -rf` 源码目录 / `Remove-Item -Recurse` / 强推等破坏性命令一律拦截；构建产物目录可清理 | ✅ |
+| `no-secret-write` | 写入内容命中凭据模式时拦截；**shell 重定向、tee、sed -i 也算写入**；普通邮箱不再误判 | ✅ |
 | `no-write-outside` | 仅在配置了 `write_roots` 时生效，限制写入范围（含 shell 写入） | 可选 |
 | `index-before-read` | 仓库无 `.codebase-memory` 持久化标记时先建索引；**全局索引没有该标记，故默认关闭** | 可选 |
 
@@ -151,12 +152,69 @@ bridge/gates/
 
 ### 安全默认
 
-* **策略文件读不出来 → 放行**（fail open）并告警。一条写错的规则把 agent 卡死，比某条规则暂时没执行严重得多。
-* **研究规则每会话最多拦 30 次**，之后放行 —— 万一规则写错，最多浪费几十次往返；**凭据写入、越界写入、破坏性命令不受上限影响**，永远生效。
+* **安全规则失败关闭**：策略文件读不出来时，完整规则停用，但**凭据写入 / 越界写入 / 破坏性命令**三项安全底线仍在，并显式告警（degraded）。
+* **研究规则有上限**：默认 200 次 / 30 分钟滑动窗口，窗口过后自动恢复；**凭据写入、越界写入、破坏性命令不受上限影响**，永远生效。
 * **空图谱结果不算合规**：`search_graph` 返回 `{"total":0}` 时不能换来读窗口，必须先查索引 / 重新索引 / 重查。
-* **改文件前必须有证据**：本会话读过该文件，或图谱查询点名过它；改的是新文件时不强制。
-* 用不着"我的项目在某个固定目录"这种硬编码：作用范围按"配置优先，否则沿目录向上找 `.git`"判定。
+* **改文件前必须有证据且证据会过期**：本会话在有效期内读过该文件，或图谱查询点名过它；改新文件时不强制。
+* **轮次级不偷懒**：只挂工具调用管不住"不动手、只许诺"；`turn_end` 会检查助手最终文本并要求继续。
+* **PowerShell / MCP 网关同样受管**：`Get-Content` / `Set-Content` / `Remove-Item` 与 bash 走同一套判定；MCP 网关会按真实工具名解包后再判定。
+* 用不着"我的项目在某个固定目录"这种硬编码：作用范围按"配置优先，否则沿目录向上找 `.git`"判定；机器专属路径放 `~/.config/agent-config-bridge/gate-policy.json`（仓库外）。
 * 闸门文件走和其它内容**完全一样的受管路径**：`adopt` 时被快照，`revoke` 时被卸载，只动它自己那个目录，你写的其它扩展原样保留。
+
+## 新宿主机一键部署（Windows / Linux / macOS）
+
+前置：Node ≥ 20，且已经安装并启动过一次 pi（存在 `~/.pi`）。
+
+```bash
+# Windows 用 PowerShell / CMD，Linux/macOS 用同一套 node 命令
+git clone <仓库地址> ~/Development/agent-config-bridge
+cd ~/Development/agent-config-bridge
+
+# 1) 只看计划，不写盘
+node scripts/bootstrap.js
+
+# 2) 确认后执行：adopt pi → apply → 校验门控 → 安装共享技能
+node scripts/bootstrap.js --yes
+
+# 3) 让 pi 重新加载：重启 pi，或在 pi 里执行 /reload
+```
+
+`bootstrap` 会明确区分三种结果：
+
+| 情况 | 行为 |
+|---|---|
+| 没有 `~/.pi` | 报错并以非 0 退出，**不假装部署成功** |
+| 已桥接 | 跳过 `adopt`，只 `apply` |
+| 未桥接 | `adopt pi`（先快照）后 `apply` |
+
+### 机器本地作用域（非 git 目录也纳入门控）
+
+公共仓库不写死任何人的路径。需要覆盖脚本目录 / MCP 源码这类非 git 目录时：
+
+```bash
+node scripts/bootstrap.js --yes --root <你的开发根> --root <另一个开发根>
+```
+
+它会在 `~/.config/agent-config-bridge/gate-policy.json` 写入：
+
+```json
+{ "config": { "project_roots": ["<开发根>"] } }
+```
+
+注意：`project_roots` **非空即独占**，会替代 `.git` 自动探测——只写真正的开发根，不要把整个家目录写进去。文件不存在时行为与旧版一致。
+
+## 全局技能：agent-hard-gates
+
+仓库内置 `skills/agent-hard-gates/SKILL.md`，描述三条铁律、机器判据、部署、验证与扩展方法。
+
+```bash
+node scripts/install-hard-gate-skill.js          # 干跑
+node scripts/install-hard-gate-skill.js --apply  # 安装
+```
+
+安装位置：`~/.claude/skills/agent-hard-gates/`。
+pi 通过既有的 `~/.agents/skills -> ~/.claude/skills` 链接读取**同一份**，不复制、不漂移。
+若目标已存在且内容不同，默认保留用户版本；确认覆盖才加 `--force`。
 
 ## 可选能力：长任务续跑（pi）
 

@@ -175,6 +175,48 @@ WARN
 
 > 表在 `bridge/lib/pi-models.js`，维护方式见 `docs/ADR/005-pi-model-context-metadata.md`。要加一个家族：加一行（**必须带 `source`**），在 `FAMILY_PROBES` 里加一条探针，测试就自动开始盯它。
 
+### 5.10 新宿主机一键部署硬门控（Windows / Linux / macOS）
+
+前置：Node ≥ 20，且已经安装并启动过一次 pi（存在 `~/.pi`）。
+
+```bash
+git clone <仓库地址> ~/Development/agent-config-bridge
+cd ~/Development/agent-config-bridge
+
+node scripts/bootstrap.js          # 干跑：只看计划
+node scripts/bootstrap.js --yes    # 执行：adopt pi → apply → 校验 → 安装技能
+
+# 然后在 pi 里 /reload（或重启 pi）
+```
+
+脚本行为：
+
+| 情况 | 行为 |
+|---|---|
+| 没有 `~/.pi` | 报错、非 0 退出，不静默跳过 |
+| 已桥接 | 跳过 adopt，只 apply |
+| 未桥接 | adopt pi（先快照）后 apply |
+| 门控文件/策略不合预期 | apply 后校验失败即报错 |
+
+如需把非 git 目录（脚本、MCP 源码）也纳入门控：
+
+```bash
+node scripts/bootstrap.js --yes --root <开发根> [--root <另一个>]
+```
+
+写入 `~/.config/agent-config-bridge/gate-policy.json`（仓库外）。
+`project_roots` **非空即独占**，会替代 `.git` 自动探测，只写真正的开发根。
+
+### 5.11 安装 / 更新全局技能 agent-hard-gates
+
+```bash
+node scripts/install-hard-gate-skill.js           # 干跑
+node scripts/install-hard-gate-skill.js --apply   # 安装
+```
+
+装到 `~/.claude/skills/agent-hard-gates/`；pi 通过 `~/.agents/skills` 链接共享同一份。
+目标已存在且内容不同时默认保留用户版本，`--force` 才覆盖。
+
 ### 5.6 我搞坏了，想退回去
 
 ```bash
@@ -243,14 +285,30 @@ node bridge/cli.js apply
 
 安全的默认值：
 
-* 策略文件坏了 → **放行**并告警，不会把 agent 卡死；
-* **研究规则**一个会话最多拦 30 次，之后放行；**凭据写入 / 越界写入 / 破坏性命令**不吃这个上限，永远生效；
+* 策略文件坏了 → **安全规则仍生效**（凭据写入 / 越界写入 / 破坏性命令），完整规则降级并显式告警，不会静默变成空门控；
+* **研究规则**默认 200 次 / 30 分钟滑动窗口，窗口过后自动恢复；**凭据写入 / 越界写入 / 破坏性命令**不吃这个上限，永远生效；
 * 不让工具碰你自己写的扩展 —— `revoke` 只删它装的那一个子目录；
 * 检查按 **安全规则 → Layer 2（索引）→ Layer 1（图谱）→ Layer 0（动脑子）** 的次序级联，次序就是 `policy.json` 里 `checks` 数组的顺序；
 * **空图谱结果不算合规**：查了但没查到，要先查索引 / 重新索引 / 重查，不能直接 read；
-* **改已存在文件前必须有证据**：本会话读过该文件，或图谱查询点名过它；改新文件不强制；如果有 `AGENTS.md` / `CLAUDE.md` / `CONTRIBUTING.md` / `.cursorrules`，还要先读其中一个；
-* **bash 写入也算写入**：`> file`、`tee`、`sed -i`、`cp/mv/rm` 都走凭据与越界检查；`git reset --hard` / `git clean -f` / `rm -rf` 源码目录 / 强推等破坏性命令直接拒绝；
-* **dsh 的不对称**：dsh 没有结果钩子，无法验证图谱结果是否有内容，也不启用需要"读过某文件"证据的 Layer 0 两项；`bash` 读取已真正接入（v2 只写了配置，适配层没传事件）。
+* **改已存在文件前必须有证据且证据会过期**：本会话在有效期内（默认 30 分钟）读过该文件，或图谱查询点名过它；改新文件不强制；如果有 `AGENTS.md` / `CLAUDE.md` / `CONTRIBUTING.md` / `.cursorrules`，还要先读其中一个；
+* **轮次级不偷懒**：一轮结束时只输出「稍后再补 / 后续再做 / 先不实现」而不动工具，会被要求继续做完；确实阻塞就写清阻塞点；
+* **bash / PowerShell 写入也算写入**：`> file`、`tee`、`sed -i`、`cp/mv/rm`、`Set-Content`、`Remove-Item` 都走凭据与越界检查；`git reset --hard` / `git clean -f` / `rm -rf` 源码目录 / `Remove-Item -Recurse` / 强推等破坏性命令直接拒绝；
+* **MCP 网关不豁免**：`mcp` 代理调用会按 `input.tool` 的真实工具名解包，再走同一套判定；
+* **dsh 的不对称**：dsh 没有结果钩子与轮次级注入，无法验证图谱结果是否有内容，也不启用需要结果/读取证据的检查；`bash` 读取已真正接入。
+
+## 6.2 全局技能：agent-hard-gates
+
+仓库内置 `skills/agent-hard-gates/SKILL.md`，把「三条铁律 → 机器判据 → 部署 → 验证 → 扩展」沉淀为可移植资产。
+
+```bash
+node scripts/install-hard-gate-skill.js --apply
+```
+
+* 安装位置：`~/.claude/skills/agent-hard-gates/`；
+* pi 读取：通过 `~/.agents/skills -> ~/.claude/skills` 链接共享**同一份**，不复制、不漂移；
+* 冲突策略：目标已存在且内容不同时默认保留用户版本（`--force` 才覆盖）。
+
+技能内含 3 条可执行自检：`node --test`、故意违规读源码（应被 Layer 1 拦）、回复「稍后再补」且不动工具（应被轮次级拦）。
 
 ## 7. 安全说明
 
