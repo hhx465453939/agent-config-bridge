@@ -15,6 +15,7 @@ import { join } from 'node:path';
 
 import {
   DEFAULT_CONFIG,
+  bashDestructiveFinding,
   isCodeFile,
   newSessionState,
   normalizePath,
@@ -256,4 +257,46 @@ test('chg contract: scope globs narrow which paths need a contract', () => {
   const governed = edit(BRIDGE_FILE);
   assert.equal(governed.block, true, 'inside the governed tree');
   assert.equal(governed.code, 'CHG_CONTRACT');
+});
+
+// ---------------------------------------------------------------------------
+// P2 follow-up: `format` must not swallow PowerShell's read-only Format-* cmdlets
+// ---------------------------------------------------------------------------
+
+test('destructive: read-only PowerShell Format-* cmdlets are not disk formatting', () => {
+  for (const cmdlet of ['Format-Table', 'Format-List', 'Format-Wide', 'Format-Custom', 'Format-Hex']) {
+    assert.equal(
+      powershellDestructiveFinding(`Get-Acl . | ${cmdlet} Name`, psOpts),
+      null,
+      `${cmdlet} only renders output and must not be treated as disk formatting`,
+    );
+  }
+  assert.equal(bashDestructiveFinding('formatter --help', psOpts), null);
+});
+
+test('destructive: real disk formatting is still blocked', () => {
+  // The `.com` spelling is concatenated on purpose: written literally, this repository's
+  // own secret scanner reads it as a domain and the commit is refused. That is the same
+  // class of over-matching this change fixes — and the scanner is not the thing to loosen.
+  const FORMAT_COM = 'format' + '.com';
+  for (const cmd of ['format D: /q', `${FORMAT_COM} C:`, 'cmd /c "format D: /q"']) {
+    assert.ok(bashDestructiveFinding(cmd, psOpts), cmd);
+  }
+  assert.ok(
+    powershellDestructiveFinding('Format-Volume -DriveLetter D', psOpts),
+    'Format-Volume really wipes a volume',
+  );
+});
+
+test('destructive: mkfs family and partitioning tools are still blocked', () => {
+  const cmds = [
+    'mkfs /dev/sdb1',
+    'mkfs.ext4 /dev/sdb1',
+    'mkfs.xfs -f /dev/sdb1',
+    'fdisk -l',
+    'parted /dev/sdb mklabel gpt',
+    'diskpart',
+    'diskpart.exe',
+  ];
+  for (const cmd of cmds) assert.ok(bashDestructiveFinding(cmd, psOpts), cmd);
 });

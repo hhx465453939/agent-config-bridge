@@ -1192,6 +1192,22 @@ const isDisposablePath = (raw, cwd, config) => {
  *
  * @returns {{why: string, segment: string}|null}
  */
+/**
+ * Host-level destructive verbs, matched against the analysed command head.
+ *
+ * `mkfs` needs a suffix family so `mkfs.ext4` / `mkfs.xfs` are covered, and
+ * `diskpart.exe` needs its extension; everything else is an exact verb, because a
+ * prefix silently swallows unrelated programs. That is exactly how `format` used to
+ * eat PowerShell's read-only `Format-Table` / `Format-List` / `Format-Wide` /
+ * `Format-Custom` / `Format-Hex` cmdlets: `format` + `-table` matched `/^format/`,
+ * so every `... | Format-Table` inspection pipeline was reported as disk formatting.
+ * `format` is therefore an exact verb now, and `format-volume` — the one cmdlet in
+ * that family that really wipes a volume — is named explicitly so the tightening
+ * does not open a hole.
+ */
+const HOST_DESTRUCTIVE_VERB =
+  /^(?:mkfs(?:\.[a-z0-9]+)?|fdisk|parted|diskpart(?:\.exe)?|format(?:\.(?:com|exe))?|format-volume)$/;
+
 export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd = null } = {}, depth = 0) => {
   if (typeof command !== 'string' || command === '' || depth > 2) return null;
   const allow = (config.destructive_allow_patterns ?? []).some((src) => {
@@ -1275,7 +1291,7 @@ export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd =
       }
     }
 
-    if (/^(?:mkfs|fdisk|parted|diskpart|format)/.test(verb) || ['shutdown', 'reboot', 'poweroff', 'halt'].includes(verb)) {
+    if (HOST_DESTRUCTIVE_VERB.test(verb) || ['shutdown', 'reboot', 'poweroff', 'halt'].includes(verb)) {
       return finding(`${verb} is a host-level destructive command`);
     }
     if (verb === 'init' && ['0', '6'].includes(values[0])) return finding('init 0/6 shuts the machine down');
