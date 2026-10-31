@@ -102,7 +102,10 @@ export const FAMILY_META = [
     id: 'kimi-k3',
     re: /^(?:kimi-)?k3(?!-256k)/,
     contextWindow: MiB,
-    maxTokens: 131_072,
+    // Sources disagree: opencode / github-copilot / kimi-coding / radius ship
+    // 131,072 for the output cap while moonshotai(.cn) ships 1,048,576. Per
+    // ADR-005 we decline to pick a side and let the caller fall back.
+    maxTokens: null,
     // The negative lookahead matters: `k3-256k` is the SAME model sold with a
     // 256K window and is a separately-listed id. Swallowing it would overstate
     // its window fourfold.
@@ -141,9 +144,13 @@ export const piAiDataDir = (home) =>
  * Read pi's shipped provider data into `id -> {contextWindow, maxTokens, sources}`.
  *
  * The files are keyed by transport (`{"openai-completions": {"<id>": {...}}}`),
- * so the walk is two levels deep. The same model id can appear under several
- * transports with the same numbers; `sources` records every file it was seen in
- * so a finding can cite one.
+ * so the walk is two levels deep. Newer pi releases key each entry by
+ * operation + id (`"chat:claude-fable-5"`) while the entry itself still carries
+ * the bare `id`; indexing by the key alone therefore indexed `chat:claude-fable-5`
+ * and made every probe miss. The entry's own `id` wins, and the key is the
+ * fallback for files that predate that field. The same model id can appear under
+ * several transports with the same numbers; `sources` records every file it was
+ * seen in so a finding can cite one.
  *
  * Values that disagree across files are kept as a set, not silently collapsed:
  * a model pi itself describes two ways is a fact worth surfacing, not resolving.
@@ -165,11 +172,14 @@ export const readOfficialModels = (dir) => {
     if (!parsed || typeof parsed !== 'object') continue;
     for (const models of Object.values(parsed)) {
       if (!models || typeof models !== 'object') continue;
-      for (const [id, def] of Object.entries(models)) {
+      for (const [keyName, def] of Object.entries(models)) {
         if (!def || typeof def !== 'object') continue;
         const contextWindow = def.contextWindow;
         const maxTokens = def.maxTokens ?? def.maxOutputTokens;
         if (typeof contextWindow !== 'number') continue;
+        // `def.id` is authoritative; the map key is "<operation>:<id>" in newer
+        // pi data and a bare id in older data.
+        const id = typeof def.id === 'string' && def.id !== '' ? def.id : keyName;
         const key = id.toLowerCase();
         const seen = index.get(key) ?? { id, contextWindows: new Set(), maxTokens: new Set(), sources: new Set() };
         seen.contextWindows.add(contextWindow);
