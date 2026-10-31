@@ -79,15 +79,18 @@ const validateServerSettings = (rule, where) => {
  * A `requires` entry names a companion the target needs at runtime but that
  * this project deliberately does NOT install.
  *
- * pi is the reason this exists. pi has no built-in MCP support: the bridge
- * generates `~/.pi/agent/mcp-adapter.json` and hands it over, but the only
- * thing that ever reads that file is the `pi-mcp-adapter` package — which
+ * The original motive was pi 0.87, which had no built-in MCP support: the
+ * bridge generated `~/.pi/agent/mcp-adapter.json` and handed it over, but the
+ * only thing that read that file was the `pi-mcp-adapter` package — which
  * lives in `~/.pi/agent/settings.json`, a `never_touch` path. So the bridge
- * cannot install it, and — without this declaration — cannot notice it going
- * away either. The failure is silent by construction: the generated config is
- * still on disk, still correct, still mode 600, and simply nobody loads it.
- * MCP and the direct codebase-memory tools disappear while `apply` keeps
- * reporting success.
+ * could not install it, and — without this declaration — could not notice it
+ * going away either. The failure is silent by construction: the generated
+ * config is still on disk, still correct, still mode 600, and simply nobody
+ * loads it. MCP and the direct codebase-memory tools disappear while `apply`
+ * keeps reporting success. pi >= 1.4 made MCP a built-in feature (it reads
+ * `~/.pi/agent/mcp.json`, and the pi manifest now targets that file), so the
+ * declaration is no longer used there — but the mechanism stays, because it is
+ * the only way to report "we produced a config nobody reads" for any target.
  *
  * Declaring the requirement turns that into an observable fact. `doctor`
  * probes it and prints the exact command that fixes it. The probe is a plain

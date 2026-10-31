@@ -128,23 +128,15 @@ export const makeSandbox = ({ install = ['pi', 'kimi'], linkSkills = true } = {}
     // thing under test.
     mkdirSync(join(home, '.agents'), { recursive: true });
     if (linkSkills) makeDirLink(join(home, '.claude', 'skills'), join(home, '.agents', 'skills'));
+    // pi >= 1.4 reads its MCP servers from ~/.pi/agent/mcp.json natively, so
+    // that is the file the fixture seeds with a server the user added by hand.
     write(
-      join(home, '.pi', 'agent', 'mcp-adapter.json'),
+      join(home, '.pi', 'agent', 'mcp.json'),
       `${JSON.stringify(
         { mcpServers: { 'pi-only': { command: 'pi-private', args: [], env: {} } } },
         null,
         2,
       )}\n`,
-    );
-    // pi.json declares a `requires` probe for the pi-mcp-adapter package, and
-    // the real machine has it installed. The fixture must therefore look
-    // installed too, or every doctor test would carry a REQUIREMENT_MISSING
-    // warning — and a fixture that quietly reports a false problem is worse
-    // than no fixture, because the tests would stop noticing real ones. Tests
-    // that exercise the missing case delete this file explicitly.
-    write(
-      join(home, '.pi', 'agent', 'npm', 'node_modules', 'pi-mcp-adapter', 'package.json'),
-      '{"name":"pi-mcp-adapter","version":"0.0.0-fixture"}\n',
     );
   }
   if (install.includes('kimi')) {

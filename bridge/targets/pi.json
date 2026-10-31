@@ -1,10 +1,12 @@
 {
   "name": "pi",
   "display": "pi (pi coding agent)",
-  "detect": [".pi"],
+  "detect": [
+    ".pi"
+  ],
   "home_hint": "~/.pi",
   "verified": true,
-  "notes": "Paths verified against pi's own documentation (skills.md, configuration.md, prompt-templates.md) and the pi-mcp-adapter README (v3.2). Skills are DECLARED AS A LINK rather than copied: pi documents ~/.agents/skills/ as a natively supported location, and sharing it by link gives pi the source's skills with no duplication and no drift to reconcile. The bridge CREATES that link (a symlink on POSIX, a junction on Windows) on the first adopt when it is missing, and recreates it if it was deleted. The rules document goes to ~/AGENTS.md rather than ~/.pi/agent/AGENTS.md because pi loads context files from both the agent directory and the working-directory chain, so a second copy under ~/.pi would make the model read the same rules twice. MACHINE-LOCAL GATE SCOPE: bridge/lib/gates.js merges ~/.config/agent-config-bridge/gate-policy.json (config only) when generating policy.json, so a machine can declare project_roots outside this public repository and cover non-git working directories without committing absolute paths here. scaffold it with `node scripts/bootstrap.js --yes --root <dev-root>`. NOTE: pi 0.87 has no built-in MCP support; MCP reaches pi through the pi-mcp-adapter package, which since v3 reads ~/.pi/agent/mcp-adapter.json (it renamed the file from mcp.json and reserves mcp.json for a future pi built-in). Install or update it with `pi install npm:pi-mcp-adapter`. NOTE ON MODEL METADATA: pi-smart-router keeps its own copy of every model's contextWindow in ~/.pi/agent/pi-router-catalog.json, and its merge is sticky (an existing value always wins), so a stale number there is permanent. That file is listed under never_touch — the bridge reports a mismatch via `doctor` (PI_CATALOG_CONTEXT_STALE) and deliberately does not rewrite it; see bridge/lib/pi-models.js for why.",
+  "notes": "Paths verified against pi's own documentation (skills.md, configuration.md, prompt-templates.md, mcp.md). Skills are DECLARED AS A LINK rather than copied: pi documents ~/.agents/skills/ as a natively supported location, and sharing it by link gives pi the source's skills with no duplication and no drift to reconcile. The bridge CREATES that link (a symlink on POSIX, a junction on Windows) on the first adopt when it is missing, and recreates it if it was deleted. The rules document goes to ~/AGENTS.md rather than ~/.pi/agent/AGENTS.md because pi loads context files from both the agent directory and the working-directory chain, so a second copy under ~/.pi would make the model read the same rules twice. MACHINE-LOCAL GATE SCOPE: bridge/lib/gates.js merges ~/.config/agent-config-bridge/gate-policy.json (config only) when generating policy.json, so a machine can declare project_roots outside this public repository and cover non-git working directories without committing absolute paths here. scaffold it with `node scripts/bootstrap.js --yes --root <dev-root>`. NOTE: pi >= 1.4 has BUILT-IN MCP support and reads ~/.pi/agent/mcp.json (user level) plus .pi/mcp.json (project level); the older pi-mcp-adapter package and its ~/.pi/agent/mcp-adapter.json are no longer needed. NOTE ON MODEL METADATA: pi-smart-router keeps its own copy of every model's contextWindow in ~/.pi/agent/pi-router-catalog.json, and its merge is sticky (an existing value always wins), so a stale number there is permanent. That file is listed under never_touch — the bridge reports a mismatch via `doctor` (PI_CATALOG_CONTEXT_STALE) and deliberately does not rewrite it; see bridge/lib/pi-models.js for why.",
   "managed": [
     {
       "kind": "skill",
@@ -30,22 +32,12 @@
     {
       "kind": "mcp",
       "from": "@mcpServers",
-      "to": ".pi/agent/mcp-adapter.json",
+      "to": ".pi/agent/mcp.json",
       "mode": "mcp-json",
-      "note": "pi-mcp-adapter (v3+) reads this file. codebase-memory-mcp gets directTools so its query and indexing tools appear first-class in pi's tool list — the hard gate keys off those names, and proxy-only mode would report every call as `mcp`. lifecycle=eager connects at startup so the tool catalog (and the direct-tool registration) is populated without a first manual `mcp({connect})` call.",
-      "requires": [
-        {
-          "id": "pi-mcp-adapter",
-          "probe": ".pi/agent/npm/node_modules/pi-mcp-adapter/package.json",
-          "unless": ".pi/agent/extensions/pi-mcp-adapter",
-          "install": "pi install npm:pi-mcp-adapter",
-          "why": "pi has no built-in MCP support, so this package is the only thing that reads the generated config; without it the MCP servers and the direct codebase-memory tools vanish from the tool list and the hard gate loses the tools it keys off (all silently — the config on disk stays correct)"
-        }
-      ],
+      "note": "pi >= 1.4 reads ~/.pi/agent/mcp.json natively (user level; .pi/mcp.json is the project level). codebase-memory-mcp is declared with exposure \"direct\" instead of the default \"codemode\" so its query and indexing tools appear in pi's tool list as mcp__codebase-memory-mcp__<tool>: the hard gate keys off those names, and a codemode-only server would hide them behind the codemode tool. The default pi set connects every enabled server at session start, so the tools are available without a manual /mcp connect.",
       "server_settings": {
         "codebase-memory-mcp": {
-          "directTools": true,
-          "lifecycle": "eager"
+          "exposure": "direct"
         }
       }
     }

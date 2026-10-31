@@ -107,24 +107,26 @@ node bridge/cli.js revoke gemini
 
 ### 5.8 为什么 MCP 配置明明对，工具却不见了
 
-有些 agent 的 MCP 支持**不是一个内建功能，而是一个包**。pi 就是这种：pi 本体没有 MCP，桥接器生成的 `~/.pi/agent/mcp-adapter.json` 只有 `pi-mcp-adapter` 这个包会读。
+有些 agent 的 MCP 支持**不是一个内建功能，而是一个包**；那种情况下，配置写得再对，只要读它的程序不在，工具就会静默消失。
 
-问题在于那个包记在 `~/.pi/agent/settings.json` 的 `packages` 里 —— 而 `settings.json` 是本项目的 `never_touch`（你自己 `pi install` 装的东西，工具无权替你决定）。于是出现一个**结构性盲区**：
+pi 曾经是这类问题的典型：pi 0.87 本体没有 MCP，桥接器生成的 `~/.pi/agent/mcp-adapter.json` 只有 `pi-mcp-adapter` 这个包会读。而那个包记在 `~/.pi/agent/settings.json` 的 `packages` 里 —— `settings.json` 是本项目的 `never_touch`（你自己 `pi install` 装的东西，工具无权替你决定）。于是出现一个**结构性盲区**：
 
 * 配置在盘上、内容正确、权限 600，`apply` 每次都报成功；
 * 但没有任何程序去读它 —— MCP server、`codebase-memory` 直连工具、以及依赖这些工具名的硬闸门**一起静默消失**；
 * pi 重装、清了 npm 缓存、或换台机器只跑了 `adopt`/`apply`，就会发生。
 
-本项目的处理方式是**声明 + 探测**，而不是替你去装（那会写 `never_touch`，属于越界）：
+**pi ≥ 1.4 已经把 MCP 做成本体功能**：它直接读 `~/.pi/agent/mcp.json`（用户级）与 `.pi/mcp.json`（项目级），不再需要 `pi-mcp-adapter`。所以本仓库的 pi 清单现在写的是 `mcp.json`，`codebase-memory-mcp` 用 `exposure: "direct"`（不是默认的 `codemode`）声明，好让 `mcp__codebase-memory-mcp__*` 这些工具名直接出现在工具列表里 —— 硬闸门正是按这些名字识别"查过图谱"的。
 
-* 需要外部程序的受管条目在清单里声明 `requires`（探针路径 + 装法 + 说明）；
+`requires` 机制本身保留下来，因为它解决的是更普遍的问题：**桥接器产出了一份没人读的配置**。任何端都可以声明"我需要某个外部程序"：
+
+* 受管条目在清单里声明 `requires`（探针路径 + 装法 + 说明）；
 * `doctor` 在"该端已桥接、且它生成的那份配置确实存在"时探测一次，缺失就报 `REQUIREMENT_MISSING`（**warn**），并把修复命令原样打出来：
 
 ```
 WARN
-  [REQUIREMENT_MISSING] pi: pi-mcp-adapter is not installed, so ~/.pi/agent/mcp-adapter.json
-  is generated but nothing loads it — pi has no built-in MCP support, ...
-      → pi install npm:pi-mcp-adapter
+  [REQUIREMENT_MISSING] pi: <companion> is not installed, so <generated config>
+  is generated but nothing loads it — ...
+      → <install command>
 ```
 
 几点刻意的设计：
@@ -133,8 +135,6 @@ WARN
 * **只写在 `doctor`，不写进 planner** —— `plan`/`apply` 必须是"源 + 目标"的确定性函数，否则快照测试与可复现性都会崩。"这台机器上装没装某个包"是环境事实，只配出现在自检里；
 * 探针是**清单里的相对路径**，库里没有任何 pi 专属代码；任何端都可以声明任何伴随程序，`unless` 用来登记"也可以装在这儿"的备选位置，避免误报；
 * 只在**已桥接且目标文件存在**时检查 —— 没 adopt 过的机器上不该被这种建议打扰。
-
-> 你已经会手动 `pi install` 的话，这条的收益不是"帮你装"，而是把一次**毫无报错的静默失效**变成一条每次跑 `doctor` 都会重刷、且带修复命令的提示。
 
 ### 5.9 为什么 1M 上下文的模型显示成 128K
 
@@ -324,7 +324,7 @@ node scripts/install-hard-gate-skill.js --apply
 |---|---|---|
 | 某端完全没被同步 | 它还是 `native`（默认） | 先 `adopt <agent>` |
 | 某端显示"未检测到" | 该 agent 目录不存在 | 先启动一次该 agent，再 `status` 确认 |
-| **`doctor` 报 `REQUIREMENT_MISSING`** | 该端读配置的**程序**没了（配置本身是好的） | 按 `doctor` 给出的 → 命令装回来，例如 `pi install npm:pi-mcp-adapter`；详见 §5.8 |
+| **`doctor` 报 `REQUIREMENT_MISSING`** | 该端读配置的**程序**没了（配置本身是好的） | 按 `doctor` 给出的 → 命令装回来；详见 §5.8 |
 | **`doctor` 报 `PI_CATALOG_CONTEXT_STALE`** | pi-smart-router 目录里某个模型的上下文窗口和 pi 发布的数据不一致，且它**不会自己刷新** | 按报错里的 `selector` 与期望值改 `~/.pi/agent/pi-router-catalog.json`；详见 §5.9 |
 | **`doctor` 报 `PI_MODEL_TABLE_STALE`** | 本项目自己的家族表（`bridge/lib/pi-models.js`）跟不上 pi 发布的 provider 数据了 | 这是**仓库的**问题：按报错里的 `file` 与两个数字更新 `FAMILY_META`，并确认 `source` 仍准确 |
 | **`doctor` 报 `PI_CATALOG_UNREADABLE`** | `pi-router-catalog.json` 不是合法 JSON | 修好它，或删掉（pi-smart-router 会回落到自带 seed） |

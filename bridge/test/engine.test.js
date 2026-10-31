@@ -277,9 +277,9 @@ test('adopt: writes a snapshot before anything is overwritten', async () => {
 
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
     assert.equal(manifest.agent, 'pi');
-    // The pi mcp-adapter.json existed with a private server, so it must be
+    // The pi mcp.json existed with a private server, so it must be
     // recorded as overwritten and its previous bytes preserved.
-    const mcpEntry = manifest.entries.find((e) => e.path.endsWith('.pi/agent/mcp-adapter.json'));
+    const mcpEntry = manifest.entries.find((e) => e.path.endsWith('.pi/agent/mcp.json'));
     assert.equal(mcpEntry.action, 'overwritten');
     const stored = join(sb.repo, '.bridge', 'snapshots', 'pi', id, 'files', mcpEntry.path);
     assert.equal(hashFile(stored), mcpEntry.sha256);
@@ -501,7 +501,7 @@ test('mcp: derived servers reach the target and preserve the target own servers'
   await withSandbox({}, (sb) => {
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
 
-    const emitted = JSON.parse(readFileSync(sb.path('.pi/agent/mcp-adapter.json'), 'utf8'));
+    const emitted = JSON.parse(readFileSync(sb.path('.pi/agent/mcp.json'), 'utf8'));
     const names = Object.keys(emitted.mcpServers);
 
     assert.ok(names.includes('local-tool'));
@@ -523,7 +523,7 @@ test('mcp: manifest server_settings are merged into a derived server and survive
     });
 
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
-    const file = sb.path('.pi/agent/mcp-adapter.json');
+    const file = sb.path('.pi/agent/mcp.json');
     let emitted = JSON.parse(readFileSync(file, 'utf8'));
     assert.equal(emitted.mcpServers['local-tool'].directTools, true, 'the declared setting is written');
     assert.equal(emitted.mcpServers['local-tool'].command, 'npx', 'and the source-derived keys stay');
@@ -568,7 +568,7 @@ test('manifest: server_settings are refused outside an mcp-json rule', async () 
 test('mcp: secrets are expanded from a file outside the repository', async () => {
   await withSandbox({}, (sb) => {
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
-    const emitted = JSON.parse(readFileSync(sb.path('.pi/agent/mcp-adapter.json'), 'utf8'));
+    const emitted = JSON.parse(readFileSync(sb.path('.pi/agent/mcp.json'), 'utf8'));
     assert.equal(emitted.mcpServers['secret-tool'].env.API_KEY, 'not-a-real-key');
     assert.equal(emitted.mcpServers['secret-tool'].env.EMAIL, 'nobody@example.com');
   });
@@ -594,7 +594,7 @@ test('mcp: a referenced but missing variable aborts the whole run', async () => 
 test('mcp: generated configuration is written with mode 600', async () => {
   await withSandbox({}, (sb) => {
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
-    const mode = statSync(sb.path('.pi/agent/mcp-adapter.json')).mode & 0o777;
+    const mode = statSync(sb.path('.pi/agent/mcp.json')).mode & 0o777;
     // Windows has no mode bits to assert: Node reports a constant 0o666 and
     // there is no chmod that can produce 600 there. The guarantee is a POSIX
     // one, and the platform that can express it is the platform that must
@@ -640,25 +640,41 @@ test('doctor: clean sandbox has no errors', async () => {
   });
 });
 
-// The failure this check exists for: pi's MCP support is a package, not a
-// feature, and the package is recorded in settings.json — a never_touch file.
-// So the bridge can generate a perfectly valid mcp-adapter.json that nothing on
+// The failure this check exists for: some agents' MCP support is a package, not
+// a feature, so the bridge can generate a perfectly valid config that nothing on
 // the machine ever reads. Nothing about that is visible from the generated
-// files; the only way to notice is to ask whether the consumer exists.
+// files; the only way to notice is to ask whether the consumer exists. pi >= 1.4
+// loads mcp.json natively, so these tests attach a fixture requirement to the pi
+// manifest: the generic mechanism stays covered without claiming pi needs it.
+const FIXTURE_REQUIREMENT = {
+  id: 'fixture-consumer',
+  probe: '.pi/agent/npm/node_modules/fixture-consumer/package.json',
+  install: 'npm i -g fixture-consumer',
+  why: 'fixture: the generated config needs a consumer',
+};
+
+const withRequirement = (sb, extra = {}) =>
+  sb.findAndReplaceManifests((m) => {
+    if (m.name !== 'pi') return null;
+    const rule = m.managed.find((r) => r.kind === 'mcp');
+    rule.requires = [{ ...FIXTURE_REQUIREMENT, ...extra }];
+    return m;
+  });
+
 test('doctor: reports a generated MCP config whose consumer is not installed', async () => {
   await withSandbox({}, (sb) => {
+    withRequirement(sb);
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
-    rmSync(sb.path('.pi/agent/npm/node_modules/pi-mcp-adapter/package.json'));
 
     const report = api.doctor({ repo: sb.repo, home: sb.home });
     const finding = report.findings.find((f) => f.code === 'REQUIREMENT_MISSING');
     assert.ok(finding, `expected REQUIREMENT_MISSING, got ${JSON.stringify(report.findings)}`);
     assert.equal(finding.level, 'warn');
     // The config is still on disk and still correct — that is the whole point.
-    assert.ok(sb.exists('.pi/agent/mcp-adapter.json'));
-    assert.match(finding.message, /pi-mcp-adapter/);
+    assert.ok(sb.exists('.pi/agent/mcp.json'));
+    assert.match(finding.message, /fixture-consumer/);
     // The hint has to be the command that actually fixes it, not advice.
-    assert.equal(finding.hint, 'pi install npm:pi-mcp-adapter');
+    assert.equal(finding.hint, 'npm i -g fixture-consumer');
     // A warning, so plain `doctor` still exits 0 — but --strict must fail.
     assert.equal(report.ok, true);
     assert.equal(api.doctor({ repo: sb.repo, home: sb.home, strict: true }).ok, false);
@@ -667,7 +683,7 @@ test('doctor: reports a generated MCP config whose consumer is not installed', a
 
 test('doctor: stays quiet about a requirement while the target is not bridged', async () => {
   await withSandbox({}, (sb) => {
-    rmSync(sb.path('.pi/agent/npm/node_modules/pi-mcp-adapter/package.json'));
+    withRequirement(sb);
     const report = api.doctor({ repo: sb.repo, home: sb.home });
     // pi is installed but native: the bridge generates nothing for it, so there
     // is nothing to orphan and no advice to give.
@@ -677,9 +693,9 @@ test('doctor: stays quiet about a requirement while the target is not bridged', 
 
 test('doctor: a companion installed at an accepted alternative location counts', async () => {
   await withSandbox({}, (sb) => {
+    withRequirement(sb, { unless: '.pi/agent/extensions/fixture-consumer' });
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
-    rmSync(sb.path('.pi/agent/npm/node_modules/pi-mcp-adapter/package.json'));
-    mkdirSync(sb.path('.pi/agent/extensions/pi-mcp-adapter'), { recursive: true });
+    mkdirSync(sb.path('.pi/agent/extensions/fixture-consumer'), { recursive: true });
     const report = api.doctor({ repo: sb.repo, home: sb.home });
     assert.equal(report.findings.some((f) => f.code === 'REQUIREMENT_MISSING'), false);
   });

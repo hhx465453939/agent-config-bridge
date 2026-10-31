@@ -8,6 +8,12 @@ date: 2026-09-29
 deciders: [user]
 ```
 
+> **2026-10-31 补记**：本 ADR 的动机（pi 没有内建 MCP）已在 pi 1.4 失效 —— pi 现在直接读
+> `~/.pi/agent/mcp.json`，`bridge/targets/pi.json` 已改指向该文件（`exposure: direct` 取代
+> `directTools`/`lifecycle`），pi 清单也不再声明 `pi-mcp-adapter` 这个 `requires`。
+> `requires` 机制本身保留：它解决的是「产出了一份没人读的配置」这一类问题，与具体宿主无关。
+> 下文保留当时的决策记录，不做改写。
+
 ## 背景
 
 本项目的核心承诺是**清单是唯一的结构知识来源**（`README.md` §"会桥接什么"、`docs/USAGE.md` §6）。这条承诺换来的是可审计：所有受管路径都能在 `bridge/targets/*.json` 里读到，代码里没有"猜路径"的逻辑。
