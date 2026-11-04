@@ -239,6 +239,37 @@ test('models: the reader tolerates a missing directory and unparsable files', ()
   assert.equal(readOfficialModels(join(HOME, '.pi', 'agent', 'no-such-dir-xyz')), null);
 });
 
+test('models: a transport-namespaced map key is resolved through the entry id', async () => {
+  // pi keys newer provider entries by operation + id (`"chat:kimi-k3"`) while the
+  // entry itself still carries the bare `id`. Indexing by the map key alone made
+  // every probe miss — ten shipped models were reported as "pi does not list it",
+  // and the family check could not verify anything. This pins the contract:
+  // `def.id` wins, the key is the fallback for files that predate it.
+  await withSandbox({}, (sb) => {
+    const dir = join(sb.home, 'provider-data');
+    write(
+      join(dir, 'namespaced.json'),
+      JSON.stringify({
+        'openai-completions': {
+          'chat:kimi-k3': { id: 'kimi-k3', contextWindow: 1_048_576, maxTokens: 131_072 },
+        },
+      }),
+    );
+    write(
+      join(dir, 'plain.json'),
+      JSON.stringify({
+        'anthropic-messages': { 'kimi-k3': { contextWindow: 1_048_576, maxTokens: 131_072 } },
+      }),
+    );
+
+    const index = readOfficialModels(dir);
+    assert.ok(index);
+    assert.equal(index.has('kimi-k3'), true, 'the entry id must be the index key');
+    assert.equal(index.has('chat:kimi-k3'), false, 'the namespaced spelling is not a key');
+    assert.equal(index.get('kimi-k3').sources.size, 2, 'both spellings collapse onto one entry');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // guessModel precedence
 // ---------------------------------------------------------------------------
