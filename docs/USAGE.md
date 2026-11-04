@@ -325,7 +325,10 @@ node bridge/cli.js apply
 
 * **同一个脚本只问一次 Worklog**：第一步跑过就不再打断，长流水线不会被反复拦；
 * **读脚本不等于跑脚本**：`cat run.R` 永远放行，否则调试自己的脚本都会被拦；
-* **没动过的旧目录不算问题**：只判「本轮更新过」的目录，不会把历史 `results/` 全报一遍。
+* **没动过的旧目录不算问题**：只判「本轮更新过」的目录，不会把历史 `results/` 全报一遍；
+* **`.ipynb` / `.Rmd` 不要求额外 `.log`**：执行后的笔记本、渲染出的报告本身就是留痕，硬要外部日志是必然误伤（但仍然要求 Worklog）；
+* **域配置写进 profile，不是写进 `policy.json`**：`profile` 的 `config` **覆盖** `policy.json` 的同名键。比如想改结果目录，请改 `profiles/ai4s-dry-lab.json` 的 `result_dirs`——改 `policy.json` 里的那个不会生效（这一条最容易踩）；
+* **提醒文案来自 profile**：域启用时每轮会注入一段「本轮要写 Worklog / 日志 / 说明」的提醒，只在该域活跃时出现，普通仓库看不到它。
 
 想加一个域（或改某个域的规则）：新建 `bridge/gates/profiles/<名字>.json`，再在 `policy.json` 的 `profiles` 数组里加上这个名字，然后 `apply`。**不需要改适配层代码**。
 

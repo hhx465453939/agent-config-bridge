@@ -22,6 +22,8 @@ status: approved
 
 带红基线开发等于假绿，因此先修：`bridge/lib/pi-models.js`（剥前缀 + `kimi-k3` 改 null）与 `bridge/test/pi-models.test.js`（补一条前缀归一化的用例，锁住这次回归）。
 
+> **交接给远端后的事实变更**：推送时发现另一个 agent 已用更好的方式修了同一处——上游 `56dc315` 改为**优先读条目自带的 `def.id`**（权威字段），并把 `kimi-k3` 的 `maxTokens` 也改成了 `null`。我的“剥 `chat:` 前缀”实现因此**冗余，已从历史里丢掉**（rebase 时未重放），保留的只有一条回归测试（改写为锁 `def.id` 契约）。这里是记录而不是粉饰：两条路都能修，`def.id` 那条更对。
+
 ## 改动
 
 | 文件 | 改动 |
@@ -54,3 +56,15 @@ bash scripts/scan-secrets.sh        # EXIT=0，93 文件干净
 ```
 
 red 项：`pi-models.test.js` 两条（见上「前置修复」）。交付前必须转为 `EXIT=0` 且 `scan-secrets.sh` 无命中。
+
+## 交付后修订（同一 CHG 收尾，用户 reload 后复查发现）
+
+交付并推送后复查，发现三处属于「能跑但会误导/会误伤」的问题，一并修掉：
+
+| # | 问题 | 处置 |
+|---|---|---|
+| 1 | **域规矩只靠拦截时才知道**：每轮注入的提醒文案还是 v4 的，一个字没提 Worklog / 日志 / 结果说明 | 提醒文案改为**跟 profile 走**（`profiles/<name>.json` 的 `reminder` 字段）。必须跟 profile 走而不能塞进 `policy.json`：后者会注入到**所有**会话，让一个 JS 仓库每轮看到“写 Worklog”，等于训练模型忽略提醒 |
+| 2 | **`.ipynb` / `.Rmd` 会被 W4 必然误伤**：执行后的笔记本与渲染产物本身就是留痕，硬要额外 `.log` 每次都会报 | 新增 `log_required_extensions`（默认 `.R` / `.r` / `.py`）。W4 只覆盖脚本类扩展名；W1（跑前 Worklog）对四类扩展名**照旧生效** |
+| 3 | **域配置写哪儿会踩坑**：profile 的 `config` 覆盖 `policy.json` 同名键，但安装目录 README 只提了 `policy.json` | 安装 README 补文件清单与“域规则改 `profiles/*.json`”；`docs/USAGE.md` 补“profile config 覆盖 base config”与 notebook 豁免；根 `README.md` 补一节 AI4S 域门控的来源（vitaforge）、适配端、版本号与边界 |
+
+修订后的验证：`node --test` **222 项 / 221 通过 / 0 失败 / 1 跳过**；安装版端到端实测——policy v5、profiles 解析 0 未解析、W1 真拦、域提醒真注入上下文。
