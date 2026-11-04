@@ -35,7 +35,7 @@ generated_by: manual
 
 ## 现场证据（不是计划绿）
 
-1. **时间戳容差是实测踩出来的**：`ai4s-script-log-source` 的轮末版（W4 下半）最初用 `log.mtime >= startedAt`，实测「紧接着写出的日志」其 mtime 比 `Date.now()` 早 2–3ms，导致**每次运行必假阳性**。修法沿用仓库既有先例（`index_mtime_epsilon_ms`），新增 `artifact_mtime_epsilon_ms`（默认 2000）。这条在 ADR-010 §7 记录。
+1. **时间戳容差是实测踩出来的**：`ai4s-script-log-source` 的轮末版（W4 下半）最初用 `log.mtime >= startedAt`，实测「紧接着写出的日志」其 mtime 比 `Date.now()` 早 2–3ms，导致**每次运行必假阳性**。修法沿用仓库既有先例（`index_mtime_epsilon_ms`），新增 `artifact_mtime_epsilon_ms`（默认 2000）。这条在 ADR-011 §7 记录。
 2. **安装器漏复制被现成测试抓到**：加完 `classifier.js` 后，`gates.test.js` 的「installed layout really loads (the bug that shipped)」立刻报 `ERR_MODULE_NOT_FOUND: <gate>/classifier.js`。修法是 `planGateInstall` 增加 `classifier.js` 与 `profiles/` 的复制动作——这是「装进去但不生效」这一类洞的现场证据（ADR-003 §4 同源）。
 3. **部署核对**：`node bridge/cli.js apply --targets pi` → `+3 ~3 -0`；安装副本 `policy.json` 版本为 **5**，含 `default_profile` 与 `profiles`，`classifier.js` 与 `profiles/*.json` 均落在 `~/.pi/agent/extensions/enforce-rules/`。
 4. **doctor 新暴露 3 条 catalog 漂移**：`pi-models` 剥掉 `chat:` 命名空间前缀后，`checkCatalog` 才第一次能真正比对本机 `pi-router-catalog.json`，于是报出 `kimi-for-coding`（262144 vs pi 1048576）、`gpt-5.4-mini`（272000 vs 400000/128000）、`glm-5.1`（200000 vs 204800/202752）。这三条是**真实存在的数据漂移**（此前被前缀缺陷遮蔽），属于 doctor 的报告职责；doctor 按设计不改写用户文件，留给用户决定。
@@ -43,6 +43,6 @@ generated_by: manual
 
 ## 未覆盖（明确不承诺）
 
-- W3 文献验证：不做（ADR-010 §5）。
+- W3 文献验证：不做（ADR-011 §5）。
 - `external_judge` 实际调用：只有字段，不实现。
 - `ai4s-quant` 的域检查：骨架，`checks: []`。

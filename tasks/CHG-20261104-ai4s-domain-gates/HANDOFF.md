@@ -62,7 +62,7 @@
 4. 改 `bridge/gates/pi/index.js`：新增 `before_agent_start` 判定，每用户轮一次，绝不放 `tool_call`（避免每次工具调用加延迟），prompt 哈希缓存；`tool_call` 用裁剪后 policy；`turn_end` 调 `outputArtifactFindings`，有 finding 返 `continue`（受 `slack_max_continues` 限制）；state 增 `profile`/`profileSource`/`scriptsRun`/`turnStart`。
 5. 改 `bridge/gates/dsh/index.js`：无 `before_agent_start` → 首个工具事件惰性判定，判定前按 `general-dev` 放行。
 6. 改两个 `policy.json`：`version: 4 → 5`，加 `classifier`/`profiles` 段，`default_profile: "general-dev"`；`external_judge` 只留字段不实现调用（用户已确认本阶段不需要）。
-7. 新增 `bridge/test/gate-ai4s.test.js`、`docs/ADR/010-ai4s-domain-gates.md`。
+7. 新增 `bridge/test/gate-ai4s.test.js`、`docs/ADR/011-ai4s-domain-gates.md`。
 
 ## 6. 十条 AC（每条必须"能红"）
 

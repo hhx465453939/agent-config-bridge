@@ -37,7 +37,7 @@ status: approved
 | `bridge/gates/pi/policy.json`、`bridge/gates/dsh/policy.json` | version 4 → 5；新增 `classifier` / `profiles` / `default_profile` / `external_judge` 字段 |
 | `bridge/lib/gates.js` | 安装计划里增加 `profiles/` 目录的复制动作（否则装完没有域定义，判定永远走 fallback） |
 | `bridge/test/gate-ai4s.test.js` | 新增：AC-1…AC-9 的用例 |
-| `docs/ADR/010-ai4s-domain-gates.md` | 新增：域判定与检查强度分级的决策记录 |
+| `docs/ADR/011-ai4s-domain-gates.md` | 新增：域判定与检查强度分级的决策记录 |
 
 ## 未做
 

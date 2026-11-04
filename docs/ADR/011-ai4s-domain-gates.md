@@ -1,7 +1,7 @@
-# ADR-010 — AI4S 域判定与领域门控
+# ADR-011 — AI4S 域判定与领域门控
 
 ```yaml
-adr: 010
+adr: 011
 change_id: CHG-20261104-ai4s-domain-gates
 status: accepted
 date: 2026-11-04

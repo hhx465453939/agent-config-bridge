@@ -2301,7 +2301,7 @@ const CHECKS = {
     // scope the rule to whatever directory the agent happened to start in.
     const root = scopeOf(norm, { config, exists: deps.exists }).root
       ?? findRepoRoot(norm, deps.exists);
-    if (!root) return null; // unknown project: fail open, see ADR-010 §fail-open
+    if (!root) return null; // unknown project: fail open, see ADR-011 §fail-open
 
     const rel = config.worklog_path ?? DEFAULT_CONFIG.worklog_path;
     const worklog = normalizePath(join(root, rel));

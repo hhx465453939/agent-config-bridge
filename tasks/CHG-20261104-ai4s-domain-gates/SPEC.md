@@ -28,7 +28,7 @@ owner: pi
 
 ## 3. 选定设计与 ADR
 
-- ADR：`docs/ADR/010-ai4s-domain-gates.md`（域判定三级强度、检查强度分级、fail-open 链）。
+- ADR：`docs/ADR/011-ai4s-domain-gates.md`（域判定三级强度、检查强度分级、fail-open 链）。
 - 判定放在 `before_agent_start`（pi）而不是 `tool_call`：`tool_call` 每次工具调用都跑，模型判定会给每次调用加一次网络往返。
 - 判定结果按 prompt 哈希缓存：同一个用户轮重复触发 `before_agent_start` 不重复判定（也避免模型抖动导致同一轮换域）。
 - dsh 惰性判定：dsh 没有「会话开始」钩子，首个工具事件时判定一次；判定前用 `general-dev`，即「宁少一层规矩，不多一层阻塞」。
@@ -104,7 +104,7 @@ profile 定义（`bridge/gates/profiles/ai4s-dry-lab.json`）：
 | M1 | `classifier.js` + 两个 profile JSON | AC-1 / AC-2 / AC-7 绿 |
 | M2 | `policy.js`：`activeChecks` / `profilePolicy` / W1 / W4 / `outputArtifactFindings` | AC-3…AC-6、AC-8 绿 |
 | M3 | 适配层：pi `before_agent_start` + 裁剪 policy + `turn_end`；dsh 惰性判定 | AC-9 绿 |
-| M4 | `policy.json` v5、`gates.js` 复制 profiles、ADR-010、DESIGN.md | AC-10 绿 + 部署可用 |
+| M4 | `policy.json` v5、`gates.js` 复制 profiles、ADR-011、DESIGN.md | AC-10 绿 + 部署可用 |
 
 ## 8. 验收断言（每条都能红）
 
