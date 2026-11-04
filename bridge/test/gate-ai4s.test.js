@@ -35,6 +35,8 @@ import {
   normalizePolicy,
   outputArtifactFindings,
   profilePolicy,
+  recordSignal,
+  reminderFor,
   resetMtimeCache,
   shouldBlock,
 } from '../gates/policy.js';
@@ -75,10 +77,12 @@ const ai4sPolicy = (dir, overrides = {}) => ({
   name: 'test-gate',
   version: 5,
   checks: ['no-secret-write'],
+  reminder: 'BASE-RULES',
   default_profile: 'general-dev',
   profiles: {
     'ai4s-dry-lab': {
       name: 'ai4s-dry-lab',
+      reminder: 'AI4S-RULES',
       fingerprints: [['docs/STATE.md', 'docs/WORKLOG.md']],
       keywords: { min_hits: 2, strong: ['单细胞', 'seurat'], weak: ['细胞', '聚类'] },
       checks: ['ai4s-worklog-before-run', 'ai4s-script-log-source'],
@@ -87,7 +91,8 @@ const ai4sPolicy = (dir, overrides = {}) => ({
         worklog_ttl_ms: 30 * MINUTE,
         result_dirs: ['results'],
         readme_prefix: 'README_',
-        script_extensions: ['.R', '.py'],
+        script_extensions: ['.R', '.py', '.ipynb'],
+        log_required_extensions: ['.R', '.py'],
       },
     },
   },
@@ -303,6 +308,60 @@ test('AC-5b: reading a script is not running it', withTmp(async (dir) => {
 
   assert.equal(verdict.block, false, 'debugging the script must stay possible');
 }));
+
+test('AC-5c: a notebook is held to W1 but not to an external .log', withTmp(async (dir) => {
+  write(join(dir, 'docs', 'STATE.md'), '# state\n');
+  const worklog = write(join(dir, 'docs', 'WORKLOG.md'), '# worklog\n');
+  ageFile(worklog, 40 * MINUTE);
+  const notebook = write(join(dir, 'scripts', 'analyze.ipynb'), '{"cells":[]}');
+  const policy = profilePolicy(normalizePolicy(ai4sPolicy(dir)), 'ai4s-dry-lab');
+
+  const stale = shouldBlock({
+    policy,
+    input: bashRun(notebook, dir),
+    state: newSessionState(),
+    fs: realFs,
+  });
+  assert.equal(stale.code, 'AI4S_WORKLOG', 'a notebook still needs a fresh Worklog before it runs');
+
+  ageFile(worklog, 1 * MINUTE);
+  const fresh = shouldBlock({
+    policy,
+    input: bashRun(notebook, dir),
+    state: newSessionState(),
+    fs: realFs,
+  });
+  assert.equal(
+    fresh.block,
+    false,
+    'an executed notebook keeps its own output; demanding a separate .log would misfire every run',
+  );
+}));
+
+test('reminder: the domain text rides along with the base text, and only in that domain', () => {
+  const root = join(REPO, '.fixture-reminder');
+  const policy = normalizePolicy(ai4sPolicy(root));
+  const state = newSessionState();
+  const now = Date.now();
+
+  const general = reminderFor(policy, state, now);
+  assert.match(String(general), /BASE-RULES/);
+  assert.doesNotMatch(
+    String(general),
+    /AI4S-RULES/,
+    'a general-dev turn must not be told about Worklogs',
+  );
+
+  state.profile = 'ai4s-dry-lab';
+  assert.match(reminderFor(policy, state, now), /AI4S-RULES/);
+
+  // The domain text has to survive a graph query: "I already asked the graph" says
+  // nothing about whether this run will leave a Worklog and a log file behind.
+  recordSignal(state, now);
+  const afterSignal = reminderFor(policy, state, now);
+  assert.doesNotMatch(String(afterSignal), /BASE-RULES/, 'the base text is silenced by a fresh signal');
+  assert.match(String(afterSignal), /AI4S-RULES/, 'the domain text is not');
+});
 
 // ---------------------------------------------------------------------------
 // AC-6 — turn-end output findings

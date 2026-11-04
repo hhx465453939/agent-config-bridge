@@ -2,6 +2,7 @@
   "name": "ai4s-dry-lab",
   "version": 1,
   "description": "计算生物学干实验：scRNA-seq / 空间转录组 / 跨物种比较。域检查守三件事——跑之前有 Worklog、脚本自己留日志、结果目录有说明文件。",
+  "reminder": "[AI4S 域已启用 · 干实验]\n本轮额外硬约束：\n① 跑分析脚本前先把本轮计划写进 docs/WORKLOG.md（目标/输入数据/关键参数/预期产出/回退），30 分钟内没更新会被拦。\n② .R/.r/.py 脚本要自己写日志（R: sink / Sys.time；Py: logging / FileHandler），跑完要留下同名 .log。\n③ 本轮动过的 results/ 或 figures/ 子目录，各放一个 README_ 开头的说明（这个目录是什么、用哪个脚本跑的、关键参数）。\n④ 文献引用写 PMID，但本阶段不做硬校验，自己核对真伪。\n⑤ .ipynb / .Rmd 不要求额外 .log：执行后的笔记本与渲染产物本身就是留痕。\n判错域只会少一层规矩，不会阻塞你干活。",
   "fingerprints": [
     ["docs/STATE.md", "docs/WORKLOG.md"],
     ["docs/WORKLOG.md", "docs/CONTEXT.md"],
@@ -57,6 +58,7 @@
     "worklog_ttl_ms": 1800000,
     "result_dirs": ["results", "figures"],
     "readme_prefix": "README_",
-    "script_extensions": [".R", ".Rmd", ".r", ".py", ".ipynb"]
+    "script_extensions": [".R", ".Rmd", ".r", ".py", ".ipynb"],
+    "log_required_extensions": [".R", ".r", ".py"]
   }
 }

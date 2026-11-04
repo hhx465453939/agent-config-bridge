@@ -311,6 +311,18 @@ export const DEFAULT_CONFIG = {
   /** W4 can be switched off per machine without touching the profile table. */
   script_log_check: true,
   /**
+   * Extensions whose runs must leave a `.log` of their own.
+   *
+   * Deliberately narrower than `script_extensions`: a notebook (`.ipynb`) and a
+   * knitted report (`.Rmd`) persist their own output — the executed cells and the
+   * rendered document ARE the record. Demanding a separate `.log` from them would
+   * be a guaranteed false positive on every legitimate run, and a rule that cries
+   * wolf gets switched off instead of fixed (ADR-008). They still get W1 (a
+   * Worklog before the first run), because "what am I about to compute" is just as
+   * true for a notebook.
+   */
+  log_required_extensions: ['.R', '.r', '.py'],
+  /**
    * Tolerance when comparing a file's mtime against a wall-clock timestamp.
    *
    * `Date.now()` and a filesystem timestamp do NOT agree to the millisecond —
@@ -460,6 +472,14 @@ export const normalizePolicy = (raw) => {
 const normalizeProfile = (name, def) => ({
   name: typeof def.name === 'string' && def.name !== '' ? def.name : name,
   description: typeof def.description === 'string' ? def.description : '',
+  /**
+   * Teaching text injected per turn while this profile is active.
+   *
+   * It lives on the profile rather than in `policy.json` because the reminder is
+   * injected into EVERY session: text about Worklogs in a plain JavaScript
+   * repository is noise, and noise teaches the model to ignore reminders.
+   */
+  reminder: typeof def.reminder === 'string' ? def.reminder : '',
   // Fingerprints are lists of repository-relative paths that must ALL exist.
   fingerprints: Array.isArray(def.fingerprints)
     ? def.fingerprints.filter((g) => Array.isArray(g) || typeof g === 'string')
@@ -1910,6 +1930,8 @@ export const outputArtifactFindings = ({ policy, state, fs, cwd = null, now = Da
     for (const [script, info] of state.scriptsRun) {
       const startedAt = Number.isFinite(info?.startedAt) ? info.startedAt : 0;
       if (startedAt < since) continue; // an earlier turn already answered for it
+      if (!hasExtension(script, config.log_required_extensions
+        ?? DEFAULT_CONFIG.log_required_extensions)) continue;
       // Two accepted spellings: `run.R.log` (what the W4 remediation suggests)
       // and `run.log` (what most pipelines write). Accepting only one would turn
       // a formatting preference into a blocked turn.
@@ -1988,6 +2010,12 @@ const SKIP_SCRIPT_VERBS = new Set([
   'du', 'df', 'which', 'type', 'command', 'open', 'xdg-open', 'git', 'file',
   'grep', 'rg', 'diff', 'cmp',
 ]);
+
+/** Does `file` end with one of `exts`? Case-insensitive, list may be undefined. */
+const hasExtension = (file, exts) => {
+  const lower = String(file ?? '').toLowerCase();
+  return (Array.isArray(exts) ? exts : []).some((e) => lower.endsWith(String(e).toLowerCase()));
+};
 
 /**
  * Analysis scripts a shell command would EXECUTE.
@@ -2346,6 +2374,10 @@ const CHECKS = {
       isFile: deps.isFile,
     });
     for (const script of scripts) {
+      // Notebooks and knitted reports keep their own output; see
+      // `log_required_extensions`.
+      if (!hasExtension(script, policy.config.log_required_extensions
+        ?? DEFAULT_CONFIG.log_required_extensions)) continue;
       const text = typeof deps.readText === 'function' ? deps.readText(script) : null;
       // Unreadable source is not evidence of a missing log: fail open.
       if (typeof text !== 'string') continue;
@@ -2807,17 +2839,29 @@ export const slackFinding = (text, config = DEFAULT_CONFIG) => {
  * well-behaved session is not nagged.
  */
 export const reminderFor = (policy, state, now = Date.now()) => {
-  if (!policy.reminded) return null;
-  // A session-wide signal silences the reminder, except while Layer 0 still
-  // has a specific gap: the model has queried the graph but has not read the
-  // project's conventions yet. Silence there would teach "query once, then act",
-  // which is the habit the thinking rule exists to break.
-  const conventionsPending =
-    policy.checks.includes('think-before-write') &&
-    policy.config.require_conventions &&
-    state.docReads.size === 0;
-  if (hasFreshSignal(state, policy.config.signal_ttl_ms, now) && !conventionsPending) return null;
-  return policy.reminded;
+  // The base text and the profile text have different silences, on purpose.
+  //
+  // The base reminder teaches "ask the graph first", so a fresh graph signal means
+  // it has been heard. The profile reminder teaches Worklog / log / result notes —
+  // behaviours a graph query says nothing about — so it keeps being injected while
+  // the domain is active. Silencing it after the first graph call would mean the
+  // research rules are mentioned once per session and then never again.
+  let base = null;
+  if (policy.reminded) {
+    // A session-wide signal silences the reminder, except while Layer 0 still has
+    // a specific gap: the model has queried the graph but has not read the
+    // project's conventions yet. Silence there would teach "query once, then act".
+    const conventionsPending =
+      policy.checks.includes('think-before-write') &&
+      policy.config.require_conventions &&
+      state.docReads.size === 0;
+    if (!hasFreshSignal(state, policy.config.signal_ttl_ms, now) || conventionsPending) {
+      base = policy.reminded;
+    }
+  }
+  const profileReminder = profileFor(policy, state?.profile)?.reminder ?? '';
+  const parts = [base, profileReminder].filter((t) => typeof t === 'string' && t !== '');
+  return parts.length > 0 ? parts.join('\n\n') : null;
 };
 
 export const globHelpers = { toPosix, posix };
