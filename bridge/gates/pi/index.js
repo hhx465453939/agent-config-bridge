@@ -18,10 +18,14 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  analysisScriptTargets,
   bashReadTargets,
   graphResultIsEvidence,
+  outputArtifactFindings,
   powershellReadTargets,
+  profilePolicy,
   recordIndexRefresh,
+  recordScriptRun,
   shellReadTargets,
   slackFinding,
   isChgContract,
@@ -43,6 +47,7 @@ import {
   unlockTokensFromQualifiedName,
   unlockTokensFromText,
 } from '../policy.js';
+import { classify } from '../classifier.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -63,6 +68,13 @@ export const realFs = {
       return false;
     }
   },
+  isDirectory: (p) => {
+    try {
+      return statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  },
   statMtime: (p) => {
     try {
       return statSync(p).mtimeMs;
@@ -75,6 +87,18 @@ export const realFs = {
       return readdirSync(dir);
     } catch {
       return [];
+    }
+  },
+  /**
+   * Source text of a file, for the AI4S "does the script log?" check.
+   * `null` (not a throw) when it cannot be read: an unreadable script is not
+   * evidence that its author forgot logging, so the check must abstain.
+   */
+  readText: (p) => {
+    try {
+      return readFileSync(p, 'utf8');
+    } catch {
+      return null;
     }
   },
 };
@@ -188,6 +212,15 @@ export default function enforceRules(pi, options = {}) {
   /** Set once per session so the same advisory is not repeated. */
   let noticedPolicyProblem = false;
   /**
+   * Cache of the last classification, keyed by (cwd, prompt).
+   *
+   * `before_agent_start` can fire again for the same user request (retry,
+   * recovery, compaction). Re-classifying would spend another model round trip
+   * and - worse - could land on a different answer, silently switching the rule
+   * set mid-turn for reasons the user cannot see.
+   */
+  let lastClassified = { key: null, result: null };
+  /**
    * The directory pi resolves a relative tool path against.
    *
    * pi's `read` schema accepts "relative or absolute" and resolves the relative
@@ -218,6 +251,11 @@ export default function enforceRules(pi, options = {}) {
     state.docReads.clear();
     state.failedCommands.clear();
     state.lastInvestigationAt = 0;
+    state.profile = policy.defaultProfile ?? 'general-dev';
+    state.profileSource = 'fallback';
+    state.scriptsRun.clear();
+    state.turnStart = 0;
+    lastClassified = { key: null, result: null };
     if (typeof ctx?.cwd === 'string' && ctx.cwd) sessionCwd = ctx.cwd;
     if (error) {
       // A gate that cannot load its policy is OFF. Say so loudly: in a headless
@@ -239,6 +277,51 @@ export default function enforceRules(pi, options = {}) {
     }
   });
 
+  /**
+   * v5: classify the session's domain once per user turn.
+   *
+   * Deliberately HERE and not in `tool_call`. `tool_call` runs for every single
+   * tool invocation, so a model-backed judge there would add a network round trip
+   * to every read — the kind of latency that gets a gate uninstalled. This event
+   * fires once per user request, which is the right granularity for "what kind of
+   * work is this?"
+   *
+   * Runs started by `pi.sendMessage(..., { triggerTurn: true })` carry no prompt
+   * (`messageType === 'custom'`). They continue work the user already asked for,
+   * so the previous classification is kept instead of being re-derived from an
+   * empty prompt — which would always answer `general-dev`.
+   */
+  pi.on('before_agent_start', async (event, ctx) => {
+    const cwd = cwdFor(ctx) ?? '';
+    // A new user turn is the boundary the output checks (W2) compare mtimes to.
+    state.turnStart = Date.now();
+    if (event?.messageType === 'custom') return;
+    const prompt = typeof event?.prompt === 'string' ? event.prompt : '';
+    const key = `${cwd}\u0000${prompt}`;
+    if (lastClassified.key === key && lastClassified.result) {
+      state.profile = lastClassified.result.profile;
+      state.profileSource = lastClassified.result.source;
+      return;
+    }
+    const result = await classify({
+      cwd,
+      prompt,
+      fs: realFs,
+      policy,
+      // No judge is wired by default (`classifier.model_judge` is false), so T2
+      // is normally skipped. A host may inject one; tests always do not.
+      modelHint: typeof options.modelHint === 'function' ? options.modelHint : null,
+    });
+    lastClassified = { key, result };
+    state.profile = result.profile;
+    state.profileSource = result.source;
+    if (result.source !== 'fingerprint' && ctx?.hasUI) {
+      // A fingerprint hit is a fact, not news; the weaker verdicts are worth one
+      // line so a mis-classification is visible instead of silent.
+      ctx.ui.notify(`enforce-rules: domain ${result.profile} (${result.source})`, 'info');
+    }
+  });
+
   pi.on('tool_call', async (event, ctx) => {
     // MCP gateway: the real tool and its arguments live under input.tool/args.
     // Before v4 the adapter returned early for every `mcp` call, so a proxied
@@ -249,6 +332,10 @@ export default function enforceRules(pi, options = {}) {
     const input = proxied ? (event.input?.args ?? {}) : event.input;
     const shell = name === 'powershell' ? 'powershell' : 'bash';
     const cwd = cwdFor(ctx);
+    // The profile decides the check LIST, never the signature: `shouldBlock`
+    // still receives `{policy, input, state, fs}`, so the rule layer never learns
+    // that domains exist (ADR-003 §strategy/adapter split).
+    const effective = profilePolicy(policy, state.profile);
 
     // Remember what this session wrote: reading your own output is never a
     // violation, and blocking it would make the gate fight normal development.
@@ -262,7 +349,7 @@ export default function enforceRules(pi, options = {}) {
       const path = normalizePath(inputPath(input), cwd);
       const content = inputContent(input);
       const verdict = shouldBlock({
-        policy,
+        policy: effective,
         input: { action: 'write', path, tool: name, content },
         state,
         fs: realFs,
@@ -287,14 +374,15 @@ export default function enforceRules(pi, options = {}) {
     // cosmetic (2026-10-16). PowerShell was added in v4 because enabling that
     // tool used to be a full bypass on Windows.
     if (name === 'bash' || name === 'powershell') {
+      const command = typeof input?.command === 'string' ? input.command : '';
       const verdict = shouldBlock({
-        policy,
+        policy: effective,
         input: {
           action: 'bash',
           path: null,
           tool: name,
           shell,
-          command: typeof input?.command === 'string' ? input.command : '',
+          command,
           cwd,
         },
         state,
@@ -309,13 +397,23 @@ export default function enforceRules(pi, options = {}) {
         }
         return { block: true, reason: verdict.reason };
       }
+      // AI4S: remember the script this call is about to run. W1 uses the key set
+      // to ask for a Worklog only on the FIRST run of a given script, and the
+      // turn-end W4 check uses `startedAt` to date the log it expects.
+      for (const script of analysisScriptTargets(command, {
+        config: effective.config,
+        cwd,
+        isFile: realFs.isFile,
+      })) {
+        recordScriptRun(state, script);
+      }
       return;
     }
 
     if (!READ_TOOLS.has(name)) return;
 
     const verdict = shouldBlock({
-      policy,
+      policy: effective,
       input: { action: 'read', path: normalizePath(inputPath(input), cwd), tool: name },
       state,
       fs: realFs,
@@ -463,9 +561,46 @@ export default function enforceRules(pi, options = {}) {
    */
   pi.on('turn_end', async (event, ctx) => {
     if (event.message?.role !== 'assistant') return;
-    if (policy.config.slack_check === false) return;
     const max = policy.config.slack_max_continues ?? 0;
     if (max <= 0 || state.slackContinues >= max) return;
+
+    // AI4S output artifacts (W4 log file / W2 result README). Deliberately a
+    // `continue` and not a `deny`: both are discovered after the computation has
+    // finished, and one more turn is enough to fix them. Blocking a call that
+    // already completed would only break a finished analysis.
+    //
+    // `outputArtifactFindings` returns [] for a general-dev session (no result
+    // dirs, no scripts), so the cost on ordinary work is one Map lookup.
+    const effective = profilePolicy(policy, state.profile);
+    const artifacts = outputArtifactFindings({
+      policy: effective,
+      state,
+      fs: realFs,
+      cwd: cwdFor(ctx),
+    });
+    if (artifacts.length > 0) {
+      state.slackContinues += 1;
+      if (ctx?.hasUI) {
+        ctx.ui.notify(
+          `enforce-rules [${artifacts[0].code}] continue ${state.slackContinues}/${max}`,
+          'warn',
+        );
+      }
+      return {
+        continue: true,
+        entries: [
+          ...(event.entries ?? []),
+          {
+            type: 'custom_message',
+            customType: 'enforce-rules-ai4s-output',
+            content: artifacts.map((f) => f.reason).join('\n\n'),
+            display: false,
+          },
+        ],
+      };
+    }
+
+    if (policy.config.slack_check === false) return;
 
     const finding = slackFinding(resultText(event.message), policy.config);
     if (!finding) return;

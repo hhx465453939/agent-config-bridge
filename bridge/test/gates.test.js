@@ -799,6 +799,12 @@ test('gates: the installed layout really loads (the bug that shipped)', async ()
   try {
     const gates = new URL('../gates/', import.meta.url);
     cpSync(new URL('policy.js', gates), join(dir, 'policy.js'));
+    // v5: the adapters import ../classifier.js and policy.json names profiles that
+    // must resolve from <gate>/profiles. Both are part of what `planGateInstall`
+    // copies now, so this mirror includes them — omitting them makes the gate fail
+    // to load rather than degrade.
+    cpSync(new URL('classifier.js', gates), join(dir, 'classifier.js'));
+    cpSync(new URL('profiles', gates), join(dir, 'profiles'), { recursive: true });
     cpSync(new URL('pi/policy.json', gates), join(dir, 'policy.json'));
     mkdirSync(join(dir, 'pi'), { recursive: true });
     cpSync(new URL('pi/index.js', gates), join(dir, 'pi', 'index.js'));

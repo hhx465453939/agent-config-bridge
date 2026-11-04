@@ -1,7 +1,7 @@
 {
   "name": "graph-first-gate",
-  "version": 4,
-  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces. v4 inherits the engine fixes that do not depend on harness hooks: the block cap is now a 30-minute sliding window of 200 instead of a lifetime 30, PowerShell/MCP-aware helpers exist in the shared engine, and a bare email is no longer treated as a credential. dsh still has no result hook and no per-turn context injection, so graph_signal_requires_content stays off and the checks that need result/read evidence (think-before-write, no-blind-retry, chg-contract-before-edit) are intentionally NOT enabled here. bash reads remain gated.",
+  "version": 5,
+  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces. v4 inherits the engine fixes that do not depend on harness hooks: the block cap is now a 30-minute sliding window of 200 instead of a lifetime 30, PowerShell/MCP-aware helpers exist in the shared engine, and a bare email is no longer treated as a credential. dsh still has no result hook and no per-turn context injection, so graph_signal_requires_content stays off and the checks that need result/read evidence (think-before-write, no-blind-retry, chg-contract-before-edit) are intentionally NOT enabled here. bash reads remain gated. v5 adds domain profiles: there is no before_agent_start hook here, so the adapter classifies lazily on the first tool event and behaves as general-dev until it has an answer. The turn-end output checks (W2, W4 log) are pi-only because dsh has no turn boundary to compare against.",
   "reminder": "",
   "checks": [
     "no-write-outside",
@@ -10,6 +10,17 @@
     "graph-before-read",
     "bash-graph-before-read"
   ],
+  "default_profile": "general-dev",
+  "profiles": ["ai4s-dry-lab", "ai4s-quant"],
+  "classifier": {
+    "enabled": true,
+    "model_judge": false,
+    "timeout_ms": 8000,
+    "external_judge": {
+      "enabled": false,
+      "note": "kept as a field only; calling an external judge is out of scope for v5"
+    }
+  },
   "config": {
     "project_roots": [],
     "exclude_globs": [
@@ -35,6 +46,12 @@
     "require_conventions": false,
     "max_identical_failures": 2,
     "retry_window_ms": 600000,
-    "destructive_allow_patterns": []
+    "destructive_allow_patterns": [],
+    "profiles_dir": "profiles",
+    "worklog_path": "docs/WORKLOG.md",
+    "worklog_ttl_ms": 1800000,
+    "result_dirs": [],
+    "readme_prefix": "README_",
+    "script_log_check": true
   }
 }

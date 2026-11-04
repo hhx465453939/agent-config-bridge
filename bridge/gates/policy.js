@@ -40,10 +40,57 @@
  * rules are expressed as explicit checks rather than as "policy failed to load".
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, normalize, posix, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const WIN32 = process.platform === 'win32';
+
+/**
+ * Real-filesystem probes the loader uses itself.
+ *
+ * Adapters inject their own probe object (they must be TOTAL — answer, never
+ * throw); this one exists so loading a policy can read the sibling `profiles/`
+ * directory without the caller having to supply a filesystem it never touched.
+ */
+const NODE_FS = {
+  exists: (p) => existsSync(p),
+  isFile: (p) => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  },
+  isDirectory: (p) => {
+    try {
+      return statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  },
+  statMtime: (p) => {
+    try {
+      return statSync(p).mtimeMs;
+    } catch {
+      return 0;
+    }
+  },
+  listDir: (p) => {
+    try {
+      return readdirSync(p);
+    } catch {
+      return [];
+    }
+  },
+  readText: (p) => {
+    try {
+      return readFileSync(p, 'utf8');
+    } catch {
+      return null;
+    }
+  },
+};
 
 /** Cached "newest mtime inside the index marker directory", keyed by directory. */
 const mtimeCache = new Map();
@@ -229,6 +276,53 @@ export const DEFAULT_CONFIG = {
     '.turbo', '.parcel-cache', 'tmp', 'temp',
   ],
   destructive_allow_patterns: [],
+
+  // -------------------------------------------------------------------------
+  // v5: domain profiles (AI4S dry lab / quant)
+  // -------------------------------------------------------------------------
+  /**
+   * Domain profile used when the classifier could not name one.
+   *
+   * `general-dev` is deliberately NOT a profile definition: it means "base
+   * checks only", i.e. exactly what the gate did before v5. Defining it as a
+   * real profile would make "no domain" and "a domain that adds nothing"
+   * indistinguishable, and would give the fallback path a rule set to drift.
+   */
+  default_profile: 'general-dev',
+  /** Where profile definitions are looked up, relative to the policy file. */
+  profiles_dir: 'profiles',
+  /**
+   * W1: a research script may not be the first thing that happens after a long
+   * gap. Requiring a fresh Worklog is what turns "write down what you are about
+   * to do" from a suggestion into a gate — and it is cheapest to satisfy *before*
+   * the run, while nothing has been computed yet.
+   */
+  worklog_path: 'docs/WORKLOG.md',
+  worklog_ttl_ms: 30 * 60 * 1000,
+  /**
+   * W2: result directories whose every touched subdirectory must carry a note
+   * file (`<readme_prefix>...`) explaining what it holds. Empty by default, so a
+   * non-research repository never sees this rule.
+   */
+  result_dirs: [],
+  readme_prefix: 'README_',
+  /** W4: extensions that count as an analysis script (run before/after checks). */
+  script_extensions: ['.R', '.Rmd', '.r', '.py', '.ipynb'],
+  /** W4 can be switched off per machine without touching the profile table. */
+  script_log_check: true,
+  /**
+   * Tolerance when comparing a file's mtime against a wall-clock timestamp.
+   *
+   * `Date.now()` and a filesystem timestamp do NOT agree to the millisecond —
+   * measured on a real host, a file written *after* `t` can carry an mtime a few
+   * milliseconds *before* `t` (clock granularity, filesystem timestamp rounding).
+   * The same trap is why `index_mtime_epsilon_ms` exists for the index check.
+   *
+   * Without it, "this run produced its log" is judged false for the log it just
+   * produced — a guaranteed false positive on every run, which is worse than the
+   * odd stale log slipping through.
+   */
+  artifact_mtime_epsilon_ms: 2000,
 };
 
 export const POLICY_FILENAME = 'policy.json';
@@ -247,10 +341,34 @@ export const loadPolicy = (fileOrUrl) => {
   try {
     const text = readFileSync(fileOrUrl, 'utf8');
     const parsed = JSON.parse(text);
-    return { ok: true, policy: normalizePolicy(parsed), error: null };
+    const policy = normalizePolicy(parsed);
+    return { ok: true, policy: attachProfiles(policy, profileDirsFor(fileOrUrl, policy), NODE_FS), error: null };
   } catch (err) {
     return { ok: false, policy: null, error: `${fileOrUrl}: ${err?.message ?? err}` };
   }
+};
+
+/**
+ * Where to look for `profiles/`, in order.
+ *
+ * Two layouts have to work, and getting this wrong fails SILENTLY (every session
+ * silently falls back to `general-dev`):
+ *
+ *   repo checkout : bridge/gates/pi/policy.json  -> ../profiles
+ *   installed     : <gate dir>/policy.json       -> ./profiles
+ *
+ * Both are returned; `attachProfiles` takes the first directory that has the file.
+ */
+const profileDirsFor = (fileOrUrl, policy) => {
+  let base;
+  try {
+    base = fileOrUrl instanceof URL ? fileURLToPath(fileOrUrl) : String(fileOrUrl);
+  } catch {
+    return [];
+  }
+  const name = policy.config.profiles_dir ?? 'profiles';
+  const dir = dirname(base);
+  return [join(dir, name), join(dir, '..', name)];
 };
 
 /** The signature the config accepts in place of a file path. */
@@ -274,6 +392,20 @@ export const normalizePolicy = (raw) => {
     const n = raw === null || raw === undefined || raw === '' ? NaN : Number(raw);
     config[key] = Number.isFinite(n) && n >= 0 ? n : DEFAULT_CONFIG[key];
   }
+
+  // Two accepted shapes for `profiles`; see the comment in the return below.
+  const profiles = new Map();
+  const pendingProfiles = [];
+  if (Array.isArray(raw?.profiles)) {
+    for (const item of raw.profiles) {
+      if (typeof item === 'string' && item !== '') pendingProfiles.push(item);
+    }
+  } else if (raw?.profiles && typeof raw.profiles === 'object') {
+    for (const [name, def] of Object.entries(raw.profiles)) {
+      if (def && typeof def === 'object') profiles.set(name, normalizeProfile(name, def));
+    }
+  }
+
   return {
     name: typeof raw?.name === 'string' ? raw.name : 'unnamed-gate',
     version: raw?.version ?? 1,
@@ -281,6 +413,176 @@ export const normalizePolicy = (raw) => {
     reminded: typeof raw?.reminder === 'string' ? raw.reminder : '',
     checks: Array.isArray(raw?.checks) ? raw.checks : [],
     config,
+    // --- v5: domain profiles ---------------------------------------------
+    // `profiles` arrives in one of two shapes and both must work:
+    //   array of names      -> policy.json; the definitions live in profiles/ and
+    //                          `attachProfiles` fills them in at load time
+    //   object of objects   -> an in-memory policy (tests, a host that injects one)
+    // Anything else is ignored rather than fatal: a typo must degrade to
+    // "general-dev", never to a gate that refuses to start.
+    defaultProfile:
+      typeof raw?.default_profile === 'string' && raw.default_profile !== ''
+        ? raw.default_profile
+        : DEFAULT_CONFIG.default_profile,
+    profiles,
+    pendingProfiles: pendingProfiles,
+    profileOrder: [...profiles.keys()],
+    classifier: {
+      enabled: raw?.classifier?.enabled !== false,
+      model_judge: raw?.classifier?.model_judge === true,
+      timeout_ms: Number.isFinite(raw?.classifier?.timeout_ms)
+        ? raw.classifier.timeout_ms
+        : 8000,
+      // Kept as a field only. Calling an external judge is out of scope for this
+      // change (the user confirmed it is not needed yet); leaving the key here
+      // documents the intent without pretending it works.
+      external_judge: raw?.classifier?.external_judge ?? { enabled: false },
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
+// Domain profiles (v5)
+// ---------------------------------------------------------------------------
+
+/**
+ * One profile definition, normalized.
+ *
+ * A profile is a NAMED CHECK SET plus the config those checks read — nothing
+ * else. Keeping it that small is the point: the adapter asks "which name is
+ * active?" and the policy layer answers with a check list. No harness and no
+ * session context crosses that boundary.
+ *
+ * Every field is optional and defaulted: a hand-written profile JSON is the
+ * normal way these get created, and a missing key must produce "adds nothing"
+ * rather than a throw at load time.
+ */
+const normalizeProfile = (name, def) => ({
+  name: typeof def.name === 'string' && def.name !== '' ? def.name : name,
+  description: typeof def.description === 'string' ? def.description : '',
+  // Fingerprints are lists of repository-relative paths that must ALL exist.
+  fingerprints: Array.isArray(def.fingerprints)
+    ? def.fingerprints.filter((g) => Array.isArray(g) || typeof g === 'string')
+    : [],
+  keywords: {
+    min_hits: Number.isInteger(def.keywords?.min_hits) ? def.keywords.min_hits : 2,
+    strong: Array.isArray(def.keywords?.strong)
+      ? def.keywords.strong.filter((w) => typeof w === 'string' && w !== '')
+      : [],
+    weak: Array.isArray(def.keywords?.weak)
+      ? def.keywords.weak.filter((w) => typeof w === 'string' && w !== '')
+      : [],
+  },
+  checks: Array.isArray(def.checks) ? def.checks.filter((c) => typeof c === 'string') : [],
+  config: def.config && typeof def.config === 'object' ? def.config : {},
+});
+
+/**
+ * Read a `profiles/` directory into `name -> profile`.
+ *
+ * Returns null when the directory does not exist, which the caller must treat as
+ * "profiles unavailable" (every session degrades to the default profile, and the
+ * adapter can say so) — never as "no profiles needed".
+ */
+export const profilesFromDir = (dir, fs = NODE_FS) => {
+  if (typeof dir !== 'string' || dir === '') return null;
+  if (!fs?.exists?.(dir) || typeof fs.listDir !== 'function') return null;
+  const table = new Map();
+  for (const file of fs.listDir(dir)) {
+    if (typeof file !== 'string' || !file.endsWith('.json')) continue;
+    const text = typeof fs.readText === 'function' ? fs.readText(join(dir, file)) : null;
+    if (typeof text !== 'string') continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      continue; // an unparsable profile contributes nothing; it must not be fatal
+    }
+    if (!parsed || typeof parsed !== 'object') continue;
+    const name = typeof parsed.name === 'string' && parsed.name !== ''
+      ? parsed.name
+      : file.slice(0, -5);
+    table.set(name, normalizeProfile(name, parsed));
+  }
+  return table;
+};
+
+/**
+ * Fill in the profiles a policy only named.
+ *
+ * Inline profiles (an object in the policy) always win over files on disk: a host
+ * that injects a policy object is stating what it wants, and disk contents
+ * discovered later must not silently override it. Names that cannot be resolved
+ * stay in `pendingProfiles` so `status`/tests can report the gap instead of the
+ * session quietly losing a rule set.
+ */
+export const attachProfiles = (policy, dirs = [], fs = NODE_FS) => {
+  const pending = Array.isArray(policy?.pendingProfiles) ? policy.pendingProfiles : [];
+  if (pending.length === 0) return policy;
+  const onDisk = new Map();
+  for (const dir of Array.isArray(dirs) ? dirs : [dirs]) {
+    const table = profilesFromDir(dir, fs);
+    if (!table) continue;
+    for (const [name, def] of table) if (!onDisk.has(name)) onDisk.set(name, def);
+  }
+  const missing = [];
+  for (const name of pending) {
+    if (policy.profiles.has(name)) continue;
+    const def = onDisk.get(name);
+    if (def) policy.profiles.set(name, def);
+    else missing.push(name);
+  }
+  policy.pendingProfiles = missing;
+  policy.profileOrder = [...policy.profiles.keys()];
+  return policy;
+};
+
+/** The definition a name resolves to, or null (`general-dev` always resolves to null). */
+export const profileFor = (policy, profile = null) => {
+  const name = typeof profile === 'string' && profile !== ''
+    ? profile
+    : policy?.defaultProfile ?? DEFAULT_CONFIG.default_profile;
+  if (name === DEFAULT_CONFIG.default_profile) return null;
+  const table = policy?.profiles;
+  if (table instanceof Map) return table.get(name) ?? null;
+  return table && typeof table === 'object' ? table[name] ?? null : null;
+};
+
+/**
+ * The checks that actually run for a profile: base list first, then the
+ * profile's own additions, de-duplicated in order.
+ *
+ * `general-dev` (or an unknown name) adds nothing, which is why "the base check
+ * list is unchanged for general-dev" needs no code at all: there is no branch to
+ * get wrong. A profile can only ADD checks; it can never remove a safety rule.
+ */
+export const activeChecks = (policy, profile = null) => {
+  const base = Array.isArray(policy?.checks) ? policy.checks : [];
+  const extra = profileFor(policy, profile)?.checks ?? [];
+  const out = [];
+  for (const name of [...base, ...extra]) {
+    if (typeof name === 'string' && name !== '' && !out.includes(name)) out.push(name);
+  }
+  return out;
+};
+
+/**
+ * The policy a check sees for one session: same object, trimmed check list, and
+ * the active profile's config merged over the base config.
+ *
+ * This is the ONLY thing the adapters hand to `shouldBlock`. The session context
+ * (which domain, why, when the turn started) stays in `state`; nothing harness-
+ * shaped leaks into the rule layer, which is what keeps the dsh adapter from
+ * having to imitate a context object it does not have (ADR-003).
+ */
+export const profilePolicy = (policy, profile = null) => {
+  const def = profileFor(policy, profile);
+  return {
+    ...policy,
+    checks: activeChecks(policy, profile),
+    config: def?.config && typeof def.config === 'object'
+      ? { ...policy.config, ...def.config }
+      : policy.config,
   };
 };
 
@@ -452,6 +754,27 @@ export const newSessionState = () => ({
   lastIndexRefreshAt: 0,
   /** How many no-slack continuations have been issued this session. */
   slackContinues: 0,
+  /**
+   * v5: the active domain profile, and where that answer came from.
+   *
+   * Starts at `general-dev` / `fallback` on purpose: until a hook has actually
+   * classified, the gate must behave exactly as it did before v5. A guess at
+   * startup would apply research rules to a session nobody has looked at yet.
+   */
+  profile: DEFAULT_CONFIG.default_profile,
+  profileSource: 'fallback',
+  /**
+   * Analysis scripts this session started, keyed by normalized path, valued
+   * `{ startedAt }`. W1 uses the key set for "is this the first run?"; the
+   * turn-end W4 check uses `startedAt` to date the expected `.log` file.
+   */
+  scriptsRun: new Map(),
+  /**
+   * Start of the current user turn (ms). W2 only judges result directories that
+   * something touched AFTER this instant, so an old directory without a README
+   * - which nobody is working on right now - is not a finding.
+   */
+  turnStart: 0,
   /** Reasons already surfaced, so the user is not shouted at every turn. */
   announced: new Set(),
 });
@@ -1518,8 +1841,10 @@ export const shellDestructiveFinding = (input, opts = {}) =>
 const NO_FS = {
   exists: () => false,
   isFile: () => false,
+  isDirectory: () => false,
   statMtime: () => 0,
   listDir: () => [],
+  readText: () => null,
 };
 
 /** Newest mtime inside a directory, or 0 when it cannot be read. */
@@ -1547,9 +1872,194 @@ export const newestMtimeIn = (dir, fs, now = Date.now(), ttlMs = 0) => {
  */
 export const resetMtimeCache = () => mtimeCache.clear();
 
+/**
+ * AI4S turn-end findings: W4 (run half) + W2.
+ *
+ * Both are OUTPUT-shape problems, and output problems are discovered after the
+ * computation. That is why they are findings for a `continue` (one more turn to
+ * fix) rather than denials: blocking a call that already finished teaches
+ * nothing and breaks a completed analysis.
+ *
+ * Returns `[]` when there is nothing to judge. In particular it returns `[]`
+ * when the session never recorded a turn start: without a boundary there is no
+ * "this turn's output", and judging the whole history would flag every old
+ * directory on the machine.
+ *
+ * @param {object} args
+ * @param {object} args.policy  normalized (profile-applied) policy
+ * @param {object} args.state   session state from newSessionState()
+ * @param {object} args.fs      probe set: {exists, isFile, statMtime, listDir, readText}
+ * @param {string} [args.cwd]   session directory the relative result dirs hang off
+ * @param {number} [args.now]
+ * @returns {Array<{code:string, reason:string, path:string}>}
+ */
+export const outputArtifactFindings = ({ policy, state, fs, cwd = null, now = Date.now() } = {}) => {
+  const config = policy?.config ?? DEFAULT_CONFIG;
+  const probes = { ...NO_FS, ...(fs ?? {}) };
+  const since = Number.isFinite(state?.turnStart) ? state.turnStart : 0;
+  if (since <= 0) return [];
+  // See `artifact_mtime_epsilon_ms`: file timestamps and Date.now() disagree by a
+  // few milliseconds in both directions, so every comparison below is tolerant.
+  const epsilon = Number.isFinite(config.artifact_mtime_epsilon_ms)
+    ? config.artifact_mtime_epsilon_ms
+    : DEFAULT_CONFIG.artifact_mtime_epsilon_ms;
+  const findings = [];
+
+  // --- W4 (run half): every script started this turn must have left a log ----
+  if (config.script_log_check !== false && state?.scriptsRun instanceof Map) {
+    for (const [script, info] of state.scriptsRun) {
+      const startedAt = Number.isFinite(info?.startedAt) ? info.startedAt : 0;
+      if (startedAt < since) continue; // an earlier turn already answered for it
+      // Two accepted spellings: `run.R.log` (what the W4 remediation suggests)
+      // and `run.log` (what most pipelines write). Accepting only one would turn
+      // a formatting preference into a blocked turn.
+      const stem = script.replace(/\.[^./\\]+$/, '');
+      const candidates = [`${script}.log`, `${stem}.log`];
+      const log = candidates.find(
+        (p) => probes.isFile(p) && probes.statMtime(p) >= startedAt - epsilon,
+      );
+      if (log) continue;
+      findings.push({
+        code: 'AI4S_SCRIPT_LOG_MISSING',
+        path: script,
+        reason: [
+          '⛔ AI4S 域控 · W4 提醒：本轮跑过的脚本没有留下日志文件。',
+          `  脚本：${script}`,
+          `  期待：${candidates.join(' 或 ')}（mtime 不早于启动时刻）`,
+          '',
+          '把输出重定向到日志（如 `Rscript run.R 2>&1 | tee run.R.log`），',
+          '或让脚本自己 sink / logging 写文件。日志是这几月后唯一能复核的现场。',
+        ].join('\n'),
+      });
+    }
+  }
+
+  // --- W2: a result subdirectory touched this turn needs a note --------------
+  const resultDirs = Array.isArray(config.result_dirs) ? config.result_dirs : [];
+  const prefix = String(config.readme_prefix ?? DEFAULT_CONFIG.readme_prefix).toLowerCase();
+  if (resultDirs.length > 0 && prefix !== '' && typeof cwd === 'string' && cwd !== '') {
+    for (const rel of resultDirs) {
+      if (typeof rel !== 'string' || rel === '') continue;
+      const dir = normalizePath(join(cwd, rel));
+      if (!probes.exists(dir)) continue;
+      for (const child of probes.listDir(dir)) {
+        const childPath = normalizePath(join(dir, child));
+        // "Touched this turn" is derived from the newest mtime INSIDE the entry,
+        // so a plain file in `results/` is skipped without needing an extra
+        // isDirectory probe: a file has no entries, hence no mtime, hence 0.
+        const newest = newestMtimeIn(childPath, probes, now, 0);
+        if (newest < since - epsilon) continue;
+        const annotated = probes.listDir(childPath)
+          .some((name) => String(name).toLowerCase().startsWith(prefix));
+        if (annotated) continue;
+        findings.push({
+          code: 'AI4S_RESULT_README',
+          path: childPath,
+          reason: [
+            '⛔ AI4S 域控 · W2 提醒：本轮更新的结果目录没有说明文件。',
+            `  目录：${childPath}`,
+            `  期待：目录下有一个以 ${config.readme_prefix ?? DEFAULT_CONFIG.readme_prefix} 开头的文件`,
+            '',
+            '写一句：这个目录是什么、用哪个脚本跑的、关键参数、怎么读。',
+            '半年后打开 results/ 的人（包括你自己）靠它才知道哪张图是什么。',
+          ].join('\n'),
+        });
+      }
+    }
+  }
+
+  return findings;
+};
+
 // ---------------------------------------------------------------------------
 // Checks
 // ---------------------------------------------------------------------------
+
+/**
+ * Verbs whose operands mention a script but do not execute it.
+ *
+ * `cat annotate.R` is reading the script, and demanding a Worklog for it would
+ * make the rule hate its own debugging: the model must be free to open the file
+ * to see what it is about to run.
+ */
+const SKIP_SCRIPT_VERBS = new Set([
+  ...BASH_READ_VERBS,
+  'ls', 'dir', 'vdir', 'tree', 'find', 'echo', 'printf', 'test', '[', 'stat',
+  'du', 'df', 'which', 'type', 'command', 'open', 'xdg-open', 'git', 'file',
+  'grep', 'rg', 'diff', 'cmp',
+]);
+
+/**
+ * Analysis scripts a shell command would EXECUTE.
+ *
+ * Only existing files with an analysis extension count, and only when the verb
+ * is an executor — a path-shaped argument is not a run. Kept deliberately
+ * conservative: a false positive here asks for a Worklog update, a false
+ * negative skips one rule set, and the second is the cheaper mistake.
+ */
+export const analysisScriptTargets = (
+  command,
+  { config = DEFAULT_CONFIG, cwd = null, isFile = defaultIsFile } = {},
+) => {
+  if (typeof command !== 'string' || command === '') return [];
+  const exts = (config.script_extensions ?? DEFAULT_CONFIG.script_extensions)
+    .map((e) => String(e).toLowerCase());
+  if (exts.length === 0) return [];
+  const found = [];
+  for (const rawSegment of splitShellSegments(command)) {
+    const segment = rawSegment.trim();
+    if (segment === '') continue;
+    const tokens = shellTokens(segment);
+    if (tokens.length === 0) continue;
+    const { verb, args } = parseCommandHead(tokens);
+    if (!verb || SKIP_SCRIPT_VERBS.has(verb)) continue;
+    for (const arg of args) {
+      const value = arg?.value;
+      if (typeof value !== 'string' || value === '' || value.startsWith('-')) continue;
+      const lowerValue = value.toLowerCase();
+      if (!exts.some((ext) => lowerValue.endsWith(ext))) continue;
+      const resolved = resolveShellPath(value, cwd);
+      if (!resolved || !isFile(resolved)) continue;
+      found.push(resolved);
+    }
+  }
+  return [...new Set(found)];
+};
+
+/**
+ * Remember that this session started an analysis script.
+ *
+ * `startedAt` is refreshed on every run (the turn-end check dates the expected
+ * `.log` against the latest one), while the KEY's presence is what makes W1 a
+ * "first run only" rule — a long pipeline must not be interrupted by a Worklog
+ * demand before every step.
+ */
+export const recordScriptRun = (state, scriptPath, now = Date.now()) => {
+  const norm = normalizePath(scriptPath);
+  if (!norm || !(state?.scriptsRun instanceof Map)) return;
+  state.scriptsRun.set(norm, { startedAt: now });
+};
+
+/** R: `sink()` / `Sys.time()` / log4r / logger / futile.logger. */
+const R_LOG_INIT = /\bsink\s*\(|\bSys\.time\s*\(|\blog4r\b|\blogger\s*::|\bfutile\.logger/;
+/** Python: the logging module (or loguru), which is the only portable answer. */
+const PY_LOG_INIT = /\blogging\s*\.|\bFileHandler\b|\bbasicConfig\s*\(|\bloguru\b/;
+
+/**
+ * Does this script set up a log sink of its own?
+ *
+ * Static and shallow ON PURPOSE: the question is "did the author remember to
+ * leave a trace", not "is the logging correct". A deep answer is not decidable
+ * without running the script, and a rule that cannot be checked is worse than no
+ * rule.
+ */
+export const hasLogInitialization = (text, scriptPath = '') => {
+  if (typeof text !== 'string') return false;
+  const ext = String(scriptPath).toLowerCase();
+  if (ext.endsWith('.r') || ext.endsWith('.rmd')) return R_LOG_INIT.test(text);
+  if (ext.endsWith('.py') || ext.endsWith('.ipynb')) return PY_LOG_INIT.test(text);
+  return R_LOG_INIT.test(text) || PY_LOG_INIT.test(text);
+};
 
 /**
  * A check answers one question about one tool call and returns either null
@@ -1761,6 +2271,102 @@ const CHECKS = {
         '不要靠“再跑一次看看”推进。',
       ].join('\n'),
     };
+  },
+
+  /**
+   * AI4S W1: an analysis script may not be the first thing that runs after a
+   * long gap — the Worklog has to be fresher than `worklog_ttl_ms`.
+   *
+   * Only the FIRST run of a given script in a session is judged: a stepwise
+   * pipeline (`01_qc.R`, `02_annotate.R`, …) would otherwise demand a Worklog
+   * edit before every step, which turns the rule into a tax and gets it disabled.
+   *
+   * Blocking BEFORE the run is the whole point: nothing has been computed yet, so
+   * the fix (write down the plan) costs one edit. After the run it is a
+   * retrospective entry nobody reads.
+   */
+  'ai4s-worklog-before-run': (policy, input, deps) => {
+    if (input.action !== 'bash') return null;
+    const config = policy.config;
+    const firstRun = analysisScriptTargets(input.command, {
+      config,
+      cwd: input.cwd ?? null,
+      isFile: deps.isFile,
+    }).find((script) => !deps.state.scriptsRun.has(normalizePath(script)));
+    if (!firstRun) return null;
+
+    const norm = normalizePath(firstRun);
+    // The Worklog lives at the project root, which the path itself tells us: a
+    // script outside any repository cannot be judged, and guessing a root would
+    // scope the rule to whatever directory the agent happened to start in.
+    const root = scopeOf(norm, { config, exists: deps.exists }).root
+      ?? findRepoRoot(norm, deps.exists);
+    if (!root) return null; // unknown project: fail open, see ADR-010 §fail-open
+
+    const rel = config.worklog_path ?? DEFAULT_CONFIG.worklog_path;
+    const worklog = normalizePath(join(root, rel));
+    const ttl = Number.isFinite(config.worklog_ttl_ms)
+      ? config.worklog_ttl_ms
+      : DEFAULT_CONFIG.worklog_ttl_ms;
+    const mtime = typeof deps.statMtime === 'function' ? deps.statMtime(worklog) : 0;
+    if (mtime > 0 && deps.now - mtime <= ttl) return null;
+
+    const age = mtime > 0 ? Math.round((deps.now - mtime) / 60000) : null;
+    return {
+      code: 'AI4S_WORKLOG',
+      reason: [
+        '⛔ AI4S 域控 · W1 拦截：跑分析脚本之前没有一份新鲜的 Worklog。',
+        `  脚本：${norm}`,
+        `  Worklog：${worklog}${age === null ? '（不存在）' : `（最后更新 ${age} 分钟前）`}`,
+        `  窗口：${Math.round(ttl / 60000)} 分钟`,
+        '',
+        '先把这一轮要做的事写进 Worklog（目标 / 输入数据 / 关键参数 / 预期产出），再跑：',
+        `  - 要做什么、为什么这么做；`,
+        `  - 输入数据与筛选条件；`,
+        '  - 预期产出的目录与文件；',
+        '  - 已知风险与回退方式。',
+        '这不是形式主义：Worklog 是几个月后唯一能回答“当时为什么这么跑”的记录。',
+      ].join('\n'),
+    };
+  },
+
+  /**
+   * AI4S W4 (run half): the script itself must set up a log sink.
+   *
+   * Static and cheap. A run whose output lives only in the agent's scrollback is
+   * unrecoverable — the session ends, the numbers are gone. Checking the source
+   * before the run is the last moment where the fix is free.
+   */
+  'ai4s-script-log-source': (policy, input, deps) => {
+    if (input.action !== 'bash') return null;
+    if (policy.config.script_log_check === false) return null;
+    const scripts = analysisScriptTargets(input.command, {
+      config: policy.config,
+      cwd: input.cwd ?? null,
+      isFile: deps.isFile,
+    });
+    for (const script of scripts) {
+      const text = typeof deps.readText === 'function' ? deps.readText(script) : null;
+      // Unreadable source is not evidence of a missing log: fail open.
+      if (typeof text !== 'string') continue;
+      if (hasLogInitialization(text, script)) continue;
+      const isR = /\.r(?:md)?$/i.test(script);
+      return {
+        code: 'AI4S_SCRIPT_LOG',
+        reason: [
+          '⛔ AI4S 域控 · W4 拦截：分析脚本没有日志初始化，跑完输出就只剩会话里的滚屏。',
+          `  脚本：${script}`,
+          '',
+          '给脚本加一段日志初始化，再跑：',
+          isR
+            ? '  R：  log_file <- file.path("logs", paste0(basename(sys.frame(1)$ofile %||% "run"), ".log"))\n        sink(log_file, split = TRUE); on.exit(close(log_file), add = TRUE)\n        message(Sys.time(), " start")'
+            : '  Py： import logging\n        logging.basicConfig(filename="logs/run.log", level=logging.INFO,\n                            format="%(asctime)s %(levelname)s %(message)s")',
+          '',
+          '判定只看“有没有日志初始化”，不看写得对不对；这是能在跑前静态判定的一部分。',
+        ].join('\n'),
+      };
+    }
+    return null;
   },
 
   /**

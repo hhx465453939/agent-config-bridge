@@ -23,7 +23,7 @@
  * point of routing it through the same planner.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { businessError } from './errors.js';
 import { planFileOp } from './fs-ops.js';
@@ -166,7 +166,33 @@ export const planGateInstall = ({ repo, home, manifest }) => {
   };
 
   copyAction(join(src, 'policy.js'), join(dest, 'policy.js'), 'gate rule engine');
+  // v5: the adapters import `../classifier.js`, so it has to sit next to
+  // policy.js in the installed layout too. Missing it makes the extension fail to
+  // LOAD (not silently degrade) — the install test caught exactly this.
+  copyAction(join(src, 'classifier.js'), join(dest, 'classifier.js'), 'domain classifier');
   copyAction(join(src, adapter, 'index.js'), join(dest, adapter, 'index.js'), `${adapter} adapter`);
+
+  // v5: the domain profile definitions.
+  //
+  // They live outside the adapter directories because both harnesses read the
+  // same table, and they MUST be installed: `policy.json` only names the profiles
+  // it wants, so a missing `profiles/` makes every session silently classify as
+  // `general-dev` - installed, running, and enforcing only the base rules. That is
+  // the "装进去但不生效" failure ADR-003 §4 already records for dsh mounting.
+  //
+  // Each JSON becomes its own plan action, so adopt snapshots them and revoke
+  // removes them exactly like every other gate file.
+  const profilesSrc = join(src, 'profiles');
+  if (existsSync(profilesSrc)) {
+    for (const file of readdirSync(profilesSrc)) {
+      if (!file.endsWith('.json')) continue;
+      copyAction(
+        join(profilesSrc, file),
+        join(dest, 'profiles', file),
+        'domain profile definition',
+      );
+    }
+  }
 
   // Only pi needs a directory entry point; dsh mounts the file by path.
   if (adapter === 'pi') {

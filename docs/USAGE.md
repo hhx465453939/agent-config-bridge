@@ -275,7 +275,9 @@ node bridge/cli.js apply
 ```
 ~/.pi/agent/extensions/enforce-rules/
   policy.js      规则引擎
+  classifier.js  域判定（T0 指纹 → T1 关键词 → T2 模型）
   policy.json    策略（想改就改这个）
+  profiles/      域定义：ai4s-dry-lab.json / ai4s-quant.json
   index.js       pi 入口
   pi/index.js    适配层
   README.md      它是什么 + 如何卸载
@@ -295,6 +297,39 @@ node bridge/cli.js apply
 * **bash / PowerShell 写入也算写入**：`> file`、`tee`、`sed -i`、`cp/mv/rm`、`Set-Content`、`Remove-Item` 都走凭据与越界检查；`git reset --hard` / `git clean -f` / `rm -rf` 源码目录 / `Remove-Item -Recurse` / 强推等破坏性命令直接拒绝；
 * **MCP 网关不豁免**：`mcp` 代理调用会按 `input.tool` 的真实工具名解包，再走同一套判定；
 * **dsh 的不对称**：dsh 没有结果钩子与轮次级注入，无法验证图谱结果是否有内容，也不启用需要结果/读取证据的检查；`bash` 读取已真正接入。
+
+### 6.1.1 按域加载检查（v5）：同一套门控，不同工作用不同规矩
+
+写代码和做计算研究（干实验 / 量化）需要的规矩不一样。v5 让门控先回答「这个会话在做什么」，再决定「多跑哪几条检查」。
+
+**判定分三级，判不出来就少一层规矩，绝不阻塞：**
+
+| 级 | 看什么 | 什么时候命中 |
+|---|---|---|
+| T0 指纹 | 仓库里有没有 `docs/STATE.md` + `docs/WORKLOG.md`（只看文件名，不读内容） | 最可信，几乎不会误判 |
+| T1 强关键词 | 你这一轮的开场请求里，**至少 2 个不同的**域强词（如「单细胞」+「Seurat」） | 「什么是单细胞」这种提问**不会**命中 |
+| T2 模型 | 前两级都不确定时才问模型（默认关闭，需要自己接 judge） | 可选 |
+| 降级 | 以上都没结论 → `general-dev` | 与 v4 行为完全一致 |
+
+**域检查矩阵：**
+
+| 编号 | 检查 | 时机 | 强度 | 你能感知到的行为 |
+|---|---|---|---|---|
+| W1 | 跑分析脚本前 Worklog 要在 30 分钟内更新过 | 工具调用时 | 拒绝 | 拦下来并告诉你要往 Worklog 写什么 |
+| W4 上 | 脚本源码里要有日志初始化（R `sink`/`Sys.time`；Py `logging`/`FileHandler`） | 工具调用时 | 拒绝 | 拦下来并给出 R/Python 代码片段 |
+| W4 下 | 本轮跑过的脚本要留下同名 `.log` | 轮结束时 | 再要一轮 | agent 自己补日志，不阻塞 |
+| W2 | 本轮动过的结果子目录要有 `README_*` 说明 | 轮结束时 | 再要一轮 | agent 自己补说明文件 |
+| W3 | 文献 PMID 是否真实对应 | — | **不做** | 正则查不出对错，硬拦只会制造「已验证」的假象 |
+
+三条边界值得记住：
+
+* **同一个脚本只问一次 Worklog**：第一步跑过就不再打断，长流水线不会被反复拦；
+* **读脚本不等于跑脚本**：`cat run.R` 永远放行，否则调试自己的脚本都会被拦；
+* **没动过的旧目录不算问题**：只判「本轮更新过」的目录，不会把历史 `results/` 全报一遍。
+
+想加一个域（或改某个域的规则）：新建 `bridge/gates/profiles/<名字>.json`，再在 `policy.json` 的 `profiles` 数组里加上这个名字，然后 `apply`。**不需要改适配层代码**。
+
+`ai4s-quant` 目前只是骨架（能识别、不误伤，暂不带域检查）；它的因子/回测规则留待后续变更。
 
 ## 6.2 全局技能：agent-hard-gates
 

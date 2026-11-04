@@ -1,0 +1,36 @@
+{
+  "name": "ai4s-quant",
+  "version": 1,
+  "description": "量化研究（占位骨架）。本阶段只做识别：能被判成该域、不误伤、不与干实验规则混用；域检查留待下一 CHG（因子 IC / 回测日志 / 数据快照）。",
+  "fingerprints": [
+    ["docs/STRATEGY.md", "docs/BACKTEST.md"],
+    ["docs/STRATEGY.md", "strategies/"]
+  ],
+  "keywords": {
+    "min_hits": 2,
+    "strong": [
+      "回测",
+      "backtest",
+      "多因子",
+      "因子挖掘",
+      "因子库",
+      "alpha",
+      "ic 分析",
+      "ic分析",
+      "夏普",
+      "sharpe",
+      "最大回撤",
+      "drawdown",
+      "策略池",
+      "仓位管理",
+      "止损",
+      "walk-forward",
+      "gridsearch",
+      "quant",
+      "量化策略"
+    ],
+    "weak": ["股票", "收益率", "行情", "组合", "净值", "调仓"]
+  },
+  "checks": [],
+  "config": {}
+}

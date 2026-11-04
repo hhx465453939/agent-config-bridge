@@ -33,18 +33,22 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  analysisScriptTargets,
   loadPolicy,
   newSessionState,
   normalizePath,
   policyFromObject,
+  profilePolicy,
   recordInspection,
   recordInvestigation,
+  recordScriptRun,
   recordSignal,
   recordUnlocks,
   recordWrite,
   shouldBlock,
   unlockTokensFromText,
 } from '../policy.js';
+import { classify } from '../classifier.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -78,6 +82,13 @@ const realFs = {
       return false;
     }
   },
+  isDirectory: (p) => {
+    try {
+      return statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  },
   statMtime: (p) => {
     try {
       return statSync(p).mtimeMs;
@@ -90,6 +101,13 @@ const realFs = {
       return readdirSync(dir);
     } catch {
       return [];
+    }
+  },
+  readText: (p) => {
+    try {
+      return readFileSync(p, 'utf8');
+    } catch {
+      return null;
     }
   },
 };
@@ -162,6 +180,21 @@ export function apply(ctx, config = {}) {
   }
 
   const state = newSessionState();
+  /**
+   * v5: classify lazily, on the first tool event.
+   *
+   * dsh has no `before_agent_start` hook, so there is no "a user turn just
+   * started" moment to hang the classifier on. Until the first tool event the
+   * adapter therefore behaves exactly like v4 (`general-dev` / base checks), and
+   * the classification happens as part of the same call it will affect — never
+   * later, so no tool call is ever judged under the wrong profile after it.
+   *
+   * What dsh can decide is limited by what it receives: it sees the working
+   * directory but NOT the user's prompt, so T1 (keywords) and T2 (model) have
+   * nothing to read. Fingerprints still work, which is the strongest signal
+   * anyway. The asymmetry is documented rather than papered over.
+   */
+  let classified = false;
 
   ctx.on('tools/pre-execute', async (exec, next) => {
     const toolName = String(exec?.name ?? '');
@@ -172,10 +205,25 @@ export function apply(ctx, config = {}) {
         ? config.cwd
         : process.cwd();
 
+    if (!classified) {
+      classified = true;
+      const result = await classify({
+        cwd,
+        prompt: '',
+        fs: realFs,
+        policy,
+        modelHint: typeof config.modelHint === 'function' ? config.modelHint : null,
+      });
+      state.profile = result.profile;
+      state.profileSource = result.source;
+    }
+
+    const effective = profilePolicy(policy, state.profile);
+
     if (WRITE_TOOLS.has(toolName)) {
       const path = normalizePath(argPath(args), cwd);
       const verdict = shouldBlock({
-        policy,
+        policy: effective,
         input: { action: 'write', path, tool: toolName, content: argContent(args) },
         state,
         fs: realFs,
@@ -191,7 +239,7 @@ export function apply(ctx, config = {}) {
     if (READ_TOOLS.has(toolName)) {
       const path = normalizePath(argPath(args), cwd);
       const verdict = shouldBlock({
-        policy,
+        policy: effective,
         input: { action: 'read', path, tool: toolName },
         state,
         fs: realFs,
@@ -206,12 +254,20 @@ export function apply(ctx, config = {}) {
     if (toolName === 'bash') {
       const command = str(args, 'command') ?? '';
       const verdict = shouldBlock({
-        policy,
+        policy: effective,
         input: { action: 'bash', path: null, tool: toolName, command, cwd },
         state,
         fs: realFs,
       });
       if (verdict.block) return { kind: 'deny', reason: verdict.reason };
+      // AI4S: remember the script this call runs (W1 first-run test, W4 log date).
+      for (const script of analysisScriptTargets(command, {
+        config: effective.config,
+        cwd,
+        isFile: realFs.isFile,
+      })) {
+        recordScriptRun(state, script);
+      }
       return next();
     }
 

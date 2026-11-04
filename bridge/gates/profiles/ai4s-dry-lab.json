@@ -1,0 +1,62 @@
+{
+  "name": "ai4s-dry-lab",
+  "version": 1,
+  "description": "计算生物学干实验：scRNA-seq / 空间转录组 / 跨物种比较。域检查守三件事——跑之前有 Worklog、脚本自己留日志、结果目录有说明文件。",
+  "fingerprints": [
+    ["docs/STATE.md", "docs/WORKLOG.md"],
+    ["docs/WORKLOG.md", "docs/CONTEXT.md"],
+    [".ai4s/state.json"]
+  ],
+  "keywords": {
+    "min_hits": 2,
+    "strong": [
+      "单细胞",
+      "scrna",
+      "scrna-seq",
+      "sc-rna",
+      "空间转录组",
+      "spatial transcriptomics",
+      "seurat",
+      "cellranger",
+      "cell ranger",
+      "scanpy",
+      "anndata",
+      "细胞注释",
+      "细胞通讯",
+      "cell communication",
+      "cellchat",
+      "差异表达",
+      "deg",
+      "gsea",
+      "拟时序",
+      "轨迹分析",
+      "pseudotime",
+      "umap",
+      "harmony",
+      "干实验",
+      "dry-lab",
+      "ai4s-dry-lab",
+      "生信分析",
+      "bioinformatics"
+    ],
+    "weak": [
+      "细胞",
+      "基因",
+      "表达量",
+      "测序",
+      "聚类",
+      "降维",
+      "批次效应",
+      "marker",
+      "富集"
+    ]
+  },
+  "checks": ["ai4s-worklog-before-run", "ai4s-script-log-source"],
+  "config": {
+    "worklog_path": "docs/WORKLOG.md",
+    "worklog_ttl_ms": 1800000,
+    "result_dirs": ["results", "figures"],
+    "readme_prefix": "README_",
+    "script_extensions": [".R", ".Rmd", ".r", ".py", ".ipynb"]
+  }
+}
