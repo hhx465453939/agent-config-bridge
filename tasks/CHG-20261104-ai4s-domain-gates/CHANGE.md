@@ -65,6 +65,6 @@ red 项：`pi-models.test.js` 两条（见上「前置修复」）。交付前�
 |---|---|---|
 | 1 | **域规矩只靠拦截时才知道**：每轮注入的提醒文案还是 v4 的，一个字没提 Worklog / 日志 / 结果说明 | 提醒文案改为**跟 profile 走**（`profiles/<name>.json` 的 `reminder` 字段）。必须跟 profile 走而不能塞进 `policy.json`：后者会注入到**所有**会话，让一个 JS 仓库每轮看到“写 Worklog”，等于训练模型忽略提醒 |
 | 2 | **`.ipynb` / `.Rmd` 会被 W4 必然误伤**：执行后的笔记本与渲染产物本身就是留痕，硬要额外 `.log` 每次都会报 | 新增 `log_required_extensions`（默认 `.R` / `.r` / `.py`）。W4 只覆盖脚本类扩展名；W1（跑前 Worklog）对四类扩展名**照旧生效** |
-| 3 | **域配置写哪儿会踩坑**：profile 的 `config` 覆盖 `policy.json` 同名键，但安装目录 README 只提了 `policy.json` | 安装 README 补文件清单与“域规则改 `profiles/*.json`”；`docs/USAGE.md` 补“profile config 覆盖 base config”与 notebook 豁免；根 `README.md` 补一节 AI4S 域门控的来源（vitaforge）、适配端、版本号与边界 |
+| 3 | **域配置写哪儿会踩坑**：profile 的 `config` 覆盖 `policy.json` 同名键，但安装目录 README 只提了 `policy.json` | 安装 README 补文件清单与“域规则改 `profiles/*.json`”；`docs/USAGE.md` 补“profile config 覆盖 base config”与 notebook 豁免；根 `README.md` 补一节 AI4S 域门控的来源（[VitaForge](https://github.com/PancrePal-xiaoyibao/VitaForge)）、适配端、版本号与边界 |
 
 修订后的验证：`node --test` **222 项 / 221 通过 / 0 失败 / 1 跳过**；安装版端到端实测——policy v5、profiles 解析 0 未解析、W1 真拦、域提醒真注入上下文。

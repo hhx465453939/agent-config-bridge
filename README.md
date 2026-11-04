@@ -156,7 +156,7 @@ bridge/gates/
 
 | 项 | 值 |
 |---|---|
-| 适配的 skill 体系 | **vitaforge**（AI4S 科研工作流：Worklog / 脚本日志 / 结果说明）。仓库地址：`<vitaforge 仓库地址，待补>` |
+| 适配的 skill 体系 | **[VitaForge](https://github.com/PancrePal-xiaoyibao/VitaForge)**（生命工坊——通用医学与大生命科学领域的 AI4S 干实验引擎）。本门控适配它的 Worklog / 脚本日志 / 结果说明三项工作流约定 |
 | 适配的 agent | **pi**。策略引擎由 dsh 共用，但域检查与轮末产物检查目前只在 pi 生效（dsh 没有 `before_agent_start` 与轮结束钩子） |
 | 策略版本 | `policy.json` **v5**；`bridge/gates/profiles/ai4s-dry-lab.json` **v1** |
 | 决策记录 | `docs/ADR/011-ai4s-domain-gates.md`；设计说明 `tasks/CHG-20261104-ai4s-domain-gates/DESIGN.md` |
