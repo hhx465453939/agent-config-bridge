@@ -163,9 +163,15 @@ const withTimeout = (promise, ms) => {
   let timer = null;
   const timeout = new Promise((_resolve, reject) => {
     timer = setTimeout(() => reject(new Error(`model judge timed out after ${ms}ms`)), ms);
-    // A pending timer would keep a test process alive; the caller gets the
-    // rejection either way, so unref where the runtime supports it.
-    timer.unref?.();
+    // Deliberately NOT unref'd.
+    //
+    // A deadline timer is the ONLY thing that can settle this race when the
+    // judge hangs. Unref'ing it lets the event loop drain while the race is
+    // still pending, and Node then aborts the run with "Promise resolution is
+    // still pending but the event loop has already resolved" — measured on
+    // node 20/22, where it cancels every remaining test in the file. It is also
+    // the correct production behaviour: our caller is awaiting us, so the
+    // process has to stay alive until the deadline fires.
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 };

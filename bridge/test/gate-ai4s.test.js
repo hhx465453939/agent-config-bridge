@@ -35,6 +35,7 @@ import {
   normalizePolicy,
   outputArtifactFindings,
   profilePolicy,
+  recordScriptRun,
   recordSignal,
   reminderFor,
   resetMtimeCache,
@@ -270,7 +271,12 @@ test('AC-4b: only the first run of a script is judged', withTmp(async (dir) => {
   const state = newSessionState();
   // Pretend this script already ran: a stepwise pipeline must not be interrupted
   // by a Worklog edit before every single step.
-  state.scriptsRun.set(script, { startedAt: Date.now() });
+  //
+  // Through `recordScriptRun`, not a raw map write: it normalizes the path, and
+  // on Windows that folds case. A temp directory has mixed case, so a raw key
+  // never matches the normalized lookup inside the check and the script is judged
+  // as a first run — exactly how this test failed on windows-latest.
+  recordScriptRun(state, script);
 
   const verdict = shouldBlock({ policy, input: bashRun(script, dir), state, fs: realFs });
 
@@ -374,7 +380,7 @@ test('AC-6: a touched result directory without a note file is a finding', withTm
 
   const state = newSessionState();
   state.turnStart = Date.now() - 5 * MINUTE;
-  state.scriptsRun.set(script, { startedAt: Date.now() - 2 * MINUTE });
+  recordScriptRun(state, script, Date.now() - 2 * MINUTE);
   write(`${script}.log`, 'ok\n');
 
   const policy = profilePolicy(normalizePolicy(ai4sPolicy(dir)), 'ai4s-dry-lab');
@@ -394,7 +400,7 @@ test('AC-6b: the note file silences it, and an untouched directory is ignored', 
 
   const state = newSessionState();
   state.turnStart = Date.now() - 5 * MINUTE;
-  state.scriptsRun.set(script, { startedAt: Date.now() - 2 * MINUTE });
+  recordScriptRun(state, script, Date.now() - 2 * MINUTE);
 
   const policy = profilePolicy(normalizePolicy(ai4sPolicy(dir)), 'ai4s-dry-lab');
   assert.deepEqual(outputArtifactFindings({ policy, state, fs: realFs, cwd: dir }), []);
@@ -404,7 +410,7 @@ test('AC-6c: a run without a log file is reported', withTmp(async (dir) => {
   const { script } = ai4sRepo(dir, { worklogAgeMs: 1 * MINUTE });
   const state = newSessionState();
   state.turnStart = Date.now() - 5 * MINUTE;
-  state.scriptsRun.set(script, { startedAt: Date.now() - 2 * MINUTE });
+  recordScriptRun(state, script, Date.now() - 2 * MINUTE);
 
   const policy = profilePolicy(normalizePolicy(ai4sPolicy(dir)), 'ai4s-dry-lab');
   const findings = outputArtifactFindings({ policy, state, fs: realFs, cwd: dir });
