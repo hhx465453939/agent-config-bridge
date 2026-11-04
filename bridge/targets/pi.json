@@ -38,6 +38,13 @@
       "server_settings": {
         "codebase-memory-mcp": {
           "exposure": "direct"
+        },
+        "knows": {
+          "directTools": true
+        },
+        "knows-full": {
+          "exposure": "direct",
+          "directTools": true
         }
       }
     }
