@@ -254,12 +254,26 @@ export const guessModel = (id, declared = {}) => {
  * whole repository exists to prevent.
  */
 export const FAMILY_PROBES = [
-  { family: 'deepseek-v4', file: 'deepseek.json', ids: ['deepseek-v4-flash', 'deepseek-v4-pro'] },
-  { family: 'glm-5.2+', file: 'zai-coding-cn.json', ids: ['glm-5.2', 'glm-5.3', 'glm-5.3-flash'] },
+  // The `file` of each probe must be a file that ACTUALLY lists those ids. The
+  // lookup itself is global, so a wrong label does not fail the check — it makes
+  // the failure message lie, which is worse: it sends the reader to a file that
+  // never had the id.
+  { family: 'deepseek-v4', file: 'deepseek.json', ids: ['deepseek-v4-pro'] },
+  // `deepseek-v4-flash` is no longer in deepseek.json (pi renamed that entry to
+  // `deepseek-flash`) but the gateway files still ship it, so it is probed where
+  // it actually lives.
+  { family: 'deepseek-v4', file: 'opencode-go.json', ids: ['deepseek-v4-flash'] },
+  { family: 'glm-5.2+', file: 'zai-coding-cn.json', ids: ['glm-5.3', 'glm-5.3-flash'] },
+  // glm-5.2 itself dropped out of the zai provider but is still shipped by the
+  // gateways. Dropping the probe would stop watching the family's older member
+  // altogether; moving it keeps the coverage and the label honest.
+  { family: 'glm-5.2+', file: 'opencode.json', ids: ['glm-5.2'] },
   // Both spellings are probed: pi ships `k3`/`k3-256k`, gateways say `kimi-k3`.
   // They are the same models, and a rule that only covers one name is a rule
-  // that quietly stops applying to half the machine.
-  { family: 'kimi-k3', file: 'moonshotai.json', ids: ['kimi-k3', 'k3'] },
+  // that quietly stops applying to half the machine. Each spelling is listed by
+  // a different file, so each gets its own probe.
+  { family: 'kimi-k3', file: 'moonshotai.json', ids: ['kimi-k3'] },
+  { family: 'kimi-k3', file: 'kimi-coding.json', ids: ['k3'] },
   { family: 'kimi-k3-256k', file: 'kimi-coding.json', ids: ['k3-256k'] },
   { family: 'claude-opus-4.6+', file: 'anthropic.json', ids: ['claude-opus-4-7', 'claude-opus-4-8'] },
 ];
