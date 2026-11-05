@@ -542,6 +542,53 @@ test('mcp: manifest server_settings are merged into a derived server and survive
   });
 });
 
+test('mcp: a source cwd survives the conversion, and an absent one leaves no null key', async () => {
+  await withSandbox({}, (sb) => {
+    // `cwd` is a documented stdio field. It used to be dropped on the way to a
+    // target: OWNED_STDIO listed only command/args/env, so a freshly created
+    // target file had no prior value to preserve and the server silently lost
+    // its working directory — the exact silent data loss CONTRIBUTING forbids.
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    const emitted = JSON.parse(readFileSync(sb.path('.pi/agent/mcp.json'), 'utf8'));
+
+    assert.equal(
+      emitted.mcpServers['local-tool'].cwd,
+      'E:/work/local-tool',
+      'the source cwd reaches the target',
+    );
+    assert.ok(
+      !('cwd' in emitted.mcpServers['remote-tool']),
+      'a server without a cwd gains no null key',
+    );
+  });
+});
+
+test('mcp: a "*" server_setting reaches every derived server, a named one wins', async () => {
+  await withSandbox({}, (sb) => {
+    sb.findAndReplaceManifests((m) => {
+      if (m.name !== 'pi') return null;
+      m.managed = m.managed.map((r) =>
+        r.kind === 'mcp'
+          ? { ...r, server_settings: { '*': { exposure: 'direct' }, 'local-tool': { exposure: 'deferred' } } }
+          : r,
+      );
+      return m;
+    });
+
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    const servers = JSON.parse(readFileSync(sb.path('.pi/agent/mcp.json'), 'utf8')).mcpServers;
+
+    assert.equal(servers['remote-tool'].exposure, 'direct', 'the wildcard reaches every derived server');
+    assert.equal(servers['secret-tool'].exposure, 'direct');
+    assert.equal(servers['local-tool'].exposure, 'deferred', 'a named entry overrides the wildcard');
+    assert.equal(
+      servers['pi-only'].exposure,
+      undefined,
+      "a server the user added by hand is not touched by the wildcard",
+    );
+  });
+});
+
 test('manifest: server_settings are refused outside an mcp-json rule', async () => {
   await withSandbox({ install: ['kimi'] }, (sb) => {
     sb.findAndReplaceManifests((m) => {

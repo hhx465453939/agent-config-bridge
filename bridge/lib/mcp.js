@@ -19,7 +19,7 @@ import { businessError } from './errors.js';
 import { expand, expandRecord } from './secrets.js';
 
 /** Keys this bridge owns per server. Everything else in the entry is preserved. */
-const OWNED_STDIO = ['command', 'args', 'env'];
+const OWNED_STDIO = ['command', 'args', 'env', 'cwd'];
 const OWNED_HTTP = ['url', 'headers'];
 
 const expandedServer = (classified, secrets) => {
@@ -31,8 +31,17 @@ const expandedServer = (classified, secrets) => {
       const command = expand(classified.command, secrets, { missing: cmdMissing });
       return { value: { command, extra: [...cmdMissing] } };
     })();
+    // `cwd` is expanded like `command` (a leading `~/` and `${VAR}` both work)
+    // and kept null when the source has none, so a target that added its own
+    // cwd is brought back in line with the authority instead of drifting.
+    const cwd = typeof classified.cwd === 'string' && classified.cwd !== ''
+      ? expand(classified.cwd, secrets, { missing })
+      : null;
     return {
-      entry: { command: commandAndArgs.command, args, env },
+      // A null cwd is not written at all: `"cwd": null` in a config file is a
+      // field a human then has to reason about, and merge already treats a
+      // missing entry as "delete the key".
+      entry: cwd ? { command: commandAndArgs.command, args, env, cwd } : { command: commandAndArgs.command, args, env },
       missing,
       keys: OWNED_STDIO,
       transport: 'stdio',
@@ -117,13 +126,23 @@ export const emitMcpJson = ({
     prune,
   });
 
-  // Per-server keys the manifest declares (pi's `directTools`, for example).
-  // Only names the source actually derives are touched: a stale override must
-  // not resurrect a server that is gone from the source, especially under
-  // --prune, where the user explicitly asked for stale entries to be removed.
+  // Per-server keys the manifest declares (pi's `exposure`, for example).
+  // A `'*'` entry applies to every derived server first, then the named entries
+  // refine it: a target can default the whole list without repeating it, and
+  // still single out one server. Only names the source actually derives are
+  // touched: a stale override must not resurrect a server that is gone from the
+  // source, especially under --prune, where the user explicitly asked for stale
+  // entries to be removed.
   if (serverSettings) {
-    for (const [name, settings] of Object.entries(serverSettings)) {
-      if (!servers[name]) continue;
+    const { '*': every, ...named } = serverSettings;
+    const derived = new Set(classified.filter((s) => s.transport !== 'unknown').map((s) => s.name));
+    if (every && typeof every === 'object') {
+      for (const name of derived) {
+        servers[name] = { ...servers[name], ...every };
+      }
+    }
+    for (const [name, settings] of Object.entries(named)) {
+      if (!servers[name] || !derived.has(name)) continue;
       servers[name] = { ...servers[name], ...settings };
     }
   }
@@ -195,6 +214,12 @@ export const renderTomlMcpSections = (classified, secrets) => {
       if (entry.args.length > 0) lines.push(`args = ${tomlArray(entry.args)}`);
       if (entry.env && Object.keys(entry.env).length > 0) {
         lines.push(`env = ${tomlInlineTable(entry.env)}`);
+      }
+      // The Codex target's schema has no working-directory field. Say so instead
+      // of writing a config that looks complete: a silently dropped cwd is how a
+      // server starts reading the wrong directory.
+      if (entry.cwd) {
+        unsupported.push(`${server.name}: cwd (${entry.cwd}) cannot be expressed in config.toml`);
       }
     } else {
       lines.push(`url = ${tomlString(entry.url)}`);

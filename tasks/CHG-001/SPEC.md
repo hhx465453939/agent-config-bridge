@@ -252,10 +252,12 @@ options:
 
 | 目标 | 文件 | 形态 |
 |---|---|---|
-| pi | `~/.pi/agent/mcp-adapter.json` | `{"mcpServers": {...}}`；**保留** pi 私有字段（如 `directTools`）；v3 起 pi-mcp-adapter 使用此文件名（旧 `mcp.json` 留给 pi 未来的内置 MCP） |
-| Codex | `~/.codex/config.toml` | `[mcp_servers.<name>]` + `command`/`args`/`env` |
+| pi | `~/.pi/agent/mcp.json` | `{"mcpServers": {...}}`；pi >= 1.4 的内置 MCP 客户端读此文件。暴露控制用内置字段 `exposure`（`direct` / `codemode` / `deferred` / `hidden`），清单可用 `server_settings` 声明，`"*"` 键对全部派生条目生效、具名条目覆盖通配。**supersede 规则**：`settings.json` 出现 `-builtin:mcp`（关闭内置）或安装了注册 `/mcp` 的扩展（如 `pi-mcp-adapter`）时，pi 不读本文件——此时 `doctor` 报 `MCP_SUPERSEDED`，`settings.json` 属 `never_touch`，只能由用户改 |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.<name>]` + `command`/`args`/`env`；**无 `cwd` 字段**，源里的 `cwd` 会作为 `unsupported` 上报而不是静默丢弃 |
 | Gemini | `~/.gemini/settings.json` | 与权威源同构的 `mcpServers`（**保留**该文件其它键） |
 | Kimi | `~/.kimi-code/mcp.json` | 同构 JSON |
+
+**stdio 字段集合**：`command` / `args` / `env` / `cwd`。`cwd` 是 MCP 文档里的正式字段，v3 之前被漏在 `OWNED_STDIO` 之外，导致新建目标文件时服务器的工目录被静默丢掉（旧文件因「保留其它键」而幸存，所以这个洞只在全新机器上暴露）。 |
 
 **合并语义（关键）**：桥接器只写"由权威源派生出的条目"，目标端原有且非派生来源的条目**保留**。实现方式是双向白名单：
 

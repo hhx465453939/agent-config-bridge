@@ -94,7 +94,13 @@ export const makeSandbox = ({ install = ['pi', 'kimi'], linkSkills = true } = {}
     `${JSON.stringify(
       {
         mcpServers: {
-          'local-tool': { command: 'npx', args: ['-y', 'some-mcp'], env: { LOG_LEVEL: 'info' } },
+          'local-tool': {
+            command: 'npx',
+            args: ['-y', 'some-mcp'],
+            env: { LOG_LEVEL: 'info' },
+            // A real stdio field: the conversion must carry it, not drop it.
+            cwd: 'E:/work/local-tool',
+          },
           'remote-tool': { type: 'http', url: 'https://mcp.example.com/endpoint', headers: {} },
           'secret-tool': {
             command: 'node',

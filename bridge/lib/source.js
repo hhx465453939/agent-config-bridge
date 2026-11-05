@@ -129,6 +129,12 @@ export const classifyMcpServer = (name, def) => {
       command: def.command,
       args: Array.isArray(def.args) ? def.args.map(String) : [],
       env: def.env && typeof def.env === 'object' ? def.env : {},
+      // `cwd` is a real stdio field (the MCP docs list `command`, `args`, `env`
+      // and `cwd`). Dropping it here deleted a server's working directory on the
+      // way to every target: a server that resolves data paths relative to its
+      // own repository then starts looking in whatever directory the session
+      // began in. Carried, not guessed.
+      cwd: typeof def.cwd === 'string' && def.cwd.length > 0 ? def.cwd : null,
       unsupported: [],
     };
   }
