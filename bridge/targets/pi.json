@@ -34,21 +34,29 @@
       "from": "@mcpServers",
       "to": ".pi/agent/mcp.json",
       "mode": "mcp-json",
-      "note": "pi >= 1.4 reads ~/.pi/agent/mcp.json natively (user level; .pi/mcp.json is the project level). codebase-memory-mcp is declared with exposure \"direct\" instead of the default \"codemode\" so its query and indexing tools appear in pi's tool list as mcp__codebase-memory-mcp__<tool>: the hard gate keys off those names, and a codemode-only server would hide them behind the codemode tool. The default pi set connects every enabled server at session start, so the tools are available without a manual /mcp connect.",
+      "note": "pi >= 1.4 reads ~/.pi/agent/mcp.json natively (user level; .pi/mcp.json is the project level), so the built-in MCP client is the transport and the pi-mcp-adapter package is no longer part of this target. The built-in client's default exposure is \"codemode\" — callable from codemode scripts but NOT declared to the model — so server_settings covers every derived server with exposure \"direct\" (the '*' entry) to keep the tool list the adapter used to provide (its `directTools: true`) and to keep the hard gate's mcp__<server>__<tool> names visible. A per-server entry can still override the wildcard. TWO THINGS THIS FILE CANNOT DO: it cannot enable built-in MCP (settings.json `extensions: [\"-builtin:mcp\"]` disables it) and it cannot uninstall a replacement extension (settings.json `packages: [\"npm:pi-mcp-adapter\"]` would supersede the built-in client, per docs/mcp.md: an installed extension registering /mcp replaces built-in MCP, and pi then does not read mcp.json at all). settings.json is never_touch on purpose, so `doctor` warns (MCP_SUPERSEDED) instead of rewriting it: the fix is the user removing those two entries.",
       "server_settings": {
+        "*": {
+          "exposure": "direct"
+        },
         "codebase-memory-mcp": {
           "exposure": "direct"
         },
-        "knows": {
-          "directTools": true
-        },
         "knows-full": {
-          "exposure": "direct",
-          "directTools": true
+          "exposure": "direct"
         }
       }
     }
   ],
+  "mcp_supersede": {
+    "generated": ".pi/agent/mcp.json",
+    "settings": ".pi/agent/settings.json",
+    "disable_flags": [
+      "-builtin:mcp"
+    ],
+    "replacement_pattern": "mcp-adapter",
+    "note": "pi supersedes the built-in MCP client in two independent ways: settings.json `extensions` may contain \"-builtin:mcp\" (built-in support disabled), and an installed extension that registers /mcp - pi-mcp-adapter is the known one - replaces it outright, after which pi does not read mcp.json at all (docs/mcp.md). Either way the file this target generates is on disk, correct, and read by nobody, which is the failure this block lets `doctor` name. settings.json is never_touch, so the finding is a warn with the fix, never a rewrite."
+  },
   "gates": {
     "supported": true,
     "adapter": "pi",

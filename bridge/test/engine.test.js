@@ -589,6 +589,35 @@ test('mcp: a "*" server_setting reaches every derived server, a named one wins',
   });
 });
 
+test('doctor: names the MCP file the harness has been told not to read', async () => {
+  await withSandbox({}, (sb) => {
+    api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
+    const settingsPath = sb.path('.pi/agent/settings.json');
+
+    write(settingsPath, JSON.stringify({ extensions: [] }, null, 2));
+    const clean = api.doctor({ repo: sb.repo, home: sb.home });
+    assert.equal(
+      clean.findings.filter((f) => f.code === 'MCP_SUPERSEDED').length,
+      0,
+      'nothing to report while the built-in client is enabled',
+    );
+
+    // Built-in MCP off and a replacement installed: the file stays correct and
+    // nobody reads it. That is the failure `apply` cannot see.
+    write(
+      settingsPath,
+      JSON.stringify({ extensions: ['-builtin:mcp'], packages: ['npm:pi-mcp-adapter'] }, null, 2),
+    );
+    const superseded = api.doctor({ repo: sb.repo, home: sb.home });
+    const finding = superseded.findings.find((f) => f.code === 'MCP_SUPERSEDED');
+    assert.ok(finding, 'the dead MCP config is reported');
+    assert.equal(finding.level, 'warn');
+    assert.match(finding.message, /mcp\.json/);
+    assert.match(finding.message, /pi-mcp-adapter/);
+    assert.match(finding.hint, /settings\.json/);
+  });
+});
+
 test('manifest: server_settings are refused outside an mcp-json rule', async () => {
   await withSandbox({ install: ['kimi'] }, (sb) => {
     sb.findAndReplaceManifests((m) => {

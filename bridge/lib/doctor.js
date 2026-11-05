@@ -100,7 +100,6 @@ export const findRequirement = (home, req) => {
 export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
   const findings = [];
   const add = (level, code, message, hint = null) => findings.push({ level, code, message, hint });
-
   // --- state -------------------------------------------------------------
   let state = { version: 1, agents: {} };
   try {
@@ -193,6 +192,65 @@ export const runDoctor = ({ repo, home, strict = false, targets = null }) => {
         );
       }
     }
+  }
+
+  // --- generated MCP file that the harness will not read -------------------
+  //
+  // A harness can supersede its own configuration source without touching the
+  // file we generate: pi drops the built-in MCP client when settings.json
+  // disables it or when an extension registers /mcp (docs/mcp.md). The file stays
+  // correct, `apply` keeps reporting success, and no server is ever connected —
+  // the exact "produced but nobody reads it" failure this command exists for.
+  //
+  // The paths and the two supersede mechanisms come from the manifest
+  // (`mcpSupersede`), never from a guess in this file: the manifest is the only
+  // place allowed to know a target's layout. settings.json is `never_touch`, so
+  // this is a warn with the fix spelled out, not an action.
+  for (const manifest of bridgedOnly) {
+    const spec = manifest.mcpSupersede;
+    if (!spec) continue;
+    const generated = join(home, spec.generated);
+    if (!existsSync(generated)) continue; // nothing generated: nothing to orphan
+    const settingsPath = join(home, spec.settings);
+    let settings = null;
+    try {
+      settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+    } catch {
+      add(
+        'warn',
+        'MCP_SETTINGS_UNREADABLE',
+        `${manifest.name}: cannot read ${settingsPath}, so it is unknown whether ${spec.generated} is used`,
+        'fix the settings file; until then the generated MCP file may be dead config',
+      );
+      continue;
+    }
+    if (!settings || typeof settings !== 'object') continue;
+
+    const lists = ['extensions', 'packages'].flatMap((key) =>
+      Array.isArray(settings[key]) ? settings[key].map(String) : [],
+    );
+    const disabled = (spec.disableFlags ?? []).filter((flag) => lists.includes(flag));
+    const replacement = spec.replacementPattern
+      ? lists.filter((entry) => entry.toLowerCase().includes(String(spec.replacementPattern).toLowerCase()))
+      : [];
+
+    if (disabled.length === 0 && replacement.length === 0) continue;
+
+    const why = [
+      disabled.length > 0 ? `settings.json lists ${disabled.join(', ')}` : null,
+      replacement.length > 0 ? `settings.json installs ${replacement.join(', ')}` : null,
+    ]
+      .filter(Boolean)
+      .join(' and ');
+
+    add(
+      'warn',
+      'MCP_SUPERSEDED',
+      `${manifest.name}: ${spec.generated} is generated and correct, but ${why}` +
+        ` — the harness reads neither the file nor a replacement for it`,
+      `remove those entries from ${spec.settings} so the built-in MCP client loads ${spec.generated}, ` +
+        'then start a new session (MCP is wired at session start); `apply` cannot do it, that file is never_touch',
+    );
   }
 
   // --- declared runtime requirements --------------------------------------

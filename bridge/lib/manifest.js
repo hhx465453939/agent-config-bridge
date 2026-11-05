@@ -217,7 +217,51 @@ const validate = (manifest, file) => {
     neverTouch,
     requires: collectRequires(managed),
     gates: validateGates(manifest.gates, file, name),
+    mcpSupersede: validateMcpSupersede(manifest.mcp_supersede, file, name),
     file,
+  };
+};
+
+/**
+ * The "a harness can supersede its own config source" block.
+ *
+ * Optional. It exists because a harness can stop reading the file we generate
+ * without that file changing: pi drops its built-in MCP client when settings
+ * disables it, or when an installed extension registers `/mcp` (then pi does not
+ * read `mcp.json` at all). The result is a config that is on disk, correct, and
+ * read by nobody — `apply` keeps reporting success and no server is ever
+ * connected. `doctor` names that state; this block tells it where to look.
+ *
+ * Layout knowledge belongs in the manifest and nowhere else, for the same reason
+ * the gates block does: a path guessed in `doctor` is a path that silently stops
+ * matching when the harness moves it.
+ */
+const validateMcpSupersede = (raw, file, name) => {
+  if (raw === undefined || raw === null) return null;
+  const where = `${file}: ${name}.mcp_supersede`;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw businessError('MANIFEST_INVALID', `${where} must be an object`);
+  }
+  const rel = (value, label) => {
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw businessError('MANIFEST_INVALID', `${where}.${label} must be a non-empty relative path`);
+    }
+    return assertRelative(value, label, where);
+  };
+  const flags = raw.disable_flags ?? [];
+  if (!Array.isArray(flags) || flags.some((f) => typeof f !== 'string' || f === '')) {
+    throw businessError('MANIFEST_INVALID', `${where}.disable_flags must be an array of non-empty strings`);
+  }
+  const pattern = raw.replacement_pattern ?? null;
+  if (pattern !== null && (typeof pattern !== 'string' || pattern === '')) {
+    throw businessError('MANIFEST_INVALID', `${where}.replacement_pattern must be a non-empty string`);
+  }
+  return {
+    generated: rel(raw.generated, 'generated'),
+    settings: rel(raw.settings, 'settings'),
+    disableFlags: flags,
+    replacementPattern: pattern,
+    note: raw.note ?? null,
   };
 };
 
