@@ -117,3 +117,42 @@ node bridge/cli.js apply --targets pi
 - 不做「永久不再询问」的无限制白名单（授权始终按类别、可随时收回）。
 - dsh 端无法调整授权（无命令通道），只能读 `apply` 后的 `policy.json`。
 - 不判断「文件是不是 agent 自己创建的」（静态解析不可靠）。
+
+## 部署实测与 v2.1 增量（本机）
+
+部署动作与结果：
+
+```
+node bridge/cli.js plan --targets pi   # +4 ~4 -0
+node bridge/cli.js apply --targets pi  # +4 ~4 -0（随后 v2.1 再 apply ~1）
+node bridge/cli.js diff  --targets pi  # no changes
+```
+
+安装副本（`~/.pi/agent/extensions/enforce-rules/`）与源 `policy.js`、`pi/index.js`、
+`classifier.js`、`profiles/*.json` sha256 一致；`policy.json` 与 README 是生成物
+（前者合并机器 override，后者是安装说明），与仓库公开源有意不同。
+
+对**安装副本**的 20 条功能断言（三选一弹窗、guardrail、授权、自我提权、无 UI 降级）：
+
+```
+20/20 passed
+```
+
+### v2.1 新增 AC
+
+| AC | 断言 | 反证方式 |
+|---|---|---|
+| AC-23 | `psql -c` / `mysql -e` / `sqlite3 db` / `mongosh --eval` 携带的 DDL 均判 `db-ddl`；`/gate grant db-ddl` 后放行 | 把 DDL 判定改回只锚定动词 → 红 |
+| AC-24 | `psql -c "select 1"`、`psql -f seed.sql`、`echo` 一段 DDL 文本均不产生 finding | 把 DDL 正则改成「全命令任意位置」→ 红（假阳性） |
+
+### 测试独立性（同批修复）
+
+`applyMachineOverride` 会让**测试注入的策略**被本机 `gate-policy.json` 里的
+`project_roots` 覆盖，于是同一 commit 在 CI（无该文件）绿、在写门控的这台机器上红
+（全量 5 项：`gate-adapter` 2、`gate-ai4s` 2、`gates` 1）。新增 `bridge/test/isolate-home.js`，
+由 3 个适配层测试文件副作用导入，把 `$HOME` 指向空临时目录；直接测试 override 自身的
+用例仍显式传 `home`，不受影响。修后**在带机器 override 的真实环境下**全量绿：
+
+```
+node --test bridge/test/*.test.js   # 259 tests / 257 pass / 0 fail / 2 skipped（未设任何环境变量）
+```

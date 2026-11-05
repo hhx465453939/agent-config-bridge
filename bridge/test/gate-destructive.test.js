@@ -227,6 +227,35 @@ test('permission: db-ddl starts at deny because a dropped schema outlives most b
   assert.equal(granted.confirm, false);
 });
 
+test('permission: a DDL statement passed to a database client is still db-ddl', () => {
+  // The pattern is anchored at the verb for bare statements, so a client name in
+  // front of the statement used to be a free bypass of the one category that
+  // starts at `deny`. These are the same act.
+  for (const command of [
+    'psql -c "drop database prod"',
+    "psql --command='truncate table users'",
+    'mysql -e "drop table users"',
+    'mariadb -e "DROP SCHEMA public"',
+    'sqlite3 app.db "drop table users"',
+    'mongosh --eval "db.dropDatabase()"',
+  ]) {
+    const found = bashDestructiveFinding(command, opts());
+    assert.equal(found?.category, 'db-ddl', `${command} must be db-ddl`);
+  }
+
+  assert.equal(judge('psql -c "drop database prod"').code, 'DESTRUCTIVE_DENIED');
+  assert.equal(
+    judge('psql -c "drop database prod"', { over: { destructive_grants: { 'db-ddl': 'allow' } } }).block,
+    false,
+  );
+
+  // A client running an ordinary query, and a plain echo of the words, stay
+  // untouched: false positives here would block read-only diagnostics.
+  assert.equal(bashDestructiveFinding('psql -c "select 1"', opts()), null);
+  assert.equal(bashDestructiveFinding('psql -f seed.sql', opts()), null);
+  assert.equal(bashDestructiveFinding('echo "drop database prod"', opts()), null);
+});
+
 test('permission: recursive chmod / chown and forced process kill are categories', () => {
   assert.equal(bashDestructiveFinding(`chmod -R 777 ${CWD}`, opts())?.category, 'perm-recursive');
   assert.equal(bashDestructiveFinding('taskkill /F /IM node.exe', opts())?.category, 'process-kill');

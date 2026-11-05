@@ -130,3 +130,59 @@ v1 把 `git reset --hard` / force push 也归进了 `high`（硬拦）。对用�
 node --test bridge/test/*.test.js   # EXIT=0，258 tests / 257 pass / 0 fail / 1 skipped
 ```
 （v1 基线 222 项 → v2 258 项，新增 36 项覆盖两层模型与授权链路）
+
+---
+
+## v2.1（部署后实测发现的绕过）：DDL 通过数据库客户端参数绕过
+
+### 现场证据
+
+部署到本机、对**安装副本**做功能验证时，20 条断言里 19 条过，1 条红：
+
+```
+裸语句（drop database <name>）        -> DESTRUCTIVE_DENIED   OK
+psql -c "drop database <name>"        -> 放行（block=false）  ← 洞
+mysql -e "drop database <name>"       -> 放行（block=false）  ← 洞
+psql -c "select 1"                    -> 放行（应放行）
+```
+
+### 根因
+
+`bashDestructiveFinding` 的 DDL 判定锚定在**首个动词**：
+
+```js
+const sql = `${verb} ${values.join(' ')}`.toLowerCase();
+if (/^(?:drop\s+(?:table|database|schema)|truncate\s+table)\b/.test(sql)) { … }
+```
+
+`psql -c "drop database x"` 的 `verb` 是 `psql`，语句落在参数里，锚定不到。
+结果是**唯一一个默认 `deny` 的类别，前面加个客户端名即可绕过**——CHG 里「DDL 默认拒绝」的设计目标没有真正达成。
+
+### 修法
+
+新增 `DB_CLIENTS`（psql / pgcli / mysql / mysqlsh / mariadb / sqlite3 / sqlcmd /
+clickhouse-client / cockroach / duckdb / usql）与 `DDL_ANYWHERE`：只对**这些客户端**
+的命令在参数里找 DDL 语句；mongo/mongosh 走 `MONGO_DROP`（`.dropDatabase()` 等 JS 形态）。
+
+不把 DDL 正则改成「全命令任意位置」是刻意的：那样 `echo` 一段 SQL 文本、文档引用、
+注释都会被判为破坏性——这类假阳性是把门控关掉的起点（本仓库就有 CHG-20261031 的
+`format` 假阳性前科）。
+
+### 修后实测
+
+```
+psql -c "drop database <name>"       -> db-ddl / DESTRUCTIVE_DENIED
+psql --command='truncate table t'    -> db-ddl
+mysql -e "drop table users"          -> db-ddl
+sqlite3 app.db "drop table users"    -> db-ddl
+mongosh --eval "db.dropDatabase()"   -> db-ddl
+/gate grant db-ddl 后                -> 放行
+psql -c "select 1" / psql -f x.sql / echo 一段 DDL 文本 -> 不误报
+```
+
+### v2.1 基线（实测）
+
+```
+node --test bridge/test/*.test.js   # EXIT=0，259 tests / 257 pass / 0 fail / 2 skipped
+```
+（259 = v2 的 258 + 1 项 DDL 客户端用例；2 skipped 为 Windows 平台跳过）

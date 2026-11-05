@@ -1796,6 +1796,32 @@ const HOST_DESTRUCTIVE_VERB =
 const RAW_DEVICE =
   /^\/dev\/(?:sd[a-z]|nvme\d|hd[a-z]|vd[a-z]|xvd[a-z]|disk\d|mmcblk\d|loop\d|dm-\d|md\d|sr\d|nbd\d|zram\d)|^\\[.?]\\physicaldrive/i;
 
+/**
+ * Clients that take a SQL statement as an argument.
+ *
+ * `psql -c "drop database prod"` runs the identical statement a bare
+ * `drop database prod` would. The DDL pattern below is anchored at the verb, so
+ * before this list existed the single category that starts at `deny` could be
+ * bypassed by typing a client name in front of the statement.
+ *
+ * Scanned only for these verbs on purpose: matching the pattern anywhere in
+ * every command would also fire on `echo "drop table x"` and on documentation
+ * quotes, which is the class of false positive that gets a gate uninstalled.
+ */
+const DB_CLIENTS = new Set([
+  'psql', 'pgcli', 'mysql', 'mysqlsh', 'mariadb', 'sqlite3', 'sqlcmd', 'clickhouse-client',
+  'cockroach', 'duckdb', 'usql',
+]);
+
+/** A DDL statement appears anywhere in the payload (used for client arguments). */
+const DDL_ANYWHERE = /(?:^|[\s'"`(])(?:drop\s+(?:table|database|schema)|truncate\s+table)\b/;
+
+/**
+ * mongo shells express the same act in JavaScript (`db.dropDatabase()`) rather
+ * than SQL, so the SQL pattern above cannot see it.
+ */
+const MONGO_DROP = /\.(?:dropdatabase|dropcollection|drop)\s*\(/i;
+
 export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd = null, isGitRepo = null } = {}, depth = 0) => {
   if (typeof command !== 'string' || command === '' || depth > 2) return null;
   const allow = (config.destructive_allow_patterns ?? []).some((src) => {
@@ -1955,6 +1981,14 @@ export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd =
     const sql = `${verb} ${values.join(' ')}`.toLowerCase();
     if (/^(?:drop\s+(?:table|database|schema)|truncate\s+table)\b/.test(sql)) {
       return finding('destructive SQL', 'confirm', 'db-ddl');
+    }
+
+    // The same statement passed to a database client's flag is still DDL.
+    if (DB_CLIENTS.has(verb) && DDL_ANYWHERE.test(values.join(' ').toLowerCase())) {
+      return finding(`destructive SQL via ${verb}`, 'confirm', 'db-ddl');
+    }
+    if (['mongo', 'mongosh'].includes(verb) && MONGO_DROP.test(values.join(' '))) {
+      return finding(`destructive MongoDB drop via ${verb}`, 'confirm', 'db-ddl');
     }
   }
   return null;
