@@ -13,12 +13,16 @@
  * snapshots them and `revoke` removes them again.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   analysisScriptTargets,
+  applyMachineOverride,
+  DESTRUCTIVE_CATEGORIES,
+  effectiveDestructiveTier,
+  machineGateConfigPath,
   bashReadTargets,
   graphResultIsEvidence,
   outputArtifactFindings,
@@ -204,9 +208,16 @@ export default function enforceRules(pi, options = {}) {
               .map((c) => `    ${c}`)
               .join('\n'),
         };
-  const { policy, error } = loaded.ok
+  const { policy: loadedPolicy, error } = loaded.ok
     ? loaded
     : fallback(`policy not loaded (${loaded.error})`);
+  /**
+   * A grant made through `/gate` lives in the machine-local override. Applying
+   * it here means the grant takes effect immediately instead of at the next
+   * `bridge apply` - and it keeps the installed `policy.json` and the live
+   * override from ever disagreeing about a tier.
+   */
+  const policy = applyMachineOverride(loadedPolicy);
 
   const state = newSessionState();
   /** Set once per session so the same advisory is not repeated. */
@@ -250,6 +261,7 @@ export default function enforceRules(pi, options = {}) {
     state.inspected.clear();
     state.docReads.clear();
     state.failedCommands.clear();
+    state.destructiveGrants.clear();
     state.lastInvestigationAt = 0;
     state.profile = policy.defaultProfile ?? 'general-dev';
     state.profileSource = 'fallback';
@@ -396,6 +408,50 @@ export default function enforceRules(pi, options = {}) {
           );
         }
         return { block: true, reason: verdict.reason };
+      }
+      // Three-tier permission model (CHG-20261105 v2): a `confirm` finding is
+      // not a refusal. pi itself does NOT ask before running a tool
+      // (`docs/security.md`: "it does not ask for approval before every tool
+      // call"), so the question has to come from here.
+      //
+      // Three options, not two: "allow once" and "allow this whole class for
+      // this session" are different promises, and collapsing them either
+      // nags on every file or silently grants more than the user meant.
+      if (verdict.confirm) {
+        const why = verdict.confirmReason ?? '破坏性命令需要确认';
+        const category = verdict.confirmCategory ?? 'delete';
+        if (ctx?.hasUI && typeof ctx.ui?.select === 'function') {
+          const options = [
+            '允许这一次',
+            `本会话允许「${category}」这一类`,
+            '拒绝',
+          ];
+          const choice = await ctx.ui.select(why, options);
+          if (choice === options[1]) {
+            state.destructiveGrants.set(category, 'allow');
+            ctx.ui.notify?.(
+              `enforce-rules: 本会话已允许「${category}」。收回：/gate deny ${category}`,
+              'info',
+            );
+          } else if (choice !== options[0]) {
+            return { block: true, reason: `${why}\n\n用户拒绝了这次执行。` };
+          }
+        } else if (ctx?.hasUI && typeof ctx.ui?.confirm === 'function') {
+          // Older harness builds only expose a yes/no dialog.
+          const allowed = await ctx.ui.confirm('允许执行这条破坏性命令？', command);
+          if (!allowed) {
+            return { block: true, reason: `${why}\n\n用户拒绝了这次执行。` };
+          }
+        } else {
+          // No UI: an automated run already carries the user's authorization in
+          // its own invocation, and blocking there would make the gate
+          // unusable from scripts. Record the decision on stderr instead of
+          // waiting for a dialog that can never appear. The guardrail tier
+          // above still refuses, so nothing unrecoverable slips through here.
+          process.stderr.write(
+            `[enforce-rules] DESTRUCTIVE_CONFIRM auto-approved (no UI) [${category}]: ${command.slice(0, 200)}\n`,
+          );
+        }
       }
       // AI4S: remember the script this call is about to run. W1 uses the key set
       // to ask for a Worklog only on the FIRST run of a given script, and the
@@ -624,6 +680,129 @@ export default function enforceRules(pi, options = {}) {
         },
       ],
     };
+  });
+
+  /**
+   * `/gate` - the only supported way to change a permission tier.
+   *
+   * Deliberately a user-typed command and not a tool. A grant must be given by
+   * the user, never taken by the agent: the `no-self-grant` check refuses any
+   * write or shell redirect that carries `destructive_grants`, which closes the
+   * obvious "agent edits its own permission file" hole.
+   *
+   * Persistent grants go to the machine-local override, never to the installed
+   * `policy.json`: `bridge apply` regenerates that file, so a grant written
+   * there would be silently lost at the next apply.
+   */
+  // A harness build without `registerCommand` (or a test double) loses `/gate`,
+  // not enforcement. A missing capability must degrade one feature, never take
+  // the security layer down with it - the same rule the UI probes follow.
+  const registerGateCommand =
+    typeof pi.registerCommand === 'function' ? pi.registerCommand.bind(pi) : null;
+  registerGateCommand?.('gate', {
+    description:
+      '破坏性操作授权：list / grant <类别> / ask <类别> / deny <类别> / reset <类别> / session <类别>',
+    handler: async (args, ctx) => {
+      const notify = (text, level = 'info') => ctx?.ui?.notify?.(text, level);
+      const tokens = String(args ?? '').trim().split(/\s+/).filter(Boolean);
+      const sub = (tokens[0] ?? 'list').toLowerCase();
+      const category = tokens[1] ?? null;
+      const categories = Object.keys(DESTRUCTIVE_CATEGORIES);
+
+      const report = () => {
+        const merged = applyMachineOverride(policy);
+        const rows = categories.map((name) => {
+          const tier = effectiveDestructiveTier(name, merged.config, state);
+          const grant = merged.config.destructive_grants?.[name] ?? 'confirm';
+          const session = state.destructiveGrants.get(name);
+          return (
+            `  ${name.padEnd(18)} ${tier.padEnd(8)}（policy: ${grant}${session ? `，本会话: ${session}` : ''}）\n` +
+            `      ${DESTRUCTIVE_CATEGORIES[name]}`
+          );
+        });
+        return [
+          '破坏性操作授权档位（allow=直接执行 / confirm=询问 / deny=拒绝）',
+          '',
+          ...rows,
+          '',
+          '红线（任何授权都不放行）：删 $HOME、删 cwd、含 .. 的路径、磁盘格式化、裸设备写入、关机重启。',
+          '',
+          '调整：/gate grant <类别>    持久允许',
+          '      /gate ask <类别>      改为每次询问',
+          '      /gate deny <类别>     拒绝',
+          '      /gate reset <类别>    恢复默认',
+          '      /gate session <类别>  仅本会话允许',
+        ].join('\n');
+      };
+
+      if (sub === 'list' || sub === 'status') {
+        notify(report());
+        return;
+      }
+
+      if (!category || !categories.includes(category)) {
+        notify(`未知类别：${category ?? '(空)'}\n可用：${categories.join(', ')}`, 'warn');
+        return;
+      }
+
+      if (sub === 'session') {
+        state.destructiveGrants.set(category, 'allow');
+        notify(`本会话已允许「${category}」（仅本会话，重开会话失效）。收回：/gate deny ${category}`);
+        return;
+      }
+
+      if (!['grant', 'ask', 'deny', 'reset'].includes(sub)) {
+        notify(`未知子命令：${sub}\n\n${report()}`, 'warn');
+        return;
+      }
+
+      const file = machineGateConfigPath();
+      if (!file) {
+        notify('无法定位机器本地配置目录（HOME / USERPROFILE 均未设置）。', 'error');
+        return;
+      }
+
+      let doc = {};
+      if (existsSync(file)) {
+        try {
+          doc = JSON.parse(readFileSync(file, 'utf8')) ?? {};
+        } catch (err) {
+          notify(`${file} 不是合法 JSON，先修好它：${err.message}`, 'error');
+          return;
+        }
+      }
+      if (!doc || typeof doc !== 'object' || Array.isArray(doc)) doc = {};
+      if (!doc.config || typeof doc.config !== 'object' || Array.isArray(doc.config)) doc.config = {};
+      if (
+        !doc.config.destructive_grants ||
+        typeof doc.config.destructive_grants !== 'object' ||
+        Array.isArray(doc.config.destructive_grants)
+      ) {
+        doc.config.destructive_grants = {};
+      }
+
+      if (sub === 'reset') {
+        delete doc.config.destructive_grants[category];
+      } else {
+        doc.config.destructive_grants[category] =
+          sub === 'grant' ? 'allow' : sub === 'ask' ? 'confirm' : 'deny';
+      }
+
+      try {
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
+      } catch (err) {
+        notify(`写入 ${file} 失败：${err.message}`, 'error');
+        return;
+      }
+
+      const merged = applyMachineOverride(policy);
+      notify(
+        sub === 'reset'
+          ? `「${category}」已恢复默认档位。\n\n${report()}`
+          : `「${category}」已设为 ${merged.config.destructive_grants?.[category] ?? 'confirm'}（持久，写在 ${file}）。\n\n${report()}`,
+      );
+    },
   });
 
   pi.on('context', async (event) => {

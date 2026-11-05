@@ -7,6 +7,7 @@
     "no-write-outside",
     "no-secret-write",
     "no-destructive-bash",
+    "no-self-grant",
     "graph-before-read",
     "bash-graph-before-read"
   ],
@@ -47,6 +48,16 @@
     "max_identical_failures": 2,
     "retry_window_ms": 600000,
     "destructive_allow_patterns": [],
+    "destructive_confirm_mode": true,
+    "destructive_grants": {
+      "delete": "confirm",
+      "git-history": "confirm",
+      "git-force-push": "confirm",
+      "db-ddl": "deny",
+      "perm-recursive": "confirm",
+      "process-kill": "confirm",
+      "raw-write": "confirm"
+    },
     "profiles_dir": "profiles",
     "worklog_path": "docs/WORKLOG.md",
     "worklog_ttl_ms": 1800000,

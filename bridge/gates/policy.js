@@ -95,6 +95,34 @@ const NODE_FS = {
 /** Cached "newest mtime inside the index marker directory", keyed by directory. */
 const mtimeCache = new Map();
 
+/**
+ * The permission categories a destructive command can belong to.
+ *
+ * Categories exist so a user can grant "I trust you to force-push on my own
+ * branch" without also granting "you may drop a production database". Each one
+ * is a *permission*: adjustable at runtime through the `/gate` command, with
+ * three tiers per category (`allow` / `confirm` / `deny`).
+ *
+ * The hard red lines in `unrecoverableTarget` and the host/disk verbs are
+ * deliberately NOT categories. They are not "deny by default", they are
+ * "deny always": no grant can reach them. That is the difference between a
+ * permission and a guardrail, and collapsing the two is how a gate becomes
+ * theatre.
+ */
+export const DESTRUCTIVE_CATEGORIES = {
+  delete: '删除文件或目录（rm / rmdir / del / rd / Remove-Item / find -delete / clear-content）',
+  'git-history':
+    '丢弃未提交工作或重写本地历史（reset --hard / clean -f / checkout -- . / restore / branch -D / filter-* / stash drop）',
+  'git-force-push': '强制推送远端历史（push --force / --force-with-lease / -f）',
+  'db-ddl': '删除或清空数据库对象（DROP TABLE|DATABASE|SCHEMA / TRUNCATE TABLE）',
+  'perm-recursive': '递归修改权限或属主（chmod -R / chown -R / chgrp -R）',
+  'process-kill': '强制结束进程（taskkill /F）',
+  'raw-write': '向文件或设备裸写（dd of=…，裸设备本身是红线）',
+};
+
+/** The three tiers a category can sit at. */
+export const DESTRUCTIVE_TIERS = ['allow', 'confirm', 'deny'];
+
 export const DEFAULT_CONFIG = {
   /** Absolute paths whose files are in scope. Empty = auto-detect a VCS root. */
   project_roots: [],
@@ -276,6 +304,39 @@ export const DEFAULT_CONFIG = {
     '.turbo', '.parcel-cache', 'tmp', 'temp',
   ],
   destructive_allow_patterns: [],
+  /**
+   * Three-tier destructive policy (2026-11-05).
+   *
+   * `true`  - unrecoverable targets are blocked outright, ordinary deletes ask
+   *           the user instead of being refused.
+   * `false` - rollback: every destructive finding is blocked, exactly the
+   *           behaviour before this switch existed.
+   */
+  destructive_confirm_mode: true,
+  /**
+   * Per-category permission tiers.
+   *
+   * `allow`   - run it without asking (the user has granted this class)
+   * `confirm` - ask the user (the default for recoverable-but-serious work)
+   * `deny`    - refuse it (the user tightened the gate)
+   *
+   * `db-ddl` starts at `deny` on purpose: a dropped schema is the one class here
+   * that routinely destroys data no backup covers. Granting it is a deliberate
+   * act (`/gate grant db-ddl`), not something that happens because a default
+   * leaned permissive.
+   *
+   * A policy-level `deny` cannot be reopened by a session grant: tightening is
+   * always stronger than loosening (see `effectiveDestructiveTier`).
+   */
+  destructive_grants: {
+    delete: 'confirm',
+    'git-history': 'confirm',
+    'git-force-push': 'confirm',
+    'db-ddl': 'deny',
+    'perm-recursive': 'confirm',
+    'process-kill': 'confirm',
+    'raw-write': 'confirm',
+  },
 
   // -------------------------------------------------------------------------
   // v5: domain profiles (AI4S dry lab / quant)
@@ -404,6 +465,20 @@ export const normalizePolicy = (raw) => {
     const n = raw === null || raw === undefined || raw === '' ? NaN : Number(raw);
     config[key] = Number.isFinite(n) && n >= 0 ? n : DEFAULT_CONFIG[key];
   }
+
+  // `destructive_grants` is merged one key at a time, not replaced wholesale: a
+  // policy.json that grants one category must not silently reset the other six
+  // to "missing", which the tier lookup would read as "not configured".
+  const grants = {};
+  for (const [name, tier] of Object.entries(DEFAULT_CONFIG.destructive_grants)) grants[name] = tier;
+  const rawGrants = raw?.config?.destructive_grants;
+  if (rawGrants && typeof rawGrants === 'object' && !Array.isArray(rawGrants)) {
+    for (const [name, tier] of Object.entries(rawGrants)) {
+      if (!Object.prototype.hasOwnProperty.call(DESTRUCTIVE_CATEGORIES, name)) continue;
+      if (DESTRUCTIVE_TIERS.includes(tier)) grants[name] = tier;
+    }
+  }
+  config.destructive_grants = grants;
 
   // Two accepted shapes for `profiles`; see the comment in the return below.
   const profiles = new Map();
@@ -766,6 +841,13 @@ export const newSessionState = () => ({
   unlocks: new Map(),
   /** Files this session itself wrote; reading them back is always fine. */
   written: new Set(),
+  /**
+   * Per-category grants the user made for THIS session only, through the
+   * confirmation dialog. Kept in memory: a session grant must not outlive the
+   * conversation that granted it, and it must not be writable by the agent
+   * (see the `no-self-grant` check).
+   */
+  destructiveGrants: new Map(),
   /** How many times the gate has blocked, to bound the damage of a false rule. */
   blocks: 0,
   /** When the current cap window started; 0 = no block yet. */
@@ -1525,6 +1607,159 @@ const isDisposablePath = (raw, cwd, config) => {
 };
 
 /**
+ * Is deleting this path unrecoverable, as opposed to "recoverable, but the user
+ * should still be asked"?
+ *
+ * The distinction the gate actually needs is not "does the path look like build
+ * output" (that is `isDisposablePath`) but "can this be undone". Four shapes
+ * cannot: the filesystem root, a top-level directory, anything at or above the
+ * user's home directory, and anything at or above the current working directory
+ * (removing an ancestor removes the working directory with it). A git repository
+ * root that none of those cover still takes its whole history with it, so an
+ * optional probe can name it.
+ *
+ * A `..` segment is judged on the RAW token: `normalize()` collapses it, which
+ * would hide an escape like `data/../..` that lands on the repository parent.
+ *
+ * Everything else - a single file, a named data directory, a build tree - is
+ * recoverable enough to be a question rather than a refusal.
+ *
+ * @param {string} raw        the path token as written in the command
+ * @param {string|null} cwd   the directory the command runs in
+ * @param {((dir: string) => boolean)|null} isGitRepo  optional disk probe; null = never look at disk
+ * @returns {boolean}
+ */
+const unrecoverableTarget = (raw, cwd, isGitRepo = null) => {
+  const rawPosix = String(raw).replace(/\\/g, '/');
+  if (rawPosix.split('/').includes('..')) return true;
+
+  const resolved = resolveShellPath(raw, cwd);
+  // A path this parser cannot resolve ($VAR, a URL, a shell placeholder) is not
+  // evidence of a catastrophe. Guessing here would block work the parser merely
+  // failed to understand - the same failure mode `parseBashCommand` avoids.
+  if (!resolved) return false;
+
+  const posix = resolved.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  if (posix === '' || posix === '/') return true; // filesystem root
+  if (/^[a-z]:$/.test(posix)) return true; // drive root
+  const segments = posix.split('/').filter(Boolean);
+  if (segments.length <= 1) return true; // /tmp, /usr, /home: removing a top-level tree
+
+  const home = (process.env.HOME ?? process.env.USERPROFILE ?? '')
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+  if (home && (posix === home || home.startsWith(`${posix}/`))) return true;
+
+  const cwdPosix = cwd
+    ? normalize(cwd).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+    : '';
+  if (cwdPosix && (posix === cwdPosix || cwdPosix.startsWith(`${posix}/`))) return true;
+
+  if (typeof isGitRepo === 'function') {
+    try {
+      if (isGitRepo(resolved)) return true;
+    } catch {
+      // A probe that throws is not evidence of anything; fall through to the
+      // recoverable branch instead of turning a filesystem hiccup into a block.
+    }
+  }
+  return false;
+};
+
+/** Severity of deleting `raw`: `high` when it cannot be undone, else `confirm`. */
+const targetSeverity = (raw, cwd, isGitRepo = null) => {
+  if (typeof raw !== 'string' || raw === '') return 'high';
+  return unrecoverableTarget(raw, cwd, isGitRepo) ? 'high' : 'confirm';
+};
+
+/**
+ * Resolve the tier for a permission category.
+ *
+ * Precedence is deliberately asymmetric: **tightening beats loosening**.
+ *
+ *   policy `deny`  -> deny   (the user said "never"; a session cannot reopen it)
+ *   session `deny` -> deny   (a session may always be stricter than its policy)
+ *   session `allow`-> allow  (the grant made in the dialog)
+ *   policy `allow` -> allow  (the grant made through `/gate`)
+ *   otherwise      -> confirm
+ *
+ * The asymmetry is the whole point: if loosening won, an agent that talked a
+ * user into one session grant would also undo a permanent `deny`.
+ *
+ * @param {string} category
+ * @param {object} config
+ * @param {object} [state] session state (its grants are memory-only)
+ * @returns {'allow'|'confirm'|'deny'}
+ */
+export const effectiveDestructiveTier = (category, config, state) => {
+  const policyTier = config?.destructive_grants?.[category];
+  const sessionTier =
+    state?.destructiveGrants instanceof Map
+      ? (state.destructiveGrants.get(category) ?? null)
+      : (state?.destructiveGrants?.[category] ?? null);
+
+  if (policyTier === 'deny') return 'deny';
+  if (sessionTier === 'deny') return 'deny';
+  if (sessionTier === 'allow') return 'allow';
+  if (policyTier === 'allow') return 'allow';
+  return 'confirm';
+};
+
+/**
+ * Where the machine-local gate override lives.
+ *
+ * The bridge writes this same file when it generates `policy.json`, so a grant
+ * made here survives `apply` (which regenerates `policy.json`) instead of being
+ * overwritten by it. Deliberately outside every repository: a permission is a
+ * property of the machine and its user, not of the code being worked on.
+ */
+export const machineGateConfigPath = (home = null) => {
+  const base = home ?? process.env.HOME ?? process.env.USERPROFILE ?? '';
+  return base ? join(base, '.config', 'agent-config-bridge', 'gate-policy.json') : null;
+};
+
+/**
+ * Merge the machine-local `config` override into a loaded policy.
+ *
+ * The bridge already does this at install time, but a grant must take effect the
+ * moment the user makes it, not at the next `apply`. Reading it here keeps one
+ * source of truth for both paths: the installed `policy.json` and the live
+ * override never disagree about a tier.
+ */
+export const applyMachineOverride = (policy, home = null) => {
+  const file = machineGateConfigPath(home);
+  if (!file) return policy;
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    // Absent or unreadable: the shipped policy stands. A broken override must
+    // not disable the gate, and it must not silently reset grants either.
+    return policy;
+  }
+  const override = parsed?.config;
+  if (!override || typeof override !== 'object' || Array.isArray(override)) return policy;
+
+  const config = { ...policy.config, ...override };
+  // Grants merge per key. Replacing the object wholesale would make a single
+  // granted category reset the other six to "not configured".
+  const grants = { ...(policy.config.destructive_grants ?? {}) };
+  if (override.destructive_grants && typeof override.destructive_grants === 'object') {
+    for (const [name, tier] of Object.entries(override.destructive_grants)) {
+      if (
+        Object.prototype.hasOwnProperty.call(DESTRUCTIVE_CATEGORIES, name) &&
+        DESTRUCTIVE_TIERS.includes(tier)
+      ) {
+        grants[name] = tier;
+      }
+    }
+  }
+  config.destructive_grants = grants;
+  return { ...policy, config };
+};
+
+/**
  * Detect a destructive shell operation that must not run unattended.
  *
  * This is Layer 0 in mechanical form: the thinking rule says "know the root
@@ -1533,7 +1768,7 @@ const isDisposablePath = (raw, cwd, config) => {
  * rule is intentionally narrow: build directories (`node_modules`, `dist`, …)
  * and temp directories remain disposable, so routine cleanup is not blocked.
  *
- * @returns {{why: string, segment: string}|null}
+ * @returns {{why: string, segment: string, severity: 'high'|'confirm'}|null}
  */
 /**
  * Host-level destructive verbs, matched against the analysed command head.
@@ -1551,7 +1786,17 @@ const isDisposablePath = (raw, cwd, config) => {
 const HOST_DESTRUCTIVE_VERB =
   /^(?:mkfs(?:\.[a-z0-9]+)?|fdisk|parted|diskpart(?:\.exe)?|format(?:\.(?:com|exe))?|format-volume)$/;
 
-export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd = null } = {}, depth = 0) => {
+/**
+ * Raw block devices, where `dd of=` is unrecoverable rather than merely risky.
+ *
+ * Matched by device family, not by a prefix on the whole path: `/dev/sda` and
+ * `/dev/nvme0n1` are devices, `/dev/shm/x` is memory-backed scratch and a plain
+ * file target is a permission the user may grant.
+ */
+const RAW_DEVICE =
+  /^\/dev\/(?:sd[a-z]|nvme\d|hd[a-z]|vd[a-z]|xvd[a-z]|disk\d|mmcblk\d|loop\d|dm-\d|md\d|sr\d|nbd\d|zram\d)|^\\[.?]\\physicaldrive/i;
+
+export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd = null, isGitRepo = null } = {}, depth = 0) => {
   if (typeof command !== 'string' || command === '' || depth > 2) return null;
   const allow = (config.destructive_allow_patterns ?? []).some((src) => {
     try {
@@ -1570,7 +1815,20 @@ export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd =
     const { verb, args } = parseCommandHead(tokens);
     if (!verb) continue;
     const values = args.map((a) => a.value);
-    const finding = (why) => ({ why, segment: segment.trim().slice(0, 200) });
+    /**
+     * `high`    - a guardrail: unrecoverable, and no grant can reach it.
+     * `confirm` - a permission: the category's tier decides allow/ask/deny.
+     *
+     * `high` is the default on purpose: a branch that forgets to pass a
+     * severity keeps the un-grantable behaviour instead of silently becoming a
+     * question the user can click through.
+     */
+    const finding = (why, severity = 'high', category = null) => ({
+      why,
+      segment: segment.trim().slice(0, 200),
+      severity,
+      category,
+    });
 
     if (verb === 'cd' || verb === 'pushd') {
       const target = args.find((a) => a.quoted || !a.value.startsWith('-'));
@@ -1583,7 +1841,11 @@ export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd =
     if (['sh', 'bash', 'zsh', 'dash', 'ksh', 'cmd', 'powershell', 'pwsh'].includes(verb)) {
       const flagAt = values.findIndex((v) => ['-c', '/c', '/C', '-Command', '-command'].includes(v));
       if (flagAt >= 0 && values[flagAt + 1]) {
-        const nested = bashDestructiveFinding(values.slice(flagAt + 1).join(' '), { config, cwd: activeCwd }, depth + 1);
+        const nested = bashDestructiveFinding(
+          values.slice(flagAt + 1).join(' '),
+          { config, cwd: activeCwd, isGitRepo },
+          depth + 1,
+        );
         if (nested) return nested;
       }
       continue;
@@ -1595,42 +1857,67 @@ export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd =
       const targets = values.filter((v) => !v.startsWith('-'));
       const dangerous = targets.filter((t) => !isDisposablePath(t, activeCwd, config));
       if (dangerous.length > 0 && (recursive || force || targets.length > 1)) {
-        return finding(`${verb} ${recursive ? 'recursive ' : ''}${force ? 'forced ' : ''}on ${dangerous[0]}`);
+        // One unrecoverable target is enough to make the whole command high:
+        // `rm -rf scratch.txt $HOME` must not become a question.
+        const severity = dangerous.some((t) => unrecoverableTarget(t, activeCwd, isGitRepo))
+          ? 'high'
+          : 'confirm';
+        return finding(
+          `${verb} ${recursive ? 'recursive ' : ''}${force ? 'forced ' : ''}on ${dangerous[0]}`,
+          severity,
+          'delete',
+        );
       }
     }
 
     if (verb === 'git') {
       const sub = commandBase(values[0] ?? '');
       const rest = values.slice(1);
-      if (sub === 'reset' && rest.includes('--hard')) return finding('git reset --hard discards uncommitted work');
+      // Every git branch below is a *permission*, not a guardrail: discarding
+      // local work or rewriting a branch you own is a normal thing to want, and
+      // the user can grant it (`/gate grant git-history`). The guardrail tier is
+      // reserved for things no grant can undo.
+      if (sub === 'reset' && rest.includes('--hard')) {
+        return finding('git reset --hard discards uncommitted work', 'confirm', 'git-history');
+      }
       if (sub === 'clean' && rest.some((v) => /^-[a-z]*f/.test(v) || v === '--force')) {
-        return finding('git clean --force deletes untracked files');
+        return finding('git clean --force deletes untracked files', 'confirm', 'git-history');
       }
       if (sub === 'checkout' && (rest.includes('--') || rest.includes('.'))) {
-        return finding('git checkout -- . discards uncommitted work');
+        return finding('git checkout -- . discards uncommitted work', 'confirm', 'git-history');
       }
       if (sub === 'restore' && !rest.includes('--staged')) {
-        return finding('git restore discards uncommitted work');
+        return finding('git restore discards uncommitted work', 'confirm', 'git-history');
       }
       if (sub === 'push' && rest.some((v) => v === '--force' || v === '--force-with-lease' || /^-f$/.test(v))) {
-        return finding('git push --force rewrites shared history');
+        return finding('git push --force rewrites shared history', 'confirm', 'git-force-push');
       }
       if (sub === 'branch' && rest.some((v) => /^-[a-zA-Z]*D/.test(v) || v === '--delete')) {
-        return finding('git branch --delete removes a branch');
+        return finding('git branch --delete removes a branch', 'confirm', 'git-history');
       }
-      if (['filter-branch', 'filter-repo'].includes(sub)) return finding(`git ${sub} rewrites history`);
-      if (sub === 'stash' && ['drop', 'clear'].includes(rest[0])) return finding(`git stash ${rest[0]}`);
+      if (['filter-branch', 'filter-repo'].includes(sub)) {
+        return finding(`git ${sub} rewrites history`, 'confirm', 'git-history');
+      }
+      if (sub === 'stash' && ['drop', 'clear'].includes(rest[0])) {
+        return finding(`git stash ${rest[0]}`, 'confirm', 'git-history');
+      }
     }
 
     if (verb === 'find' && values.includes('-delete')) {
       const root = values.find((v) => !v.startsWith('-')) ?? '.';
-      if (!isDisposablePath(root, activeCwd, config)) return finding(`find ${root} -delete`);
+      if (!isDisposablePath(root, activeCwd, config)) {
+        return finding(`find ${root} -delete`, targetSeverity(root, activeCwd, isGitRepo), 'delete');
+      }
     }
 
     if (verb === 'dd' && values.some((v) => v.startsWith('of='))) {
       const target = values.find((v) => v.startsWith('of=')).slice(3);
-      if (!['/dev/null', 'nul'].includes(target.toLowerCase()) && !isDisposablePath(target, activeCwd, config)) {
-        return finding(`dd of=${target}`);
+      if (['/dev/null', 'nul'].includes(target.toLowerCase())) return null;
+      // Writing to a raw device is a guardrail: there is no "undo" for it. A
+      // plain file is a permission the user may grant.
+      if (RAW_DEVICE.test(target)) return finding(`dd of=${target} writes a raw device`);
+      if (!isDisposablePath(target, activeCwd, config)) {
+        return finding(`dd of=${target}`, 'confirm', 'raw-write');
       }
     }
 
@@ -1638,27 +1925,37 @@ export const bashDestructiveFinding = (command, { config = DEFAULT_CONFIG, cwd =
       return finding(`${verb} is a host-level destructive command`);
     }
     if (verb === 'init' && ['0', '6'].includes(values[0])) return finding('init 0/6 shuts the machine down');
-    if (verb === 'taskkill' && values.some((v) => v.toLowerCase() === '/f')) return finding('taskkill /F forcibly terminates processes');
+    if (verb === 'taskkill' && values.some((v) => v.toLowerCase() === '/f')) {
+      return finding('taskkill /F forcibly terminates processes', 'confirm', 'process-kill');
+    }
 
     if (['del', 'erase'].includes(verb) && values.some((v) => ['/s', '/q', '/f'].includes(v.toLowerCase()))) {
-      return finding(`${verb} deletes files recursively`);
+      const target = values.find((v) => !v.startsWith('-') && !v.startsWith('/'));
+      return finding(`${verb} deletes files recursively`, targetSeverity(target, activeCwd, isGitRepo), 'delete');
     }
     if (['rd', 'rmdir'].includes(verb) && values.some((v) => v.toLowerCase() === '/s')) {
-      return finding(`${verb} /s deletes a tree`);
+      const target = values.find((v) => !v.startsWith('-') && !v.startsWith('/'));
+      return finding(`${verb} /s deletes a tree`, targetSeverity(target, activeCwd, isGitRepo), 'delete');
     }
     if (verb === 'remove-item' && values.some((v) => v.toLowerCase().startsWith('-recurse'))) {
       const target = values.find((v) => !v.startsWith('-'));
-      if (!target || !isDisposablePath(target, activeCwd, config)) return finding('Remove-Item -Recurse');
+      if (!target || !isDisposablePath(target, activeCwd, config)) {
+        return finding('Remove-Item -Recurse', targetSeverity(target, activeCwd, isGitRepo), 'delete');
+      }
     }
     if (verb === 'stop-computer') return finding('Stop-Computer shuts the machine down');
 
     if (['chmod', 'chown', 'chgrp'].includes(verb) && values.some((v) => /^-[a-z]*R/.test(v))) {
       const target = values.filter((v) => !v.startsWith('-')).pop();
-      if (target && !isDisposablePath(target, activeCwd, config)) return finding(`${verb} -R on ${target}`);
+      if (target && !isDisposablePath(target, activeCwd, config)) {
+        return finding(`${verb} -R on ${target}`, targetSeverity(target, activeCwd, isGitRepo), 'perm-recursive');
+      }
     }
 
     const sql = `${verb} ${values.join(' ')}`.toLowerCase();
-    if (/^(?:drop\s+(?:table|database|schema)|truncate\s+table)\b/.test(sql)) return finding('destructive SQL');
+    if (/^(?:drop\s+(?:table|database|schema)|truncate\s+table)\b/.test(sql)) {
+      return finding('destructive SQL', 'confirm', 'db-ddl');
+    }
   }
   return null;
 };
@@ -1826,7 +2123,11 @@ export const powershellDestructiveFinding = (command, opts = {}) => {
     if (verb !== 'clear-content' && verb !== 'clc') continue;
     const target = args.map((a) => a.value).find((v) => !v.startsWith('-'));
     if (target && !isDisposablePath(target, cwd, config)) {
-      return { why: `${verb} wipes file contents`, segment: segment.trim().slice(0, 200) };
+      return {
+        why: `${verb} wipes file contents`,
+        segment: segment.trim().slice(0, 200),
+        severity: targetSeverity(target, cwd, opts.isGitRepo ?? null),
+      };
     }
   }
   return null;
@@ -2402,33 +2703,171 @@ const CHECKS = {
   },
 
   /**
-   * Layer 0: destructive shell operations never run unattended.
+   * Layer 0: destructive shell operations are never taken on the agent's own
+   * authority.
    *
-   * This is hard (not subject to the block cap). Deleting a source tree, hard
-   * resetting a worktree, force-pushing history or dropping a database is the
-   * class of action where "act first, understand later" is unrecoverable. Build
-   * output directories and temporary paths stay disposable so routine cleanup
-   * is not blocked.
+   * Two tiers, and the difference between them is the whole design:
+   *
+   *   guardrail  (`severity: 'high'`)    - unrecoverable. Deleting $HOME, the
+   *                                        cwd, a `..` escape, formatting a
+   *                                        disk, dd onto a raw device. NO grant
+   *                                        can reach these.
+   *   permission (`severity: 'confirm'`) - serious but survivable. The category's
+   *                                        tier decides allow / ask / deny.
+   *
+   * Hard (not subject to the block cap): a security rule must not stand down
+   * because a session hit its block limit.
    */
   'no-destructive-bash': (policy, input, deps) => {
     if (input.action !== 'bash') return null;
     const finding = shellDestructiveFinding(input, {
       config: policy.config,
       cwd: input.cwd ?? null,
+      // Injected, not imported: a git repository root is unrecoverable even when
+      // it is neither $HOME nor an ancestor of the cwd, but this file must stay
+      // disk-free when a harness supplies no probe.
+      isGitRepo: (dir) => deps?.fs?.exists?.(join(dir, '.git')) === true,
     });
     if (!finding) return null;
+
+    // ---- guardrail: not a permission, and no grant can reach it ----------
+    if (finding.severity === 'high') {
+      return {
+        code: 'DESTRUCTIVE_BASH',
+        reason: [
+          '⛔ 动脑子铁律 · Layer 0 拦截：这条命令不可恢复，任何授权都不会放行。',
+          `  原因：${finding.why}`,
+          `  命令：${finding.segment}`,
+          '',
+          '这一档是红线，不是权限：删 $HOME / 删 cwd / 含 .. 的路径 / 磁盘格式化 /',
+          '裸设备写入 / 关机重启。没有任何 /gate grant 能打开它。',
+          '',
+          '确实要做，请主人手动在终端执行。',
+          'node_modules / dist / build / .venv 等构建产物的清理不受此限制。',
+        ].join('\n'),
+      };
+    }
+
+    // ---- permission: the category's tier decides --------------------------
+    const category = finding.category ?? 'delete';
+    const tier = effectiveDestructiveTier(category, policy.config, deps?.state);
+
+    if (tier === 'deny') {
+      return {
+        code: 'DESTRUCTIVE_DENIED',
+        reason: [
+          `⛔ 门控拦截：「${category}」这一类操作已被设为拒绝。`,
+          `  原因：${finding.why}`,
+          `  命令：${finding.segment}`,
+          '',
+          `这是主人主动收紧的授权（policy 默认值，或 /gate deny ${category}）。`,
+          `要放开：/gate ask ${category}（改成每次询问）或 /gate grant ${category}（直接允许）。`,
+        ].join('\n'),
+      };
+    }
+
+    if (tier === 'allow') return null; // granted: run it
+
+    // `destructive_confirm_mode: false` is the rollback switch. It restores the
+    // pre-2026-11-05 behaviour, but only for the ask tier: the guardrail above
+    // never depended on this switch.
+    if (policy.config.destructive_confirm_mode === false) {
+      return {
+        code: 'DESTRUCTIVE_BASH',
+        reason: [
+          '⛔ 动脑子铁律 · Layer 0 拦截：破坏性命令不允许自动执行。',
+          `  原因：${finding.why}`,
+          `  命令：${finding.segment}`,
+          '',
+          '（destructive_confirm_mode 为 false：确认档也按硬拦处理）',
+          '要恢复分级：把 policy.json 的 config.destructive_confirm_mode 设为 true。',
+        ].join('\n'),
+      };
+    }
+
     return {
-      code: 'DESTRUCTIVE_BASH',
+      code: 'DESTRUCTIVE_CONFIRM',
+      confirm: true,
+      confirmCategory: category,
       reason: [
-        '⛔ 动脑子铁律 · Layer 0 拦截：破坏性命令不允许自动执行。',
+        `⚠️ 需要确认：「${category}」这一类操作会丢弃可恢复但重要的东西。`,
         `  原因：${finding.why}`,
         `  命令：${finding.segment}`,
         '',
-        '先确认根因和影响范围；确实要做，请主人手动执行，或把该模式加入',
-        'policy.json 的 config.destructive_allow_patterns。',
-        'node_modules / dist / build / .venv 等构建产物的清理不受此限制。',
+        '交互模式会弹窗，可选「允许这一次」/「本会话允许这一类」/「拒绝」。',
+        '无 UI 的自动化运行会直接执行并记一行日志。',
+        '不可恢复的操作（删 $HOME / 删 cwd / 含 .. / 磁盘格式化 / 裸设备写入）仍被硬拦，没有授权口。',
+        `想永久调整：/gate list 看当前档位，/gate grant ${category} 或 /gate deny ${category}。`,
       ].join('\n'),
     };
+  },
+
+  /**
+   * A grant must be given by the user, never taken by the agent.
+   *
+   * The permission tiers live in two files: the installed `policy.json` and the
+   * machine-local `gate-policy.json`. If the agent could edit either one, every
+   * tier above would be decorative - it would grant itself `allow` on `db-ddl`
+   * and carry on. So the only supported way to change them is the `/gate`
+   * command, which the user types; a write that carries `destructive_grants` is
+   * refused here.
+   */
+  'no-self-grant': (policy, input, deps) => {
+    const isGateFile = (p) => {
+      const posix = String(p ?? '').replace(/\\/g, '/').toLowerCase();
+      if (!posix) return false;
+      return (
+        posix.endsWith('/.config/agent-config-bridge/gate-policy.json') ||
+        /\/extensions\/enforce-rules\/policy\.json$/.test(posix)
+      );
+    };
+
+    if (input.action === 'write') {
+      if (!isGateFile(input.path)) return null;
+      // Only the grants block is protected: a user may still fix a typo in
+      // another field by hand, and a tool that rewrites the whole file without
+      // touching grants is not self-granting.
+      if (typeof input.content === 'string' && !/destructive_grants/.test(input.content)) return null;
+      return {
+        code: 'GATE_SELF_GRANT',
+        reason: [
+          '⛔ 门控自保护：agent 不能给自己提权。',
+          `  目标：${input.path}`,
+          '',
+          '这次写入会改动破坏性操作的授权表（destructive_grants）。授权只能由用户亲手给：',
+          '  1) 交互弹窗里选「本会话允许 <类别>」—— 只对当前会话有效；',
+          '  2) 敲 /gate grant <类别> —— 持久（写机器本地 gate-policy.json）；',
+          '  3) 敲 /gate deny <类别> —— 收紧；/gate list 查看当前档位。',
+          '',
+          '为什么不让 agent 写：如果 agent 能改授权表，所有分级都变成装饰——',
+          '它只要给自己 allow db-ddl 就绕过了整个门控。',
+        ].join('\n'),
+      };
+    }
+
+    if (input.action === 'bash') {
+      const targets = shellWriteTargets(input, {
+        config: policy.config,
+        cwd: input.cwd ?? null,
+        isFile: deps?.isFile,
+        exists: deps?.exists,
+      });
+      const hit = targets.find(isGateFile);
+      if (!hit) return null;
+      return {
+        code: 'GATE_SELF_GRANT',
+        reason: [
+          '⛔ 门控自保护：agent 不能给自己提权。',
+          `  目标：${hit}`,
+          '',
+          '用 shell 改写授权表同样不允许。授权只能由用户亲手给：',
+          '  /gate grant <类别> / /gate ask <类别> / /gate deny <类别> / /gate list',
+          '',
+          '为什么不让 agent 写：如果 agent 能改授权表，所有分级都变成装饰。',
+        ].join('\n'),
+      };
+    }
+    return null;
   },
 
   /** Don't read source before consulting the code graph. */
@@ -2708,6 +3147,10 @@ export const HARD_CHECKS = new Set([
   'no-write-outside',
   'no-secret-write',
   'no-destructive-bash',
+  // The self-grant guard protects the permission table itself. If it stood down
+  // under the block cap, an agent could spend the cap and then write itself an
+  // `allow` on `db-ddl`.
+  'no-self-grant',
   // ai-spec 契约门控：不得因拦截上限而失效——它守的是「不跑偏」，与安全同级。
   'chg-contract-before-edit',
 ]);
@@ -2755,12 +3198,43 @@ export const shouldBlock = ({ policy, input, state, exists, fs, now = Date.now()
     if (!check) continue; // unknown check names are ignored, not fatal
     const verdict = check(policy, input, { state, exists: probes.exists, fs: probes, ...probes, now });
     if (verdict) {
+      // A confirmation is not a refusal: the call has not been denied, the user
+      // has not been asked yet. Counting it against the block cap would let a
+      // few ordinary deletes spend the session's rule budget, and reporting
+      // `block: true` would stop the adapter from ever asking.
+      if (verdict.confirm) {
+        return {
+          block: false,
+          code: null,
+          reason: null,
+          capReached: overCap,
+          confirm: true,
+          confirmReason: verdict.reason ?? null,
+          confirmCategory: verdict.confirmCategory ?? null,
+        };
+      }
       state.blocks += 1;
       if (!(state.firstBlockAt > 0)) state.firstBlockAt = now;
-      return { block: true, code: verdict.code, reason: verdict.reason, capReached: false };
+      return {
+        block: true,
+        code: verdict.code,
+        reason: verdict.reason,
+        capReached: false,
+        confirm: false,
+        confirmReason: null,
+        confirmCategory: null,
+      };
     }
   }
-  return { block: false, code: null, reason: null, capReached: overCap };
+  return {
+    block: false,
+    code: null,
+    reason: null,
+    capReached: overCap,
+    confirm: false,
+    confirmReason: null,
+    confirmCategory: null,
+  };
 };
 
 // ---------------------------------------------------------------------------

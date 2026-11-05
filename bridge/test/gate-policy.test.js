@@ -292,7 +292,15 @@ test('cap: safety checks keep running after the research cap', () => {
   assert.equal(read.capReached, true);
   assert.deepEqual(
     [...HARD_CHECKS].sort(),
-    ['chg-contract-before-edit', 'no-destructive-bash', 'no-secret-write', 'no-write-outside'],
+    [
+      'chg-contract-before-edit',
+      'no-destructive-bash',
+      'no-secret-write',
+      // Guards the permission table itself: if this stood down under the cap, an
+      // agent could spend the cap and then grant itself `allow` on `db-ddl`.
+      'no-self-grant',
+      'no-write-outside',
+    ],
   );
 });
 

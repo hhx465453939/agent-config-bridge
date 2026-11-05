@@ -34,6 +34,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   analysisScriptTargets,
+  applyMachineOverride,
   loadPolicy,
   newSessionState,
   normalizePath,
@@ -159,16 +160,18 @@ export function apply(ctx, config = {}) {
               .map((c) => `    ${c}`)
               .join('\n'),
         };
-  const policy = loaded.ok
-    ? loaded.policy
-    : {
-        name: 'enforce-rules',
-        version: 1,
-        description: 'fallback: policy unreadable, gate inactive',
-        reminded: '',
-        checks: [],
-        config: { max_blocks_per_session: 0, signal_ttl_ms: 0 },
-      };
+  const policy = applyMachineOverride(
+    loaded.ok
+      ? loaded.policy
+      : {
+          name: 'enforce-rules',
+          version: 1,
+          description: 'fallback: policy unreadable, gate inactive',
+          reminded: '',
+          checks: [],
+          config: { max_blocks_per_session: 0, signal_ttl_ms: 0 },
+        },
+  );
 
   if (!loaded.ok) {
     // Fail open, loudly. A gate that bricks the agent because of a typo in a
@@ -260,6 +263,11 @@ export function apply(ctx, config = {}) {
         fs: realFs,
       });
       if (verdict.block) return { kind: 'deny', reason: verdict.reason };
+      // Three-tier destructive policy (CHG-20261105): a `confirm` finding is not
+      // a refusal. dsh's pre-execute exposes only `deny` and `next` - there is
+      // no UI channel to ask through - so a recoverable delete degrades to
+      // "run it". The `high` tier above still denies, which is why this is a
+      // capability difference between harnesses and not a hole in the rule.
       // AI4S: remember the script this call runs (W1 first-run test, W4 log date).
       for (const script of analysisScriptTargets(command, {
         config: effective.config,
