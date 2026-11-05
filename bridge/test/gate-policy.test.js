@@ -37,6 +37,7 @@ import {
   recordSignal,
   recordUnlocks,
   recordWrite,
+  scopeOf,
   shouldBlock,
   unlockTokensFromQualifiedName,
   unlockTokensFromText,
@@ -482,6 +483,68 @@ test('think: an existing file needs a read or a scoped graph hit, not a session 
     now: 1_000_000,
   });
   assert.equal(freshFile.block, false, 'a new file has nothing to inspect; do not brick greenfield work');
+});
+
+test('think: a broad project root does not erase the repository its own conventions', () => {
+  // The machine-local override covers non-git working directories by listing a
+  // whole dev tree as the boundary (see the target manifest). Answering "the
+  // project is <dev tree>" made this rule look for <dev tree>/AGENTS.md — a file
+  // that does not exist — so it was silently inert for every repository under
+  // it, which is the exact failure mode this gate exists to prevent.
+  const DEV_TREE = normalizePath(WIN32 ? 'C:\\code' : '/code');
+  const REPO = join(DEV_TREE, 'app');
+  const repoFile = join(REPO, 'packages', 'xyb', 'client.js');
+  const repoAgents = join(REPO, 'AGENTS.md');
+
+  const repoFs = {
+    exists: (p) => {
+      const n = normalizePath(p);
+      return (
+        n === normalizePath(repoAgents) ||
+        n === normalizePath(join(REPO, '.git')) ||
+        n === normalizePath(repoFile) ||
+        n === normalizePath(REPO)
+      );
+    },
+    isFile: (p) =>
+      [repoAgents, repoFile].map((x) => normalizePath(x)).includes(normalizePath(p)),
+    statMtime: () => 0,
+    listDir: () => [],
+  };
+
+  const p = policyFromObject({
+    name: 'broad-root',
+    checks: ['think-before-write'],
+    config: {
+      project_roots: [DEV_TREE],
+      require_target_evidence: false,
+      require_conventions: true,
+      convention_files: ['AGENTS.md'],
+      signal_ttl_ms: 0,
+    },
+  }).policy;
+
+  const scope = scopeOf(normalizePath(repoFile), { config: p.config, exists: repoFs.exists });
+  assert.equal(scope.inScope, true, 'the dev tree is still the boundary');
+  assert.equal(scope.root, DEV_TREE, 'the boundary stays the boundary');
+  assert.equal(scope.projectRoot, REPO, 'the project is the repository, not the dev tree');
+
+  const state = newSessionState();
+  const call = () =>
+    shouldBlock({
+      policy: p,
+      state,
+      input: { action: 'write', path: normalizePath(repoFile), tool: 'edit', content: 'x' },
+      fs: repoFs,
+      now: 1,
+    });
+
+  const first = call();
+  assert.equal(first.code, 'THINK_CONVENTIONS', 'the repository conventions are asked for');
+  assert.match(first.reason, /app/);
+
+  recordDocRead(state, normalizePath(repoAgents), 2);
+  assert.equal(call().block, false, 'reading the repository AGENTS.md satisfies it');
 });
 
 test('think: project conventions are required when they exist', () => {

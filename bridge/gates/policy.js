@@ -782,26 +782,43 @@ const withinRoot = (parent, child) => {
 };
 
 /**
- * Is this path in scope for the gate?
- * @returns {{inScope: boolean, reason: string, root: string|null}}
+ * Is this path in scope for the gate, and which project does it belong to?
+ *
+ * `root` is the BOUNDARY: the configured project root (or the detected repo)
+ * that decides whether the gate applies at all. `projectRoot` is the PROJECT:
+ * the nearest repository inside that boundary.
+ *
+ * The two are deliberately separate. A machine lists a whole dev tree as its
+ * boundary when it needs to cover non-git working directories (see the target
+ * manifest), and answering "the project is <dev tree>" made the conventions
+ * rule look for `<dev tree>/AGENTS.md` — a file that does not exist — so the
+ * rule was silently inert for every repository underneath. When the boundary IS
+ * the project (the usual case), both fields are identical and nothing changes.
+ * @returns {{inScope: boolean, reason: string, root: string|null, projectRoot: string|null}}
  */
 export const scopeOf = (filePath, { config = DEFAULT_CONFIG, exists }) => {
-  if (!filePath) return { inScope: false, reason: '没有路径', root: null };
-  if (!isAbsolute(filePath)) return { inScope: false, reason: '不是绝对路径', root: null };
-  if (!isCodeFile(filePath, config)) return { inScope: false, reason: '不是代码文件', root: null };
-  if (isExcluded(filePath, config)) return { inScope: false, reason: '在排除清单内（vendor/依赖/构建产物）', root: null };
+  const out = (inScope, reason, root = null, projectRoot = null) => ({ inScope, reason, root, projectRoot });
+  if (!filePath) return out(false, '没有路径');
+  if (!isAbsolute(filePath)) return out(false, '不是绝对路径');
+  if (!isCodeFile(filePath, config)) return out(false, '不是代码文件');
+  if (isExcluded(filePath, config)) return out(false, '在排除清单内（vendor/依赖/构建产物）');
+
+  const repoRoot = findRepoRoot(
+    filePath,
+    exists,
+    config.repo_markers ? { markers: config.repo_markers } : {},
+  );
 
   if (Array.isArray(config.project_roots) && config.project_roots.length > 0) {
-    const root = config.project_roots.find((r) => withinRoot(r, filePath));
-    return root
-      ? { inScope: true, reason: '在配置的项目根之下', root }
-      : { inScope: false, reason: '不在任何配置的项目根之下', root: null };
+    const boundary = config.project_roots.find((r) => withinRoot(r, filePath));
+    if (!boundary) return out(false, '不在任何配置的项目根之下');
+    const insideBoundary = repoRoot === boundary || (repoRoot && withinRoot(boundary, repoRoot));
+    return out(true, '在配置的项目根之下', boundary, insideBoundary ? repoRoot : boundary);
   }
 
-  const root = findRepoRoot(filePath, exists, config.repo_markers ? { markers: config.repo_markers } : {});
-  return root
-    ? { inScope: true, reason: '在某个代码仓库内', root }
-    : { inScope: false, reason: '不在任何代码仓库内', root: null };
+  return repoRoot
+    ? out(true, '在某个代码仓库内', repoRoot, repoRoot)
+    : out(false, '不在任何代码仓库内');
 };
 
 // ---------------------------------------------------------------------------
@@ -2493,7 +2510,7 @@ const CHECKS = {
     // 项目适用性：不用 CHG 体系的项目（如以 ADR 管理的仓库）不该被这条拦死。
     // 判据取文件系统事实：`tasks/` 存在且含 `CHG-*` 子目录，才认为本项目采纳了 CHG。
     // 不跳过的后果：任何不用 CHG 的仓库都改不了代码 —— 死锁。
-    const tasksDir = join(scope.root, 'tasks');
+    const tasksDir = join(scope.projectRoot ?? scope.root, 'tasks');
     if (!deps.exists(tasksDir)) return null;
     if (typeof deps.listDir === 'function') {
       const entries = deps.listDir(tasksDir) ?? [];
@@ -2554,7 +2571,7 @@ const CHECKS = {
       const norm = normalizePath(target);
       const scope = scopeOf(norm, { config, exists: deps.exists });
       if (!scope.inScope || !scope.root) continue;
-      roots.add(scope.root);
+      roots.add(scope.projectRoot ?? scope.root);
       if (config.require_target_evidence !== false) {
         if (deps.state.written.has(norm)) continue;
         // A directory or a path that does not exist yet: nothing to inspect.
@@ -2662,7 +2679,7 @@ const CHECKS = {
     // The Worklog lives at the project root, which the path itself tells us: a
     // script outside any repository cannot be judged, and guessing a root would
     // scope the rule to whatever directory the agent happened to start in.
-    const root = scopeOf(norm, { config, exists: deps.exists }).root
+    const root = scopeOf(norm, { config, exists: deps.exists }).projectRoot
       ?? findRepoRoot(norm, deps.exists);
     if (!root) return null; // unknown project: fail open, see ADR-011 §fail-open
 
@@ -2992,7 +3009,7 @@ const CHECKS = {
     const scope = scopeOf(input.path, { config: policy.config, exists: deps.exists });
     if (!scope.inScope || !scope.root) return null;
     if (deps.state.written.has(input.path)) return null;
-    const marker = join(scope.root, policy.config.index_marker);
+    const marker = join(scope.projectRoot ?? scope.root, policy.config.index_marker);
     if (deps.exists(marker)) return null;
     return {
       code: 'INDEX_FIRST',
@@ -3033,7 +3050,7 @@ const CHECKS = {
     // fall back to the session's own successful index refresh: the default
     // codebase-memory index lives in a global data directory, so requiring a
     // repo-local marker made this check abstain on every normal project.
-    const marker = join(scope.root, policy.config.index_marker);
+    const marker = join(scope.projectRoot ?? scope.root, policy.config.index_marker);
     let evidenceAt = 0;
     if (deps.exists(marker)) {
       evidenceAt = newestMtimeIn(marker, deps, deps.now, policy.config.index_mtime_ttl_ms);

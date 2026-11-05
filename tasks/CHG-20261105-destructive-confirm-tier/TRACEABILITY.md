@@ -156,3 +156,27 @@ node bridge/cli.js diff  --targets pi  # no changes
 ```
 node --test bridge/test/*.test.js   # 259 tests / 257 pass / 0 fail / 2 skipped（未设任何环境变量）
 ```
+
+### v2.2：边界 vs 项目根（AC-25）
+
+| AC | 断言 | 反证方式 |
+|---|---|---|
+| AC-25 | 配置边界为开发树、文件在边界内的 git 仓库时：`scope.root === <dev-root>`、`scope.projectRoot === <repo>`，写入未读约定的文件得 `THINK_CONVENTIONS`；读完仓库 `AGENTS.md` 后该规则不再拦；非仓库目录 `projectRoot` 退回边界 | 把 `root` 当作项目根使用（v2.1 及之前）→ 红 |
+
+安装副本实测（真实机器配置）：
+
+```
+boundary(root) = <dev-root>；projectRoot = <dev-root>/agent-config-bridge
+写入未读约定       -> THINK_CONVENTIONS
+读完 AGENTS.md 后  -> CHG_CONTRACT   （同一个根因的第二个失效规则，同时活了）
+```
+
+### 部署后的行为变化（告知用户）
+
+本次部署后，之前因同一个根因而静默失效的两条规则开始真的生效：
+
+1. 改代码前需要本会话读过该仓库的约定文档（AGENTS.md / CLAUDE.md / CONTRIBUTING.md / .cursorrules，存在才要求）；
+2. 改代码前需要本会话读过该仓库的 `tasks/CHG-*/SPEC.md`（或 PRD.md）。
+
+两条都早就在 `policy.json` 的 `checks` 里声明，不是新增规则；之前不生效是 bug。
+需要临时关闭时的合法通道：用户编辑机器本地 `gate-policy.json` 的 `config`（agent 不得自改，`no-self-grant` 只管授权表）。

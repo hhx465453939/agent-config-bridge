@@ -186,3 +186,61 @@ psql -c "select 1" / psql -f x.sql / echo 一段 DDL 文本 -> 不误报
 node --test bridge/test/*.test.js   # EXIT=0，259 tests / 257 pass / 0 fail / 2 skipped
 ```
 （259 = v2 的 258 + 1 项 DDL 客户端用例；2 skipped 为 Windows 平台跳过）
+
+---
+
+## v2.2（同批发现）：一个宽泛的 `project_roots` 让「读约定 / CHG 契约」静默失效
+
+### 现场证据（本机，部署后实测）
+
+机器本地 override `~/.config/agent-config-bridge/gate-policy.json` 把
+`project_roots` 写成开发树（`<dev-root>`），于是：
+
+```
+写入已读文件、未读任何约定  -> 放行（预期：THINK_CONVENTIONS）
+```
+
+打点结果：`scopeOf().root = <dev-root>`，`docs = []`、
+`exists(<dev-root>/CONTRIBUTING.md) = false`——规则在找 `<dev-root>` 下的约定文件，
+而那个目录里根本没有。同一根因也让 `chg-contract-before-edit` 失效：它找
+`<dev-root>/tasks`，同样不存在。
+
+### 根因：`root` 一个字段回答了两个不同问题
+
+1. **门控管不管这个文件？**（边界，应该宽——要盖住非 git 的工作目录）
+2. **这个文件属于哪个项目？**（项目根，应该窄——约定与 `tasks/` 都长在仓库根上）
+
+`scopeOf` 用一个 `root` 同时回答两者，于是「宽」把「窄」吃掉了。
+
+### 修法
+
+`scopeOf` 返回值新增 `projectRoot`：边界仍由 `project_roots` 决定（`root` 不变），
+`projectRoot` 取边界内**最近的 git 仓库根**，找不到则退回边界。
+消费点改用 `projectRoot ?? root`：`think-before-write`（约定）、
+`chg-contract-before-edit`（`tasks/`）、`index-before-read` / `index-freshness-before-read`
+（`.codebase-memory` 标记）、AI4S W1（Worklog）。
+
+边界就是项目时（常规配置），两个字段相同，行为零变化。
+
+### 修后实测（安装副本，真实机器配置）
+
+```
+boundary(root) = <dev-root>                     // 管辖范围不变
+projectRoot    = <dev-root>/agent-config-bridge  // 项目 = 仓库
+写入已读文件、未读约定 -> block THINK_CONVENTIONS   // 规则真的活着了
+读完 AGENTS.md 后     -> block CHG_CONTRACT        // 同一个修复带活的第二条
+非仓库目录           -> projectRoot = <dev-root>（退回边界，不惩罚无约定的目录）
+```
+
+### 行为变化（必须告知用户）
+
+本机部署后，之前静默失效的两条规则开始生效：
+改代码前需要「本会话读过该仓库的 AGENTS.md/CLAUDE.md/CONTRIBUTING.md」
+与「读过该仓库 `tasks/CHG-*/SPEC|PRD` 契约」。这是 policy.json 里本来声明的检查项，
+不是新增规则。
+
+### v2.2 基线（实测，未设任何环境变量）
+
+```
+node --test bridge/test/*.test.js   # EXIT=0，260 tests / 258 pass / 0 fail / 2 skipped
+```
