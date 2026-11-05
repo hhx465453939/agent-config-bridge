@@ -12,6 +12,9 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+// The operator's machine-local gate override must not reach these fixtures.
+import './isolate-home.js';
+
 import enforceRules from '../gates/pi/index.js';
 import { normalizePath } from '../gates/policy.js';
 

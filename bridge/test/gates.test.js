@@ -18,6 +18,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+// The operator's machine-local gate override must not reach these fixtures.
+import './isolate-home.js';
+
 import {
   DEFAULT_CONFIG,
   globToRegExp,

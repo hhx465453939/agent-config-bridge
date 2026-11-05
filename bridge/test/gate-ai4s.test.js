@@ -25,6 +25,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// The operator's machine-local gate override must not reach these fixtures.
+import './isolate-home.js';
+
 import enforceRules, { realFs } from '../gates/pi/index.js';
 import * as dsh from '../gates/dsh/index.js';
 import { classify } from '../gates/classifier.js';
