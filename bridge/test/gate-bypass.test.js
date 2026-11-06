@@ -471,3 +471,12 @@ test('config: both shipped policies declare the mode keys', () => {
     assert.equal(parsed.config.destructive_mode_until, 0, `${adapter}: no expiry`);
   }
 });
+
+test('config: the shipped pi reminder names the mode switch', () => {
+  // Discoverability is part of the feature: the reminder is the only place the
+  // model learns that a stalled dialog has a supported answer. Without this line
+  // the agent stares at a blocked delete and never tells the user about /gate mode.
+  const parsed = JSON.parse(readFileSync(join(GATES, 'pi', 'policy.json'), 'utf8'));
+  assert.match(parsed.reminder, /\/gate mode/);
+  assert.match(parsed.reminder, /红线仍拦/);
+});
