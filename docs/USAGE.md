@@ -296,7 +296,8 @@ node bridge/cli.js apply
 * **轮次级不偷懒**：一轮结束时只输出「稍后再补 / 后续再做 / 先不实现」而不动工具，会被要求继续做完；确实阻塞就写清阻塞点；
 * **bash / PowerShell 写入也算写入**：`> file`、`tee`、`sed -i`、`cp/mv/rm`、`Set-Content`、`Remove-Item` 都走凭据与越界检查；`git reset --hard` / `git clean -f` / `rm -rf` 源码目录 / `Remove-Item -Recurse` / 强推等破坏性命令直接拒绝；
 * **MCP 网关不豁免**：`mcp` 代理调用会按 `input.tool` 的真实工具名解包，再走同一套判定；
-* **dsh 的不对称**：dsh 没有结果钩子与轮次级注入，无法验证图谱结果是否有内容，也不启用需要结果/读取证据的检查；`bash` 读取已真正接入。
+* **破坏性命令有独立模式**：`/gate mode bypass` 只放开破坏性指令的授权档（删除 / git 历史 / 强推 / DDL / 递归改权限 / 杀进程 / 裸写），红线（删 `$HOME` / 删 cwd / 含 `..` / 磁盘格式化 / 裸设备写入 / 关机）**仍然拦**；图谱、契约、AI4S、密钥、越界写入等其它规则**完全不受影响**。`/gate mode bypass 8h` 到期自动回 `enforce`；`/gate mode bypass session` 只对当前会话生效且不写盘；agent 不能自己切（写 `destructive_mode` 会被 `no-self-grant` 拒绝）；
+* **dsh 的不对称**：dsh 没有结果钩子与轮次级注入，无法验证图谱结果是否有内容，也不启用需要结果/读取证据的检查；`bash` 读取已真正接入。dsh 也没有命令通道，`destructive_mode` 由 `apply` 或机器本地 override 提供，启动时若处于 bypass 会写一行告警。
 
 ### 6.1.1 按域加载检查（v5）：同一套门控，不同工作用不同规矩
 

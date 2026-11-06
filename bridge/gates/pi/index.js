@@ -21,7 +21,11 @@ import {
   analysisScriptTargets,
   applyMachineOverride,
   DESTRUCTIVE_CATEGORIES,
+  DESTRUCTIVE_MODES,
+  destructiveModeRemainingMs,
+  effectiveDestructiveMode,
   effectiveDestructiveTier,
+  isDestructiveBypass,
   machineGateConfigPath,
   bashReadTargets,
   graphResultIsEvidence,
@@ -165,6 +169,39 @@ const isSignalTool = (name) =>
   SIGNAL_TOOLS.some((s) => name === s || name.endsWith(`_${s}`));
 
 /**
+ * A `/gate mode` duration: `90s`, `30m`, `8h`, `2d`, or a bare number (hours).
+ *
+ * Returns `null` for anything else so the caller can refuse to write instead of
+ * guessing. A guessed expiry is worse than no expiry: the user believes the gate
+ * will tighten itself and it never does.
+ */
+export const parseGateDurationMs = (text) => {
+  const m = /^(\d+(?:\.\d+)?)\s*(s|m|h|d)?$/i.exec(String(text ?? '').trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = (m[2] ?? 'h').toLowerCase();
+  return Math.round(n * { s: 1000, m: 60000, h: 3600000, d: 86400000 }[unit]);
+};
+
+/** Human form of a duration, for the mode banner. */
+export const formatDurationMs = (ms) => {
+  const total = Math.max(0, Math.round(Number(ms) / 1000));
+  if (total >= 86400) {
+    const d = Math.floor(total / 86400);
+    const h = Math.floor((total % 86400) / 3600);
+    return h > 0 ? `${d}d${h}h` : `${d}d`;
+  }
+  if (total >= 3600) {
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    return m > 0 ? `${h}h${m}m` : `${h}h`;
+  }
+  if (total >= 60) return `${Math.floor(total / 60)}m`;
+  return `${Math.max(1, total)}s`;
+};
+
+/**
  * Fallback when policy.json cannot be read.
  *
  * v4 fails CLOSED for the safety rules instead of returning `checks: []`.
@@ -262,6 +299,9 @@ export default function enforceRules(pi, options = {}) {
     state.docReads.clear();
     state.failedCommands.clear();
     state.destructiveGrants.clear();
+    // A session override is memory-only by design, so a new session always starts
+    // from the global mode. Re-`session_start` also counts as a new session.
+    state.destructiveMode = null;
     state.lastInvestigationAt = 0;
     state.profile = policy.defaultProfile ?? 'general-dev';
     state.profileSource = 'fallback';
@@ -281,7 +321,19 @@ export default function enforceRules(pi, options = {}) {
       }
       return;
     }
-    if (ctx?.hasUI) {
+    if (isDestructiveBypass(policy.config, state)) {
+      // Loud on purpose. A silent bypass is indistinguishable from a working gate,
+      // and ADR-012 already recorded that "too strict" replaced by "naked" is
+      // worse than leaving it alone. stderr too, because a headless run has no UI.
+      const source = state.destructiveMode ? '本会话覆盖' : '全局设置';
+      const left = destructiveModeRemainingMs(policy.config);
+      const line =
+        `[enforce-rules] 破坏性命令 BYPASS 生效（${source}，${left === null ? '不过期' : `剩 ${formatDurationMs(left)}`}）：` +
+        `删除/git 重写/force push/DDL 等不再询问或拦截，红线（删 $HOME / 删 cwd / 含 .. / 磁盘格式化 / 裸设备写入 / 关机）仍然拦。` +
+        ` 其他门控规则（图谱/思考/契约/AI4S/密钥/越界写入）不受影响。 收回：/gate mode enforce`;
+      process.stderr.write(`${line}\n`);
+      if (ctx?.hasUI) ctx.ui.notify(line, 'warn');
+    } else if (ctx?.hasUI) {
       ctx.ui.notify(
         `enforce-rules: ${policy.name} active (${policy.checks.join(', ') || 'no checks'})`,
         'info',
@@ -701,7 +753,7 @@ export default function enforceRules(pi, options = {}) {
     typeof pi.registerCommand === 'function' ? pi.registerCommand.bind(pi) : null;
   registerGateCommand?.('gate', {
     description:
-      '破坏性操作授权：list / grant <类别> / ask <类别> / deny <类别> / reset <类别> / session <类别>',
+      '门控授权与模式：list / grant|ask|deny|reset|session <类别> / mode [bypass|enforce] [时长] [session]',
     handler: async (args, ctx) => {
       const notify = (text, level = 'info') => ctx?.ui?.notify?.(text, level);
       const tokens = String(args ?? '').trim().split(/\s+/).filter(Boolean);
@@ -709,8 +761,94 @@ export default function enforceRules(pi, options = {}) {
       const category = tokens[1] ?? null;
       const categories = Object.keys(DESTRUCTIVE_CATEGORIES);
 
-      const report = () => {
+      /**
+       * The machine-local override, read once per command.
+       *
+       * Factored out because BOTH the grant path and the mode path write this
+       * file; two hand-rolled parsers is how one of them ends up silently
+       * dropping the other's keys.
+       */
+      const readGateDoc = () => {
+        const file = machineGateConfigPath();
+        if (!file) {
+          return { error: '无法定位机器本地配置目录（HOME / USERPROFILE 均未设置）。' };
+        }
+        let doc = {};
+        if (existsSync(file)) {
+          try {
+            doc = JSON.parse(readFileSync(file, 'utf8')) ?? {};
+          } catch (err) {
+            return { error: `${file} 不是合法 JSON，先修好它：${err.message}` };
+          }
+        }
+        if (!doc || typeof doc !== 'object' || Array.isArray(doc)) doc = {};
+        if (!doc.config || typeof doc.config !== 'object' || Array.isArray(doc.config)) doc.config = {};
+        return { file, doc };
+      };
+
+      const writeGateDoc = (file, doc) => {
+        try {
+          mkdirSync(dirname(file), { recursive: true });
+          writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
+          return null;
+        } catch (err) {
+          return `写入 ${file} 失败：${err.message}`;
+        }
+      };
+
+      /** Everything the mode banner and the picker need, in one read. */
+      const modeState = () => {
         const merged = applyMachineOverride(policy);
+        const globalMode = DESTRUCTIVE_MODES.includes(merged.config.destructive_mode)
+          ? merged.config.destructive_mode
+          : 'enforce';
+        const sessionMode = DESTRUCTIVE_MODES.includes(state.destructiveMode)
+          ? state.destructiveMode
+          : null;
+        return {
+          merged,
+          globalMode,
+          until: Number(merged.config.destructive_mode_until ?? 0) || 0,
+          sessionMode,
+          effective: effectiveDestructiveMode(merged.config, state),
+          remaining: destructiveModeRemainingMs(merged.config),
+        };
+      };
+
+      /**
+       * The mode the destructive gate will actually apply, always stated first.
+       *
+       * ADR-013: a bypass nobody notices is the failure mode that makes the whole
+       * switch dangerous, so it is the first line of every report.
+       */
+      const modeLine = () => {
+        const m = modeState();
+        if (m.sessionMode) {
+          return `破坏性命令模式：${m.effective.toUpperCase()}（本会话覆盖 = ${m.sessionMode}）`;
+        }
+        if (m.globalMode === 'bypass') {
+          if (m.remaining === null) return '破坏性命令模式：BYPASS（全局，不过期）';
+          if (m.remaining > 0) return `破坏性命令模式：BYPASS（全局，剩 ${formatDurationMs(m.remaining)}）`;
+          return '破坏性命令模式：ENFORCE（全局 bypass 已到期）';
+        }
+        return '破坏性命令模式：ENFORCE（全局）';
+      };
+
+      const modeHelp = [
+        modeLine(),
+        '  只影响破坏性指令（删除 / git 历史 / force push / DDL / 权限递归 / 杀进程 / 裸写）；',
+        '  图谱优先、思考前置、CHG 契约、AI4S、密钥与越界写入等其他门控不受影响。',
+        '  bypass 下仍然拦的红线：删 $HOME / 删 cwd / 含 .. 的路径 / 磁盘格式化 / 裸设备写入 / 关机重启。',
+        '',
+        '  /gate mode bypass            全局 bypass（持久，直到改回）',
+        '  /gate mode bypass 8h         全局 bypass，8 小时后自动回 enforce（s/m/h/d）',
+        '  /gate mode enforce           全局 enforce',
+        '  /gate mode bypass session    仅本会话 bypass（不写盘，重开会话失效）',
+        '  /gate mode enforce session   仅本会话 enforce（覆盖全局）',
+      ].join('\n');
+
+      const report = () => {
+        const { merged } = modeState();
         const rows = categories.map((name) => {
           const tier = effectiveDestructiveTier(name, merged.config, state);
           const grant = merged.config.destructive_grants?.[name] ?? 'confirm';
@@ -721,22 +859,135 @@ export default function enforceRules(pi, options = {}) {
           );
         });
         return [
+          modeLine(),
+          '',
           '破坏性操作授权档位（allow=直接执行 / confirm=询问 / deny=拒绝）',
           '',
           ...rows,
           '',
-          '红线（任何授权都不放行）：删 $HOME、删 cwd、含 .. 的路径、磁盘格式化、裸设备写入、关机重启。',
+          '红线（任何授权、任何模式都不放行）：删 $HOME、删 cwd、含 .. 的路径、磁盘格式化、裸设备写入、关机重启。',
           '',
           '调整：/gate grant <类别>    持久允许',
           '      /gate ask <类别>      改为每次询问',
           '      /gate deny <类别>     拒绝',
           '      /gate reset <类别>    恢复默认',
           '      /gate session <类别>  仅本会话允许',
+          '      /gate mode ...        破坏性命令模式（enforce / bypass，见 /gate mode）',
         ].join('\n');
       };
 
       if (sub === 'list' || sub === 'status') {
         notify(report());
+        return;
+      }
+
+      /**
+       * `/gate mode` - the switch that is not a category (ADR-013).
+       *
+       * Parsed as an order-independent token list so `/gate mode bypass 8h` and
+       * `/gate mode 8h bypass` mean the same thing, and so a typo refuses to write
+       * instead of silently setting something the user did not ask for.
+       */
+      if (sub === 'mode' || sub === 'bypass' || sub === 'enforce') {
+        const modeTokens = sub === 'mode' ? tokens.slice(1) : tokens;
+        let action = '';
+        let sessionScope = false;
+        let durationMs = null;
+
+        for (const word of modeTokens) {
+          const lower = word.toLowerCase();
+          if (DESTRUCTIVE_MODES.includes(lower)) {
+            action = lower;
+            continue;
+          }
+          if (lower === 'session' || lower === '本会话') {
+            sessionScope = true;
+            continue;
+          }
+          const parsed = parseGateDurationMs(word);
+          if (parsed === null) {
+            notify(
+              `看不懂「${word}」。\n\n${modeHelp}`,
+              'warn',
+            );
+            return;
+          }
+          durationMs = parsed;
+        }
+        // `/gate mode 8h` is an unambiguous request for a bounded bypass.
+        if (!action && durationMs !== null) action = 'bypass';
+
+        if (!action) {
+          // No action: report, and offer a picker when the harness has one. The
+          // picker is the "选择这个 gate 的模式" path - a user should not have to
+          // remember the grammar to switch.
+          if (!(ctx?.hasUI && typeof ctx.ui?.select === 'function')) {
+            notify(`${modeHelp}\n\n${report()}`);
+            return;
+          }
+          const options = [
+            'bypass：全局 8 小时（到期自动回 enforce）',
+            'bypass：本会话（重开会话失效）',
+            'bypass：全局（持久，直到我改回来）',
+            'enforce：全局（清掉持久 bypass）',
+            'enforce：本会话（覆盖全局）',
+            '只看当前状态，不改',
+          ];
+          const picked = await ctx.ui.select(modeHelp, options);
+          const index = options.indexOf(picked);
+          if (index === -1 || index === options.length - 1) {
+            notify(`${modeHelp}\n\n${report()}`);
+            return;
+          }
+          action = index >= 3 ? 'enforce' : 'bypass';
+          sessionScope = index === 1 || index === 4;
+          durationMs = index === 0 ? 8 * 60 * 60 * 1000 : null;
+        }
+
+        if (sessionScope && durationMs !== null) {
+          notify('会话内覆盖没有到期概念（会话结束即失效），请去掉时长。', 'warn');
+          return;
+        }
+
+        if (sessionScope) {
+          state.destructiveMode = action;
+          notify(
+            action === 'bypass'
+              ? `本会话已进入破坏性命令 bypass：除红线外不再询问或拦截（重开会话自动回 enforce，其他门控规则不变）。\n\n${modeHelp}`
+              : `本会话已强制 enforce（覆盖全局设置）。\n\n${modeHelp}`,
+            action === 'bypass' ? 'warn' : 'info',
+          );
+          return;
+        }
+
+        const read = readGateDoc();
+        if (read.error) {
+          notify(read.error, 'error');
+          return;
+        }
+        read.doc.config.destructive_mode = action;
+        read.doc.config.destructive_mode_until =
+          action === 'bypass' && durationMs ? Date.now() + durationMs : 0;
+        const failure = writeGateDoc(read.file, read.doc);
+        if (failure) {
+          notify(failure, 'error');
+          return;
+        }
+        // A fresh global decision outranks a stale session override; leaving it
+        // in place would make this command look like it did nothing.
+        state.destructiveMode = null;
+        const expiry =
+          action === 'bypass' && durationMs
+            ? `，${formatDurationMs(durationMs)} 后自动回 enforce`
+            : action === 'bypass'
+              ? '，不过期'
+              : '';
+        notify(
+          action === 'bypass'
+            ? `破坏性命令已切到 BYPASS${expiry}（写入 ${read.file}）。\n红线仍然拦；图谱/思考/契约/AI4S/密钥/越界写入等其他规则不受影响。\n收回：/gate mode enforce\n\n${modeHelp}`
+            : `破坏性命令已切到 ENFORCE（写入 ${read.file}），授权档位恢复生效。\n\n${modeHelp}`,
+          action === 'bypass' ? 'warn' : 'info',
+        );
         return;
       }
 

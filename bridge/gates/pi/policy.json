@@ -76,6 +76,8 @@
       "process-kill": "confirm",
       "raw-write": "confirm"
     },
+    "destructive_mode": "enforce",
+    "destructive_mode_until": 0,
     "profiles_dir": "profiles",
     "worklog_path": "docs/WORKLOG.md",
     "worklog_ttl_ms": 1800000,

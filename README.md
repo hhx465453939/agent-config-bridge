@@ -143,12 +143,36 @@ bridge/gates/
 | `think-before-write` | 动脑子铁律：改已存在文件前必须**在有效期内**读过它（默认 30 分钟）或被图谱点名，并读过项目约定（存在才要求） | ✅ pi |
 | `no-blind-retry` | 同一条失败命令原样重试第 3 次前，必须先做调查（读代码 / 查图谱 / 真改） | ✅ pi |
 | `no-slack`（轮次级） | 一轮结束时若只输出「稍后再补 / 后续再做 / 先不实现」等第一人称拖延承诺，强制继续一轮（有次数上限） | ✅ pi |
-| `no-destructive-bash` | `git reset --hard` / `git clean -f` / `rm -rf` 源码目录 / `Remove-Item -Recurse` / 强推等破坏性命令一律拦截；构建产物目录可清理 | ✅ |
+| `no-destructive-bash` | 破坏性命令分两档：**红线**（删 `$HOME`/cwd、含 `..`、顶层目录、git 根、磁盘格式化、裸设备写入、关机）任何授权都不放行；其余按七类授权（删除 / git 历史 / 强推 / DDL / 递归改权限 / 杀进程 / 裸写）。构建产物目录可清理 | ✅ |
 | `no-secret-write` | 写入内容命中凭据模式时拦截；**shell 重定向、tee、sed -i 也算写入**；普通邮箱不再误判 | ✅ |
 | `no-write-outside` | 仅在配置了 `write_roots` 时生效，限制写入范围（含 shell 写入） | 可选 |
 | `index-before-read` | 仓库无 `.codebase-memory` 持久化标记时先建索引；**全局索引没有该标记，故默认关闭** | 可选 |
 
 策略文件是普通 JSON（`<扩展目录>/policy.json`），你可以直接改：改检查项、改作用范围、改"一个会话最多拦几次"。
+
+#### 破坏性命令的模式：`enforce` / `bypass`
+
+长任务（尤其彻夜跑）会被 `confirm` 档的弹窗卡住——人在睡觉，弹窗永远等不到答案。为此破坏性门控多了一维**模式**开关，**作用域只有破坏性指令，其他门控完全不牵扯**：
+
+| 档 | 破坏性指令 | 其他检查 |
+|---|---|---|
+| `enforce`（默认） | 按授权档位：直接执行 / 询问 / 拒绝 | 照常 |
+| `bypass` | 权限档全放开，不弹窗不拒绝；**红线仍拦** | **照常，逐字不变** |
+
+```
+/gate mode                  查看当前模式（有 UI 时弹选择器）
+/gate mode bypass           全局 bypass（持久，写机器本地 gate-policy.json）
+/gate mode bypass 8h        全局 bypass，8 小时后自动回 enforce（s/m/h/d）
+/gate mode enforce          全局 enforce
+/gate mode bypass session   仅本会话 bypass（不写盘，重开会话失效）
+/gate mode enforce session  仅本会话 enforce（覆盖全局）
+```
+
+三条边界写清楚：
+
+* **红线不参与 bypass**：删 `$HOME` / 删 cwd / 含 `..` / 顶层目录 / git 根 / 磁盘格式化 / 裸设备写入 / 关机，任何模式都拦；
+* **其他规则不参与 bypass**：图谱优先、思考前置、CHG 契约、AI4S、密钥与越界写入、no-blind-retry、轮末 no-slack 全部照旧——它们不是"点烦了的询问"，是门控存在的理由；
+* **agent 不能自己切**：写 `destructive_mode` 的写入会被 `no-self-grant` 拒绝，只有你敲 `/gate mode` 能改。
 
 ### 域门控：AI4S 科研工作流（v5）
 

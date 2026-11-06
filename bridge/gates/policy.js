@@ -122,6 +122,26 @@ export const DESTRUCTIVE_CATEGORIES = {
 
 /** The three tiers a category can sit at. */
 export const DESTRUCTIVE_TIERS = ['allow', 'confirm', 'deny'];
+/**
+ * The destructive-command gate's mode (ADR-013).
+ *
+ * SCOPE: `no-destructive-bash` ONLY. This is deliberately not a switch for the
+ * whole gate - the research rules, the secret/scope rules, the contract rule and
+ * the AI4S rules are not "questions the user gets tired of", they are the
+ * discipline the gate exists for, and silencing them because a delete at 03:00
+ * wants a dialog would trade one annoyance for a much worse blind spot.
+ *
+ *   enforce - the permission tiers decide allow / ask / deny.
+ *   bypass  - the permission layer of `no-destructive-bash` is off: no dialog,
+ *             no refusal. The unrecoverable guardrail inside that same check is
+ *             untouched, and `no-self-grant` keeps protecting this switch.
+ *
+ * Deliberately NOT a category either: seven categories answer "may the agent do
+ * this class of thing?"; the mode answers "should I keep being asked about
+ * deletes right now?" - a different axis with a different lifetime (one long
+ * night, then back).
+ */
+export const DESTRUCTIVE_MODES = ['enforce', 'bypass'];
 
 export const DEFAULT_CONFIG = {
   /** Absolute paths whose files are in scope. Empty = auto-detect a VCS root. */
@@ -337,6 +357,21 @@ export const DEFAULT_CONFIG = {
     'process-kill': 'confirm',
     'raw-write': 'confirm',
   },
+  /**
+   * Mode of the destructive-command gate (ADR-013). `enforce` is the only
+   * acceptable default: a gate that ships bypassed is indistinguishable from no
+   * gate at all. Scope is `no-destructive-bash` only - see `DESTRUCTIVE_MODES`.
+   */
+  destructive_mode: 'enforce',
+  /**
+   * When a `bypass` expires (ms epoch). 0 = never.
+   *
+   * This is what makes an unattended night safe: `/gate mode bypass 8h`, and the
+   * destructive gate tightens itself in the morning. A forgotten permanent
+   * bypass is exactly the "naked agent" ADR-012 warned about, so expiry is a
+   * first-class knob rather than a follow-up.
+   */
+  destructive_mode_until: 0,
 
   // -------------------------------------------------------------------------
   // v5: domain profiles (AI4S dry lab / quant)
@@ -447,6 +482,24 @@ const profileDirsFor = (fileOrUrl, policy) => {
 /** The signature the config accepts in place of a file path. */
 export const policyFromObject = (raw) => ({ ok: true, policy: normalizePolicy(raw), error: null });
 
+/** A destructive-gate mode string, or the fail-closed default. Never throws. */
+export const normalizeDestructiveMode = (raw) => {
+  const mode = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  return DESTRUCTIVE_MODES.includes(mode) ? mode : DEFAULT_CONFIG.destructive_mode;
+};
+
+/**
+ * An epoch-ms expiry, or 0 for "never".
+ *
+ * `null`/`''` mean "not set", NOT zero (the same trap `index_mtime_*` documents):
+ * `Number(null)` is 0, and turning an absent value into a real timestamp would
+ * make a bypass expire in 1970 — or, with a sign flip, never.
+ */
+export const normalizeDestructiveModeUntil = (raw) => {
+  const n = raw === null || raw === undefined || raw === '' ? NaN : Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+};
+
 export const normalizePolicy = (raw) => {
   const config = { ...DEFAULT_CONFIG, ...(raw?.config ?? {}) };
   config.code_extensions = config.code_extensions.map((e) => String(e).replace(/^\./, '').toLowerCase());
@@ -479,6 +532,13 @@ export const normalizePolicy = (raw) => {
     }
   }
   config.destructive_grants = grants;
+
+  // The mode keys are sanitized here rather than trusted: they are hand-edited in
+  // `policy.json` and written by `/gate`, and a typo must degrade to `enforce`
+  // (fail closed) - never to a gate that refuses to start, and never to one that
+  // silently stays open.
+  config.destructive_mode = normalizeDestructiveMode(config.destructive_mode);
+  config.destructive_mode_until = normalizeDestructiveModeUntil(config.destructive_mode_until);
 
   // Two accepted shapes for `profiles`; see the comment in the return below.
   const profiles = new Map();
@@ -865,6 +925,14 @@ export const newSessionState = () => ({
    * (see the `no-self-grant` check).
    */
   destructiveGrants: new Map(),
+  /**
+   * v6: this session's destructive-gate mode override (`/gate mode … session`).
+   *
+   * `null` means "follow the global `config.destructive_mode`". Memory-only on
+   * purpose: a session override must not outlive the conversation that made it,
+   * which is exactly why `/gate mode bypass session` needs no cleanup.
+   */
+  destructiveMode: null,
   /** How many times the gate has blocked, to bound the damage of a false rule. */
   blocks: 0,
   /** When the current cap window started; 0 = no block yet. */
@@ -1724,6 +1792,48 @@ export const effectiveDestructiveTier = (category, config, state) => {
 };
 
 /**
+ * Resolve the destructive gate's mode: session override first, then the global
+ * setting.
+ *
+ * Unlike `effectiveDestructiveTier` (where tightening beats loosening), the
+ * session override wins in BOTH directions. The threat models differ: a category
+ * grant can be talked out of a user through a dialog the AGENT caused, so a
+ * session grant must not undo a permanent `deny`; the mode is only reachable
+ * through a slash command the user types, which an agent cannot invoke.
+ * Precedence here is therefore "the most recent explicit user decision wins".
+ *
+ * An expired `destructive_mode_until` reads as `enforce` without rewriting the
+ * file - no timer, no background job, and the next `/gate mode` shows the expiry
+ * for what it is.
+ *
+ * @param {object} config
+ * @param {object} [state] session state (its `destructiveMode` is memory-only)
+ * @param {number} [now]
+ * @returns {'enforce'|'bypass'}
+ */
+export const effectiveDestructiveMode = (config, state, now = Date.now()) => {
+  const sessionMode = state?.destructiveMode;
+  if (DESTRUCTIVE_MODES.includes(sessionMode)) return sessionMode;
+
+  if (normalizeDestructiveMode(config?.destructive_mode) !== 'bypass') return 'enforce';
+  const until = normalizeDestructiveModeUntil(config?.destructive_mode_until);
+  if (until > 0 && now >= until) return 'enforce';
+  return 'bypass';
+};
+
+export const isDestructiveBypass = (config, state, now = Date.now()) =>
+  effectiveDestructiveMode(config, state, now) === 'bypass';
+
+/** How long until a bypass expires, in ms; `null` when it does not expire. */
+export const destructiveModeRemainingMs = (config, now = Date.now()) => {
+  if (normalizeDestructiveMode(config?.destructive_mode) !== 'bypass') return null;
+  const until = normalizeDestructiveModeUntil(config?.destructive_mode_until);
+  if (until <= 0) return null;
+  const left = until - now;
+  return left > 0 ? left : 0;
+};
+
+/**
  * Where the machine-local gate override lives.
  *
  * The bridge writes this same file when it generates `policy.json`, so a grant
@@ -1773,6 +1883,12 @@ export const applyMachineOverride = (policy, home = null) => {
     }
   }
   config.destructive_grants = grants;
+  // The mode keys come from a hand-editable file, so they get the same
+  // sanitization `normalizePolicy` applies. Without this a typo like
+  // `"destructive_mode": "Bypass "` would merge straight into the live config and
+  // silently decide the mode by string inequality.
+  config.destructive_mode = normalizeDestructiveMode(config.destructive_mode);
+  config.destructive_mode_until = normalizeDestructiveModeUntil(config.destructive_mode_until);
   return { ...policy, config };
 };
 
@@ -2801,6 +2917,13 @@ const CHECKS = {
 
     // ---- permission: the category's tier decides --------------------------
     const category = finding.category ?? 'delete';
+
+    // Bypass (ADR-013) turns the PERMISSION layer off - and only the permission
+    // layer: research, secret, scope, contract and AI4S checks are untouched and
+    // keep running in bypass. It sits AFTER the guardrail return above because
+    // the red lines are not a permission; no mode can reach them.
+    if (isDestructiveBypass(policy.config, deps?.state)) return null;
+
     const tier = effectiveDestructiveTier(category, policy.config, deps?.state);
 
     if (tier === 'deny') {
@@ -2875,23 +2998,30 @@ const CHECKS = {
 
     if (input.action === 'write') {
       if (!isGateFile(input.path)) return null;
-      // Only the grants block is protected: a user may still fix a typo in
-      // another field by hand, and a tool that rewrites the whole file without
-      // touching grants is not self-granting.
-      if (typeof input.content === 'string' && !/destructive_grants/.test(input.content)) return null;
+      // Only the grants block and the mode switch are protected: a user may still
+      // fix a typo in another field by hand, and a tool that rewrites the whole
+      // file without touching either is not self-granting.
+      //
+      // `destructive_mode` must be here too (ADR-013): writing
+      // `{"config":{"destructive_mode":"bypass"}}` would silently turn off the
+      // destructive permission layer for every future session - strictly worse
+      // than granting itself one category, because it is permanent and global.
+      if (typeof input.content === 'string' && !/destructive_grants|destructive_mode/.test(input.content)) return null;
       return {
         code: 'GATE_SELF_GRANT',
         reason: [
           '⛔ 门控自保护：agent 不能给自己提权。',
           `  目标：${input.path}`,
           '',
-          '这次写入会改动破坏性操作的授权表（destructive_grants）。授权只能由用户亲手给：',
+          '这次写入会改动破坏性操作的授权表（destructive_grants）或门控模式（destructive_mode）。',
+          '授权与模式只能由用户亲手改：',
           '  1) 交互弹窗里选「本会话允许 <类别>」—— 只对当前会话有效；',
           '  2) 敲 /gate grant <类别> —— 持久（写机器本地 gate-policy.json）；',
-          '  3) 敲 /gate deny <类别> —— 收紧；/gate list 查看当前档位。',
+          '  3) 敲 /gate deny <类别> —— 收紧；/gate list 查看当前档位；',
+          '  4) 敲 /gate mode bypass|enforce [时长] [session] —— 切换门控模式。',
           '',
-          '为什么不让 agent 写：如果 agent 能改授权表，所有分级都变成装饰——',
-          '它只要给自己 allow db-ddl 就绕过了整个门控。',
+          '为什么不让 agent 写：如果 agent 能改授权表或模式开关，所有分级都变成装饰——',
+          '它只要给自己 allow db-ddl 或 destructive_mode: bypass 就绕过了破坏性命令门控。',
         ].join('\n'),
       };
     }

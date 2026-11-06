@@ -28,13 +28,14 @@
  *     documented way to contribute prompt text.
  */
 
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   analysisScriptTargets,
   applyMachineOverride,
+  isDestructiveBypass,
   loadPolicy,
   newSessionState,
   normalizePath,
@@ -183,6 +184,22 @@ export function apply(ctx, config = {}) {
   }
 
   const state = newSessionState();
+
+  /**
+   * ADR-013: the destructive gate's mode is read from the same config both paths
+   * already share, so dsh needs no command channel to obey it. It does need to
+   * SAY it, because a silent bypass on this harness (no reminder, no UI) is
+   * invisible. Note the scope: only destructive commands are affected; every
+   * other check keeps running.
+   */
+  if (isDestructiveBypass(policy.config, state)) {
+    const line =
+      '[enforce-rules] 破坏性命令 BYPASS 生效（全局）：删除/git 重写/force push/DDL 等不再询问或拦截；' +
+      '红线（删 $HOME / 删 cwd / 含 .. / 磁盘格式化 / 裸设备写入 / 关机）仍然拦。' +
+      '其他门控规则不受影响。收回：编辑 policy.json 或机器本地 gate-policy.json。';
+    ctx.logger?.warn?.(line);
+    process.stderr.write(`${line}\n`);
+  }
   /**
    * v5: classify lazily, on the first tool event.
    *
