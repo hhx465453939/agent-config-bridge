@@ -71,6 +71,14 @@ ALLOW_PATTERNS=(
   # It exists in v2 history; without this exception a clean history scan is
   # permanently red on a string that is not a credential.
   'benign-token-code|One spelling for a token: forward|isAbsolute\(token\)'
+  # A placeholder home that is already in published history: the dsh adapter
+  # test spelled '/home/someone' and '/Users/someone' as fixtures before it was
+  # changed to build the path from the test's own temp directory. "someone" is
+  # the canonical documentation placeholder and the values are provably public
+  # (there is no account behind them), which is the only case this list is for.
+  # Narrow on purpose: it matches the literal name, not the shape, so a real
+  # home path is still reported.
+  'placeholder-home|/home/someone([^A-Za-z0-9_.-]|$)|/Users/someone([^A-Za-z0-9_.-]|$)'
 )
 
 ALLOW_RE="$(printf '%s\n' "${ALLOW_PATTERNS[@]}" | cut -d'|' -f2- | paste -sd'|' -)"

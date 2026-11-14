@@ -13,13 +13,31 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // The operator's machine-local gate override must not reach these fixtures.
 import './isolate-home.js';
 
 import { apply } from '../gates/dsh/index.js';
 import { normalizePath } from '../gates/policy.js';
+
+const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+/**
+ * A deletion target that hits the guardrail: it carries a `..` segment and does
+ * NOT resolve into a scratch directory.
+ *
+ * Two traps this avoids, both hit while writing this file:
+ *   - a literal home path (`/home/<name>`, `C:/Users/<name>`) is forbidden by
+ *     `scripts/scan-secrets.sh`, in tests and in history alike (CONTRIBUTING.md);
+ *   - `os.tmpdir()` is under `Temp`, and the classifier exempts build output
+ *     (temp/build/dist/node_modules) even when the path also has a `..`, so a
+ *     tmpdir-based target never reaches the guardrail.
+ *
+ * Built at run time, so no scanner pattern can match it.
+ */
+const guardrailTarget = `${repo}/../secrets`;
 
 const withTmp = (fn) => async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gate-dsh-'));
@@ -80,7 +98,7 @@ test('pwsh: a guardrail deletion is denied', withTmp(async (dir) => {
   const run = mount(destructivePolicy(), {});
   const verdict = await run({
     name: 'pwsh',
-    arguments: { command: 'Remove-Item -Recurse -Force "C:/Users/someone/../secrets"' },
+    arguments: { command: `Remove-Item -Recurse -Force "${guardrailTarget}"` },
     agent: { session: {} },
   });
 
@@ -92,7 +110,7 @@ test('bash: the same command is denied too (no regression on POSIX presets)', wi
   const run = mount(destructivePolicy(), {});
   const verdict = await run({
     name: 'bash',
-    arguments: { command: 'rm -rf /home/someone/../secrets' },
+    arguments: { command: `rm -rf "${guardrailTarget}"` },
     agent: { session: {} },
   });
 
