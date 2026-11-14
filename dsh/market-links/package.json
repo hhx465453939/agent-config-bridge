@@ -1,0 +1,30 @@
+{
+  "name": "dsh-market-links",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 左侧边栏「插件市场」入口：把各家 DSH 插件市场/目录做成可点开的链接，点击在系统浏览器打开。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  }
+}

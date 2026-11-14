@@ -13,7 +13,7 @@
  *   node scripts/install-dsh.js          # 干跑：只打印计划
  *   node scripts/install-dsh.js --yes    # 写盘
  *   node scripts/install-dsh.js --home <dir> --yes
- *   node scripts/install-dsh.js --only gates|commands
+ *   node scripts/install-dsh.js --only gates|commands|market
  */
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 
 import { planGateInstall, gateInstallDir } from '../bridge/lib/gates.js';
 import { planCommandsInstall, commandsInstallDir } from '../bridge/lib/commands.js';
+import { MARKET_LINKS_PACKAGE, planMarketLinksModule } from '../bridge/lib/market-links.js';
 import { loadManifest } from '../bridge/lib/manifest.js';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -62,7 +63,11 @@ const actions = [];
 if (wants('gates')) actions.push(...planGateInstall({ repo, home, manifest }));
 if (wants('commands')) actions.push(...planCommandsInstall({ repo, home, manifest }));
 
-if (actions.length === 0) fail('清单没有声明可部署的内容（gates / commands）。');
+// The market module reports state and prints commands; it has no file actions,
+// because a plugin with a browser half must live in a profile's package graph.
+const marketReport = wants('market') ? planMarketLinksModule({ repo, home }) : null;
+
+if (actions.length === 0 && marketReport === null) fail('清单没有声明可部署的内容（gates / commands / market）。');
 
 // --- 1. 计划 ---------------------------------------------------------------
 
@@ -163,7 +168,7 @@ for (const patch of patches) {
 // missing sibling look deployed.
 const missingGate = wants('gates') && !gateMounted;
 const missingCommands = wants('commands') && !commandsMounted;
-if (missingGate || missingCommands) {
+if ((wants('gates') || wants('commands')) && (missingGate || missingCommands)) {
   const policyPath = join(gateDir, 'policy.json').split('\\').join('/');
   say('');
   say('把下面这段贴进对应的 cordis.patch.yml 任意位置，然后保存（dsh 会热重载）：');
@@ -181,9 +186,43 @@ if (missingGate || missingCommands) {
   }
   say('');
   say('（相对路径是相对 patch 文件所在目录，即 ~/.dsh/profiles/<profile>/。）');
-} else {
+} else if (wants('gates') || wants('commands')) {
   say('');
   say('两行都已挂载 —— 保存后 dsh 会热重载；`/mcp`、`/gate`、提示词命令立即可用。');
+}
+
+// --- 5. 侧栏插件市场模块（可选，独立于门控/命令） -----------------------------
+
+if (marketReport !== null) {
+  say('');
+  say('侧栏「插件市场」模块（可选，独立于上面两行）：');
+  say(`  包名  ${MARKET_LINKS_PACKAGE}`);
+  say(`  源码  ${marketReport.source.dir}`);
+  if (!marketReport.ok) {
+    ok = false;
+    say('  ✖ 源码不完整：');
+    for (const problem of marketReport.source.problems) say(`      - ${problem}`);
+  } else {
+    say('  ✔ 源码完整（index.js / client.js / package.json / cordis.patch.yml）');
+  }
+  if (marketReport.profiles.length === 0) {
+    say('  · 没有可检查的 profile（~/.dsh/profiles 不存在？）');
+  }
+  for (const profile of marketReport.profiles) {
+    const state = profile.installed
+      ? '已装'
+      : profile.bundled
+        ? '已列为 bundle，但 node_modules 里没有这个包'
+        : profile.dependency === null
+          ? '未装'
+          : '已声明依赖，但 node_modules 里没有这个包';
+    say(`  ${profile.installed ? '✔' : '·'} profile ${profile.profile}: ${state}`);
+  }
+  if (!marketReport.profiles.some((profile) => profile.installed)) {
+    say('');
+    say('  这个模块不写 profile（清单里的 never_touch），装它走 dsh 自己的入口：');
+    for (const step of marketReport.steps) say(`    ${step.text}`);
+  }
 }
 
 process.exit(!yes || ok ? 0 : 1);

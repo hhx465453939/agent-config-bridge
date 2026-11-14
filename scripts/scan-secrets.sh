@@ -79,6 +79,13 @@ ALLOW_PATTERNS=(
   # Narrow on purpose: it matches the literal name, not the shape, so a real
   # home path is still reported.
   'placeholder-home|/home/someone([^A-Za-z0-9_.-]|$)|/Users/someone([^A-Za-z0-9_.-]|$)'
+
+  # Public plugin catalogues published in dsh/market-links/client.js and
+  # docs/DSH-PLUGIN-MARKET.md. They are community directories, not this
+  # machine's infrastructure: no credentials, no private hosts, no ports.
+  # Literal hostnames only -- a different name under any of these TLDs is
+  # still reported, which is the point of keeping this list narrow.
+  'public-dsh-catalogs|(dshplugin\.io|dshplugin\.dev|deepseek1024\.com|mydsh\.dev|deepseek404\.com|dsh-plugin\.org|dshfind\.com|deepseekdocs\.com)'
 )
 
 ALLOW_RE="$(printf '%s\n' "${ALLOW_PATTERNS[@]}" | cut -d'|' -f2- | paste -sd'|' -)"

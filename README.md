@@ -258,6 +258,18 @@ node scripts/install-hard-gate-skill.js --apply  # 安装
 pi 通过既有的 `~/.agents/skills -> ~/.claude/skills` 链接读取**同一份**，不复制、不漂移。
 若目标已存在且内容不同，默认保留用户版本；确认覆盖才加 `--force`。
 
+## dsh 侧栏「插件市场」入口（可选模块）
+
+dsh 没有官方插件市场，社区目录站有十几家。这个可选模块给 dsh 左侧边栏加一行「插件市场」：点开是一张分组的目录清单，点任意一条用系统浏览器打开；找到插件后把包名丢给 agent，或按提示自己装。
+
+```bash
+node scripts/install-dsh.js --only market     # 干跑：源码完整性 + 每个 profile 的安装状态
+```
+
+和门控/命令不同，它**不往 `~/.dsh/plugins/` 拷文件**：带浏览器半边的插件必须作为包进 profile 的依赖图（dsh 只从 profile 的包构建 Client 模块图，路径挂载的行只有 Host 半边生效），而 `.dsh/profiles` 是清单里的 `never_touch`。所以脚本只校验源码、报告状态、打印两条官方安装命令（桌面端应用内加插件 / CLI `dsh plugin`），不假装自己写过 profile。
+
+市场清单、推荐插件与边界见 [`docs/DSH-PLUGIN-MARKET.md`](docs/DSH-PLUGIN-MARKET.md)，插件源码在 [`dsh/market-links/`](dsh/market-links/)。
+
 ## 可选能力：长任务续跑（pi）
 
 > 与桥接无关，**默认不装**，不影响 adopt / revoke / rollback。
@@ -356,6 +368,7 @@ $EDITOR ~/.config/agent-config-bridge/secrets.env
 bridge/         桥接器本体（Node 20+，零第三方依赖）
 templates/      环境变量与目标端配置模板
 docs/           架构决策记录（ADR）与使用手册
+dsh/            部署到 dsh 的插件源码（斜杠命令 / 侧栏插件市场）
 bridge/test/    单元测试与 fixture（node --test，无框架依赖）
 tasks/          按变更编号归档的 CHANGE / HEALTH / PRD / SPEC / TRACEABILITY
 ```
