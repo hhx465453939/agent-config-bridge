@@ -112,7 +112,11 @@ export const emitMcpJson = ({
   let existing = {};
   if (existingText && existingText.trim() !== '') {
     try {
-      existing = JSON.parse(existingText);
+      // A UTF-8 BOM is what Windows PowerShell's `Set-Content -Encoding utf8`
+      // writes, and JSON.parse rejects it. The file is a generated target but
+      // users do poke at it by hand, and failing `apply` on a byte-order mark
+      // is a bad trade: strip it and keep the merge behaviour.
+      existing = JSON.parse(existingText.replace(/^\uFEFF/, ''));
     } catch (err) {
       throw businessError('TARGET_JSON_CORRUPT', `target MCP file is not valid JSON (${err.message})`);
     }

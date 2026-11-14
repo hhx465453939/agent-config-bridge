@@ -4,7 +4,7 @@
   "detect": [".dsh"],
   "home_hint": "~/.dsh",
   "verified": true,
-  "notes": "VERIFIED 2026-11-14 against DeepSeek Harness Desktop 0.2.2-rc.3 on Windows 11, from dsh's own installed documentation and sources plus a live session. (1) USER-GLOBAL RULES: dsh-agent-instructions composes the user-global chain as $DSH_HOME/AGENTS.md first, then <agentsHome>/AGENTS.md ($DSH_AGENTS_HOME or ~/.agents) — the standard preset mounts it with maxBytes 65536 — so .dsh/AGENTS.md is the managed target, and ~/.agents/AGENTS.md is the user-owned overlay slot for machine-specific additions (editing the managed file is what `apply` reverts). (2) SKILLS: ~/.agents/skills is a native user skill root; project .agents/skills overrides it and the packaged preset skill overrides both, so the same link pi uses is enough — this manifest declares no skill dimension on purpose. (3) PLUGINS: dsh does NOT auto-load an extensions directory; a row has to be mounted through the Cordis composition, which is why gates/commands declare auto_load false and carry a verified patch row. An installed plugin directory also needs package.json {\"type\":\"module\"} because these plugins are ES modules (bridge/lib/gates.js and bridge/lib/commands.js write it). (4) COMMANDS: dsh registers slash commands from plugins (`ctx.commands.register`), and ships no prompt-template directory, so Claude's command files are only reachable through the plugin this target installs (dsh/commands/), which copies them into prompts/*.md and injects one as the user's next prompt through `agent.followup()`. (5) MCP: dsh has NO global mcp.json equivalent. Live servers live in the profile's cordis.patch.yml under the `mcp-manager` row's config.servers (transport/command/args/env/cwd/enabled, secrets as ${credential:NAME} templates resolved from ~/.dsh/.credentials.yaml refs), and that file is a settings surface the GUI also writes. This target therefore declares NO mcp dimension: the profile tree is never_touch, and guessing a path here is how a bridge silently writes a file nobody reads.",
+  "notes": "VERIFIED 2026-11-14 against DeepSeek Harness Desktop 0.2.2-rc.3 on Windows 11, from dsh's own installed documentation and sources plus a live session. (1) USER-GLOBAL RULES: dsh-agent-instructions composes the user-global chain as $DSH_HOME/AGENTS.md first, then <agentsHome>/AGENTS.md ($DSH_AGENTS_HOME or ~/.agents) — the standard preset mounts it with maxBytes 65536 — so .dsh/AGENTS.md is the managed target, and ~/.agents/AGENTS.md is the user-owned overlay slot for machine-specific additions (editing the managed file is what `apply` reverts). (2) SKILLS: ~/.agents/skills is a native user skill root; project .agents/skills overrides it and the packaged preset skill overrides both, so the same link pi uses is enough — this manifest declares no skill dimension on purpose. (3) PLUGINS: dsh does NOT auto-load an extensions directory; a row has to be mounted through the Cordis composition, which is why gates/commands declare auto_load false and carry a verified patch row. An installed plugin directory also needs package.json {\"type\":\"module\"} because these plugins are ES modules (bridge/lib/gates.js and bridge/lib/commands.js write it). (4) COMMANDS: dsh registers slash commands from plugins (`ctx.commands.register`), and ships no prompt-template directory, so Claude's command files are only reachable through the plugin this target installs (dsh/commands/), which copies them into prompts/*.md and injects one as the user's next prompt through `agent.followup()`. (5) MCP: dsh has NO global mcp.json equivalent — live servers are either the profile composition's `mcp-manager` row (a settings surface the GUI also writes) or registrations a plugin contributes at runtime. Rewriting the profile is off the table (never_touch), so this target splits the problem. `bridge apply` owns ONE generated document (~/.dsh/agent-config-bridge/mcp.json, Claude-shaped, mode 600 because entries may carry credentials), and `dsh/mcp/` is a reader plugin installed by `scripts/install-dsh.js --only mcp` that registers every entry with ctx.mcpManager.register() and reconciles on change — a running dsh therefore picks up a `bridge apply` without a restart. The reader needs one mount row (`auto_load: false`), and `/mcp` + `/mcp restart <name>` from the sibling commands plugin operate on exactly these registrations. Credentials stay literal in that document: Claude's .claude.json carries literal values and ~/.dsh/.credentials.yaml is never_touch, so the `${credential:NAME}` template route mcp-manager supports would require writing the credentials store — refused on purpose.",
   "managed": [
     {
       "kind": "rules-doc",
@@ -19,6 +19,13 @@
       "to": ".dsh/plugins/agent-config-commands/prompts",
       "mode": "copy-flat",
       "note": "the prompt templates behind the installed slash-command plugin. dsh has no prompt-template directory: the plugin (dsh/commands/index.js) reads this directory at activation and registers one command per file, injecting the rendered template as the user's next prompt. Copied from ~/.claude/commands so the prompt text stays owned by the user and by Claude Code."
+    },
+    {
+      "kind": "mcp",
+      "from": "@mcpServers",
+      "to": ".dsh/agent-config-bridge/mcp.json",
+      "mode": "mcp-json",
+      "note": "the document the installed reader (the mcp_reader block) feeds into dsh's mcp-manager at runtime. Claude-shaped on purpose: the reader — and a human debugging it — see the same fields the authoritative source has. mode 600 because it may carry expanded credentials."
     }
   ],
   "gates": {
@@ -40,6 +47,13 @@
     "extension_dir": ".dsh/plugins",
     "auto_load": false,
     "mount_hint": "- insert:\n    - id: agent-config-commands\n      # relative specifier, anchored beside the patch file\n      name: '../../plugins/agent-config-commands/index.js'"
+  },
+  "mcp_reader": {
+    "supported": true,
+    "install_as": "agent-config-mcp",
+    "extension_dir": ".dsh/plugins",
+    "auto_load": false,
+    "mount_hint": "- insert:\n    - id: agent-config-mcp\n      # relative specifier, anchored beside the patch file\n      name: '../../plugins/agent-config-mcp/index.js'"
   },
   "never_touch": [
     ".dsh/storages",

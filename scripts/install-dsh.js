@@ -1,19 +1,20 @@
 #!/usr/bin/env node
 /**
- * dsh（DeepSeek Harness）桌面端一键部署：硬门控 + 斜杠命令。
+ * dsh（DeepSeek Harness）桌面端一键部署：硬门控 + 斜杠命令 + MCP 读取器。
  *
  * 与 pi 的 bootstrap 不同的地方只有一处：dsh 的 profile 是设置面，本项目
  * **不写**它（`never_touch` 里有 `.dsh/profiles`）。所以这个脚本只做两件事：
  *
- *   1. 把门控（enforce-rules 引擎）与命令插件（/mcp、/gate、提示词命令）
- *      装进 `~/.dsh/plugins/`，并把 `~/.claude/commands/*.md` 同步成提示词；
- *   2. 打印**要粘进 profile patch 的那一段**，以及它是否已经粘过。
+ *   1. 把门控（enforce-rules 引擎）、命令插件（/mcp、/gate、提示词命令）与
+ *      MCP 读取器装进 `~/.dsh/plugins/`，并把 `~/.claude/commands/*.md`
+ *      同步成提示词；
+ *   2. 打印**要粘进 profile patch 的那一行/几行**，以及它是否已经粘过。
  *
  * 用法：
  *   node scripts/install-dsh.js          # 干跑：只打印计划
  *   node scripts/install-dsh.js --yes    # 写盘
  *   node scripts/install-dsh.js --home <dir> --yes
- *   node scripts/install-dsh.js --only gates|commands|market
+ *   node scripts/install-dsh.js --only gates|commands|mcp|market
  */
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -23,6 +24,7 @@ import { fileURLToPath } from 'node:url';
 
 import { planGateInstall, gateInstallDir } from '../bridge/lib/gates.js';
 import { planCommandsInstall, commandsInstallDir } from '../bridge/lib/commands.js';
+import { planMcpReaderInstall, mcpReaderInstallDir } from '../bridge/lib/mcp-reader.js';
 import { MARKET_LINKS_PACKAGE, planMarketLinksModule } from '../bridge/lib/market-links.js';
 import { loadManifest } from '../bridge/lib/manifest.js';
 
@@ -62,12 +64,13 @@ const wants = (kind) => only === null || only === kind;
 const actions = [];
 if (wants('gates')) actions.push(...planGateInstall({ repo, home, manifest }));
 if (wants('commands')) actions.push(...planCommandsInstall({ repo, home, manifest }));
+if (wants('mcp')) actions.push(...planMcpReaderInstall({ repo, home, manifest }));
 
 // The market module reports state and prints commands; it has no file actions,
 // because a plugin with a browser half must live in a profile's package graph.
 const marketReport = wants('market') ? planMarketLinksModule({ repo, home }) : null;
 
-if (actions.length === 0 && marketReport === null) fail('清单没有声明可部署的内容（gates / commands / market）。');
+if (actions.length === 0 && marketReport === null) fail('清单没有声明可部署的内容（gates / commands / mcp / market）。');
 
 // --- 1. 计划 ---------------------------------------------------------------
 
@@ -106,6 +109,7 @@ if (yes) {
 const checks = [];
 const gateDir = gateInstallDir(manifest, home);
 const commandsDir = commandsInstallDir(manifest, home);
+const mcpDir = manifest.mcpReader?.supported ? mcpReaderInstallDir(manifest, home) : null;
 
 if (wants('gates')) {
   checks.push(['门控引擎', join(gateDir, 'policy.js')]);
@@ -116,6 +120,10 @@ if (wants('gates')) {
 if (wants('commands')) {
   checks.push(['命令插件', join(commandsDir, 'index.js')]);
   checks.push(['模块类型声明', join(commandsDir, 'package.json')]);
+}
+if (wants('mcp') && mcpDir) {
+  checks.push(['MCP 读取器', join(mcpDir, 'index.js')]);
+  checks.push(['模块类型声明', join(mcpDir, 'package.json')]);
 }
 
 let ok = true;
@@ -155,20 +163,29 @@ say('');
 say('挂载状态（dsh 不会自动加载扩展目录）：');
 let gateMounted = false;
 let commandsMounted = false;
+let mcpMounted = false;
 for (const patch of patches) {
   const text = readFileSync(patch, 'utf8');
   const g = text.includes('agent-config-gates');
   const c = text.includes('agent-config-commands');
+  const m = text.includes('agent-config-mcp');
   gateMounted = gateMounted || g;
   commandsMounted = commandsMounted || c;
-  say(`  ${patch.replace(home, '~')}: 门控 ${g ? '已挂载' : '未挂载'} · 命令 ${c ? '已挂载' : '未挂载'}`);
+  mcpMounted = mcpMounted || m;
+  say(
+    `  ${patch.replace(home, '~')}: 门控 ${g ? '已挂载' : '未挂载'} · 命令 ${c ? '已挂载' : '未挂载'} · MCP ${m ? '已挂载' : '未挂载'}`,
+  );
 }
 
 // Report the rows that are actually missing: one mounted row must not make a
 // missing sibling look deployed.
 const missingGate = wants('gates') && !gateMounted;
 const missingCommands = wants('commands') && !commandsMounted;
-if ((wants('gates') || wants('commands')) && (missingGate || missingCommands)) {
+const missingMcp = wants('mcp') && Boolean(mcpDir) && !mcpMounted;
+if (
+  (wants('gates') || wants('commands') || (wants('mcp') && mcpDir)) &&
+  (missingGate || missingCommands || missingMcp)
+) {
   const policyPath = join(gateDir, 'policy.json').split('\\').join('/');
   say('');
   say('把下面这段贴进对应的 cordis.patch.yml 任意位置，然后保存（dsh 会热重载）：');
@@ -184,11 +201,15 @@ if ((wants('gates') || wants('commands')) && (missingGate || missingCommands)) {
     say('    - id: agent-config-commands');
     say("      name: '../../plugins/agent-config-commands/index.js'");
   }
+  if (missingMcp) {
+    say('    - id: agent-config-mcp');
+    say("      name: '../../plugins/agent-config-mcp/index.js'");
+  }
   say('');
   say('（相对路径是相对 patch 文件所在目录，即 ~/.dsh/profiles/<profile>/。）');
-} else if (wants('gates') || wants('commands')) {
+} else if (wants('gates') || wants('commands') || (wants('mcp') && mcpDir)) {
   say('');
-  say('两行都已挂载 —— 保存后 dsh 会热重载；`/mcp`、`/gate`、提示词命令立即可用。');
+  say('相关行都已挂载 —— 保存后 dsh 会热重载；`/mcp`、`/gate`、提示词命令与 MCP server 立即可用。');
 }
 
 // --- 5. 侧栏插件市场模块（可选，独立于门控/命令） -----------------------------

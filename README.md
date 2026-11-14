@@ -98,7 +98,7 @@ node bridge/cli.js revoke kimi
 | 斜杠命令 / 提示词模板 | ✅ | 各端文件格式做适配 |
 | 子 agent 定义 | ✅ | 目标端支持时桥接，不支持则报告跳过 |
 | 全局规则文档（开发习惯 / 记忆） | ✅ | 由权威源派生出各端镜像名 |
-| MCP server 声明 | ✅ | 做跨格式转换；密钥走仓库外的 `secrets.env` |
+| MCP server 声明 | ✅ | 做跨格式转换；密钥走仓库外的 `secrets.env`。dsh 例外：生成文档 + 读取器插件（见下文） |
 | **硬闸门（gate）** | ✅ | 仅对有扩展机制的 agent（见下节） |
 | **各端私有设置** | ❌ | 模型选择、主题、快捷键、权限白名单、非 MCP 段配置 —— 原样保留 |
 | **模型上下文窗口元数据** | ❌ 只报告 | 自定义 provider 扩展与 `pi-router-catalog.json` 里各存一份 `contextWindow`，且目录那份**永不自动刷新**；`doctor` 比对后报警，**不重写**（见 `docs/ADR/005`、`docs/USAGE.md` §5.9） |
@@ -258,6 +258,31 @@ node scripts/install-hard-gate-skill.js --apply  # 安装
 pi 通过既有的 `~/.agents/skills -> ~/.claude/skills` 链接读取**同一份**，不复制、不漂移。
 若目标已存在且内容不同，默认保留用户版本；确认覆盖才加 `--force`。
 
+## dsh 的 MCP：Claude Code 的 server 直接搬过去（含读取器）
+
+dsh 没有全局 `mcp.json`：它的 server 只能来自 profile 里的 `mcp-manager` 行（GUI 也会写的设置面，本项目 `never_touch`），或插件在运行时注册。所以这条链拆成两半：
+
+| 一半 | 谁负责 | 落在哪 |
+|---|---|---|
+| **文档**（server 声明，Claude 形状） | `bridge apply`（受管、可回滚） | `~/.dsh/agent-config-bridge/mcp.json`（mode 600，可能含展开后的凭据） |
+| **读取器**（把文档变成 `ctx.mcpManager.register()`） | `node scripts/install-dsh.js --only mcp --yes` | `~/.dsh/plugins/agent-config-mcp/` |
+
+读取器常驻：轮询文档（约 1 秒），条目变了重建、删了跟撤、文档半写或缺失则**保持现有舰队不动**。于是「Claude Code 里加一个 server → `bridge apply` → 运行中的 dsh 直接生效」——不用重启，也不用改 profile。
+
+一次性挂载（dsh 不自动加载扩展目录；脚本会打印这段并检查是否已粘，保存后热重载）：
+
+```yaml
+- insert:
+    - id: agent-config-mcp
+      name: '../../plugins/agent-config-mcp/index.js'
+```
+
+装好后 `/mcp` 会列出这些 server（来源标 `plugin`）、`/mcp restart <name>` 单独重连；运行时状态在 `~/.dsh/agent-config-bridge/mcp-status.json`（只有名字 / 状态 / 工具数 / 失败原因，不含凭据）。
+
+两条刻意不做的事：**不写 profile 的 `config.servers`**（设置面，写了就是拿用户配置赌格式）；**凭据不进 `${credential:NAME}` 模板**（那要写 `~/.dsh/.credentials.yaml`，同样是 `never_touch`），因此与 pi 的 `mcp.json` 一样是 mode 600 的字面值。
+
+细节、验证与边界见 [`docs/DSH-MCP.md`](docs/DSH-MCP.md)。
+
 ## dsh 侧栏「插件市场」入口（可选模块）
 
 dsh 没有官方插件市场，社区目录站有十几家。这个可选模块给 dsh 左侧边栏加一行「插件市场」：点开是一张分组的目录清单，点任意一条用系统浏览器打开；找到插件后把包名丢给 agent，或按提示自己装。
@@ -368,7 +393,7 @@ $EDITOR ~/.config/agent-config-bridge/secrets.env
 bridge/         桥接器本体（Node 20+，零第三方依赖）
 templates/      环境变量与目标端配置模板
 docs/           架构决策记录（ADR）与使用手册
-dsh/            部署到 dsh 的插件源码（斜杠命令 / 侧栏插件市场）
+dsh/            部署到 dsh 的插件源码（斜杠命令 / MCP 读取器 / 侧栏插件市场）
 bridge/test/    单元测试与 fixture（node --test，无框架依赖）
 tasks/          按变更编号归档的 CHANGE / HEALTH / PRD / SPEC / TRACEABILITY
 ```

@@ -1,0 +1,8 @@
+{
+  "name": "agent-config-mcp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Installed by agent-config-bridge: reads the generated MCP document and registers its servers with dsh's mcp-manager.",
+  "main": "index.js"
+}

@@ -105,6 +105,8 @@ node bridge/cli.js revoke gemini
 
 > **你自己在目标端手工加的 MCP server 不会被删**——同步只覆盖"由权威源派生的条目"。
 
+dsh 的这一步多一层：它没有全局 `mcp.json`，所以 `apply` 只更新文档，真正把 server 注册进去的是一个常驻读取器插件。装一次（`node scripts/install-dsh.js --only mcp --yes` + 粘一行挂载），之后每次改 Claude 配置只需 `apply`，运行中的 dsh 会在一秒左右自己跟上，不用重启。详见 [`DSH-MCP.md`](DSH-MCP.md)。
+
 ### 5.8 为什么 MCP 配置明明对，工具却不见了
 
 有些 agent 的 MCP 支持**不是一个内建功能，而是一个包**；那种情况下，配置写得再对，只要读它的程序不在，工具就会静默消失。
@@ -371,6 +373,7 @@ node scripts/install-hard-gate-skill.js --apply
 | `revoke` 报"快照不完整" | 快照被手工删改 | 按报错列出的路径手工恢复；不要指望工具硬撑 |
 | pi 里闸门没生效 | 扩展目录未被加载或 pi 未 reload | 重启 pi 或 `/reload`；在 pi 里跑 `/status` 看已加载扩展 |
 | dsh 里闸门没生效 | dsh 不自动加载扩展目录 | 按装好的 `README.md` 里那行把闸门挂进 cordis 组合 |
+| dsh 里 MCP server 没出现 | 读取器没装，或装载行没粘 | `node scripts/install-dsh.js --only mcp` 看挂载状态；`cat ~/.dsh/agent-config-bridge/mcp-status.json` 看 `registered` 与每个 server 的 `state` |
 | 闸门拦得太狠 / 该拦的没拦 | 策略配置不合你的习惯 | 改 `policy.json`（检查项、作用范围、拦截上限），或改仓库清单里的 `gates.policy` 覆盖块 |
 | `doctor` 报"检测到符号链接" | 受管路径被换成了指向别处的链接 | 若是 pi 的 `~/.agents/skills`：删掉它，`adopt`/`apply` 会自动重建指向 `.claude/skills` 的链接；其他路径按 `doctor` 的修复提示处理 |
 | `apply` 后 `diff` 仍非 0 | 目标端被别的工具改写 | 看 `diff` 详情；若该端有自管机制，把对应路径从清单移除 |

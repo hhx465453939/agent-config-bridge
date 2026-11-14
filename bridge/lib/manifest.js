@@ -218,6 +218,7 @@ const validate = (manifest, file) => {
     requires: collectRequires(managed),
     gates: validateGates(manifest.gates, file, name),
     commands: validateCommands(manifest.commands, file, name),
+    mcpReader: validateMcpReader(manifest.mcp_reader, file, name),
     mcpSupersede: validateMcpSupersede(manifest.mcp_supersede, file, name),
     file,
   };
@@ -244,6 +245,40 @@ const validateCommands = (raw, file, targetName) => {
     supported: true,
     installAs,
     extensionDir: assertRelative(raw.extension_dir, 'commands.extension_dir', file),
+    mountHint: raw.mount_hint ?? null,
+    autoLoad: raw.auto_load !== false,
+    target: targetName,
+  };
+};
+
+/**
+ * The MCP reader block.
+ *
+ * Optional, and separate from `gates`/`commands`: it only exists for a harness
+ * that has no user-level MCP declaration file the bridge could write, so the
+ * generated document has to be fed into the harness by a plugin
+ * (`dsh/mcp/index.js` for dsh). Same naming contract as its siblings: snake_case
+ * on disk, camelCase from here on.
+ *
+ * `auto_load: false` is the honest default for this family — dsh does not load
+ * an extension directory — so the installer prints the one mount row and
+ * `status` can say which half is missing.
+ */
+const validateMcpReader = (raw, file, targetName) => {
+  if (raw === undefined || raw === null || raw.supported === false) {
+    return { supported: false, reason: raw?.reason ?? 'no MCP reader declared' };
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw businessError('MANIFEST_INVALID', `${file}: "mcp_reader" must be an object or false`);
+  }
+  const installAs = raw.install_as;
+  if (typeof installAs !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(installAs)) {
+    throw businessError('MANIFEST_INVALID', `${file}: mcp_reader.install_as must be a lowercase slug`);
+  }
+  return {
+    supported: true,
+    installAs,
+    extensionDir: assertRelative(raw.extension_dir, 'mcp_reader.extension_dir', file),
     mountHint: raw.mount_hint ?? null,
     autoLoad: raw.auto_load !== false,
     target: targetName,
