@@ -3,15 +3,22 @@
   "display": "DeepSeek Harness (dsh)",
   "detect": [".dsh"],
   "home_hint": "~/.dsh",
-  "verified": false,
-  "notes": "PARTIALLY VERIFIED, and it matters which parts. Verified from dsh's own documentation and source: the harness home is $DSH_HOME or ~/.dsh and holds the fixed user-global AGENTS.md; plugins are Cordis modules mounted explicitly (dsh does NOT auto-load an extensions directory); the tool pipeline exposes `tools/pre-execute`, and the built-in filesystem tools are named read/write/edit with a `file_path` argument. NOT verified: where a user-global MCP declaration lives (dsh resolves MCP servers per session/adapter, and this project refuses to write to a guessed path), and whether dsh reads ~/.agents/skills. Because of that this manifest declares only the parts that were checked, and `doctor` keeps reporting the target as unverified until someone confirms it against a real installation.",
+  "verified": true,
+  "notes": "VERIFIED 2026-11-14 against DeepSeek Harness Desktop 0.2.2-rc.3 on Windows 11, from dsh's own installed documentation and sources plus a live session. (1) USER-GLOBAL RULES: dsh-agent-instructions composes the user-global chain as $DSH_HOME/AGENTS.md first, then <agentsHome>/AGENTS.md ($DSH_AGENTS_HOME or ~/.agents) — the standard preset mounts it with maxBytes 65536 — so .dsh/AGENTS.md is the managed target, and ~/.agents/AGENTS.md is the user-owned overlay slot for machine-specific additions (editing the managed file is what `apply` reverts). (2) SKILLS: ~/.agents/skills is a native user skill root; project .agents/skills overrides it and the packaged preset skill overrides both, so the same link pi uses is enough — this manifest declares no skill dimension on purpose. (3) PLUGINS: dsh does NOT auto-load an extensions directory; a row has to be mounted through the Cordis composition, which is why gates/commands declare auto_load false and carry a verified patch row. An installed plugin directory also needs package.json {\"type\":\"module\"} because these plugins are ES modules (bridge/lib/gates.js and bridge/lib/commands.js write it). (4) COMMANDS: dsh registers slash commands from plugins (`ctx.commands.register`), and ships no prompt-template directory, so Claude's command files are only reachable through the plugin this target installs (dsh/commands/), which copies them into prompts/*.md and injects one as the user's next prompt through `agent.followup()`. (5) MCP: dsh has NO global mcp.json equivalent. Live servers live in the profile's cordis.patch.yml under the `mcp-manager` row's config.servers (transport/command/args/env/cwd/enabled, secrets as ${credential:NAME} templates resolved from ~/.dsh/.credentials.yaml refs), and that file is a settings surface the GUI also writes. This target therefore declares NO mcp dimension: the profile tree is never_touch, and guessing a path here is how a bridge silently writes a file nobody reads.",
   "managed": [
     {
       "kind": "rules-doc",
       "from": "CLAUDE.md",
       "to": ".dsh/AGENTS.md",
       "mode": "copy",
-      "note": "the fixed user-global instruction file, per config-catalog (dshHome + AGENTS.md)"
+      "note": "the fixed user-global instruction file dsh-agent-instructions loads first, before the shared agents root. Because `apply` owns this file, machine-specific DSH additions belong in ~/.agents/AGENTS.md (loaded second, never written by this project) rather than in edits here."
+    },
+    {
+      "kind": "command",
+      "from": "commands",
+      "to": ".dsh/plugins/agent-config-commands/prompts",
+      "mode": "copy-flat",
+      "note": "the prompt templates behind the installed slash-command plugin. dsh has no prompt-template directory: the plugin (dsh/commands/index.js) reads this directory at activation and registers one command per file, injecting the rendered template as the user's next prompt. Copied from ~/.claude/commands so the prompt text stays owned by the user and by Claude Code."
     }
   ],
   "gates": {
@@ -20,15 +27,24 @@
     "install_as": "agent-config-gates",
     "extension_dir": ".dsh/plugins",
     "auto_load": false,
-    "mount_hint": "dsh mounts plugins through a Cordis composition, so the installed directory does not take effect until a plugin row points at it. Add to your cordis patch:\n\n  - name: '~/.dsh/plugins/agent-config-gates/'\n    config:\n      policyPath: '~/.dsh/plugins/agent-config-gates/policy.json'\n\n`status` reports whether the gate directory is installed; whether it is mounted is visible only in your own composition file, which this project deliberately does not edit.",
+    "mount_hint": "dsh mounts plugins through a Cordis composition, so an installed directory takes effect only when a row points at it. Add this to the profile patch (~/.dsh/profiles/<profile>/cordis.patch.yml; `node scripts/install-dsh.js --yes` writes it and prints this snippet):\n\n- insert:\n    - id: enforce-rules\n      # relative specifier, anchored beside the patch file; a file:// URL also works\n      name: '../../plugins/agent-config-gates/dsh/index.js'\n      config:\n        policyPath: '<absolute>/.dsh/plugins/agent-config-gates/policy.json'\n\nstatus reports whether the gate directory is installed; whether it is mounted is visible only in the composition file, which this project deliberately does not edit.",
     "policy": {
       "config": {
         "project_roots": []
       }
     }
   },
+  "commands": {
+    "supported": true,
+    "install_as": "agent-config-commands",
+    "extension_dir": ".dsh/plugins",
+    "auto_load": false,
+    "mount_hint": "- insert:\n    - id: agent-config-commands\n      # relative specifier, anchored beside the patch file\n      name: '../../plugins/agent-config-commands/index.js'"
+  },
   "never_touch": [
     ".dsh/storages",
-    ".dsh/profiles"
+    ".dsh/profiles",
+    ".dsh/sessions",
+    ".dsh/.credentials.yaml"
   ]
 }

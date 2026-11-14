@@ -1,0 +1,8 @@
+{
+  "name": "agent-config-commands",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Installed by agent-config-bridge: the dsh slash commands (/mcp, /gate) plus the user's prompt templates.",
+  "main": "index.js"
+}

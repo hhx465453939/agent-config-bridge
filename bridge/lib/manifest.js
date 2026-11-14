@@ -217,8 +217,36 @@ const validate = (manifest, file) => {
     neverTouch,
     requires: collectRequires(managed),
     gates: validateGates(manifest.gates, file, name),
+    commands: validateCommands(manifest.commands, file, name),
     mcpSupersede: validateMcpSupersede(manifest.mcp_supersede, file, name),
     file,
+  };
+};
+
+/**
+ * The slash-command block. Optional, and separate from `gates` on purpose: a
+ * harness can accept extension code (`gates`) without having any prompt-command
+ * surface, and the reverse. Same naming contract as `validateGates`: snake_case
+ * in the JSON, camelCase from here on, so a reader never touches a raw key.
+ */
+const validateCommands = (raw, file, targetName) => {
+  if (raw === undefined || raw === null || raw.supported === false) {
+    return { supported: false, reason: raw?.reason ?? 'no command surface declared' };
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw businessError('MANIFEST_INVALID', `${file}: "commands" must be an object or false`);
+  }
+  const installAs = raw.install_as;
+  if (typeof installAs !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(installAs)) {
+    throw businessError('MANIFEST_INVALID', `${file}: commands.install_as must be a lowercase slug`);
+  }
+  return {
+    supported: true,
+    installAs,
+    extensionDir: assertRelative(raw.extension_dir, 'commands.extension_dir', file),
+    mountHint: raw.mount_hint ?? null,
+    autoLoad: raw.auto_load !== false,
+    target: targetName,
   };
 };
 
