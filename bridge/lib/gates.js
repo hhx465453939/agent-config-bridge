@@ -43,7 +43,26 @@ const PI_ENTRY = `// Entry point so the harness finds the adapter when it loads 
 export { default } from './pi/index.js';
 `;
 
-const readme = (manifest) => {
+/**
+ * dsh imports the adapter as a module, so the installed directory needs to say
+ * which module system it uses.
+ *
+ * Node decides a `.js` file's type from the nearest `package.json`. With none,
+ * a current runtime still loads the file by *detecting* module syntax — but it
+ * warns (`MODULE_TYPELESS_PACKAGE_JSON`) on every load, re-parses the file, and
+ * breaks outright when any ancestor `package.json` declares `"type": "commonjs"`
+ * (a home directory that owns one is enough). Declaring the type turns that from
+ * a lucky fallback into a guarantee.
+ */
+const DSH_PACKAGE_JSON = `${JSON.stringify({
+  name: 'agent-config-gates',
+  version: '0.0.0',
+  private: true,
+  type: 'module',
+  description: 'Installed by agent-config-bridge: dsh loads this directory as an ES module.',
+}, null, 2)}\n`;
+
+const readme = (manifest, home = null) => {
   const lines = [
     '# agent-config-gates',
     '',
@@ -180,21 +199,50 @@ const readme = (manifest) => {
   ];
 
   if (manifest.gates.autoLoad === false) {
+    const policyPath = join(gateInstallDir(manifest, home), 'policy.json').split('\\').join('/');
     lines.push(
       '',
       '## This harness does not auto-load extensions',
       '',
       ...(manifest.gates.mountHint ? [manifest.gates.mountHint, ''] : []),
-      'Mount this directory with a Cordis plugin row:',
+      'Mount this adapter with one Cordis plugin row in the profile patch',
+      '(`<home>/.dsh/profiles/<profile>/cordis.patch.yml`):',
       '',
       '```yaml',
-      `- name: '${manifest.gates.extensionDir}/${manifest.gates.installAs}/'`,
+      '- insert:',
+      '    - id: enforce-rules',
+      '      # A relative specifier is anchored beside the patch file, so it walks',
+      '      # back out of the profile directory to this adapter. A file:// URL also',
+      "      # works; a bare '~/.dsh/plugins/...' does NOT (the loader wants a specifier).",
+      `      name: '${mountSpecifier(manifest)}'`,
+      '      config:',
+      '        # Read with a plain fs call, so it must be absolute.',
+      `        policyPath: '${policyPath}'`,
       '```',
+      '',
+      'This directory also carries a `package.json` declaring `"type": "module"`:',
+      'the adapter is an ES module, and without that declaration a current runtime',
+      'only loads it by detecting module syntax — warning and re-parsing on every',
+      'load — and fails outright when an ancestor `package.json` says CommonJS.',
     );
   }
 
   lines.push('');
   return lines.join('\n');
+};
+
+/**
+ * The specifier a Cordis profile patch uses to reach the installed adapter.
+ *
+ * Derived from the manifest rather than hard-coded: the patch file lives at
+ * `<home>/.dsh/profiles/<profile>/cordis.patch.yml`, and the loader anchors a
+ * relative specifier beside it. Anything that is not a `.dsh/...` extension
+ * directory cannot use that anchor, so it gets the absolute form instead.
+ */
+const mountSpecifier = (manifest) => {
+  const rel = `${manifest.gates.extensionDir}/${manifest.gates.installAs}/${manifest.gates.adapter}/index.js`;
+  const prefix = '.dsh/';
+  return rel.startsWith(prefix) ? `../../${rel.slice(prefix.length)}` : rel;
 };
 
 /**
@@ -315,9 +363,15 @@ export const planGateInstall = ({ repo, home, manifest }) => {
     contentAction(join(dest, 'index.js'), PI_ENTRY, 'pi directory entry point');
   }
 
+  // dsh imports `dsh/index.js` directly, so the directory has to declare its
+  // module type; see DSH_PACKAGE_JSON.
+  if (adapter === 'dsh') {
+    contentAction(join(dest, 'package.json'), DSH_PACKAGE_JSON, 'dsh module type declaration');
+  }
+
   const policy = resolvePolicy({ repo, manifest, home });
   contentAction(join(dest, 'policy.json'), `${JSON.stringify(policy, null, 2)}\n`, 'gate policy');
-  contentAction(join(dest, 'README.md'), readme(manifest), 'gate readme');
+  contentAction(join(dest, 'README.md'), readme(manifest, home), 'gate readme');
 
   return actions;
 };

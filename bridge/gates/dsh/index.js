@@ -11,9 +11,16 @@
  *
  * Configure through the cordis plugin row, e.g.
  *
- *   - name: '/absolute/path/to/agent-config-bridge/bridge/gates/dsh/index.js'
- *     config:
- *       policyPath: '/absolute/path/to/agent-config-bridge/bridge/gates/dsh/policy.json'
+ *   - insert:
+ *       - id: enforce-rules
+ *         # A bare home-relative path ('~/.dsh/plugins/...') does NOT resolve:
+ *         # dsh's loader takes a module specifier, and a relative one is
+ *         # anchored beside the patch file (~/.dsh/profiles/<profile>/). This is
+ *         # the verified form; a file:// URL works too.
+ *         name: '../../plugins/agent-config-gates/dsh/index.js'
+ *         config:
+ *           # policyPath is read with a plain fs call, so it must be absolute.
+ *           policyPath: '/absolute/path/to/agent-config-gates/policy.json'
  *
  * Differences from the pi adapter (both are deliberate, both are documented
  * rather than hidden):
@@ -26,6 +33,17 @@
  *     explanation carried by a denial are the whole mechanism on this harness.
  *     The batch is published as a reusable cordis package, which already has a
  *     documented way to contribute prompt text.
+ *
+ * Two harness details are matched here rather than assumed, because both were
+ * silent failures on Windows Desktop (2026-11-14):
+ *
+ *   - the shell tool is named per platform (`bash` on POSIX presets, `pwsh` on
+ *     the Windows one), so it must be matched as a set — an exact `'bash'`
+ *     comparison disables every shell rule on Windows while the plugin row still
+ *     reports `active`;
+ *   - `ToolExecution` carries no `cwd`, so relative paths must be resolved
+ *     against the Session's directory (the `workingDirectory` service), not
+ *     against the directory the Desktop app happened to be launched from.
  */
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -126,6 +144,28 @@ const SIGNAL_TOOLS = [
 
 const WRITE_TOOLS = new Set(['write', 'edit', 'apply_patch', 'str_replace_editor', 'create_file', 'multi_edit']);
 const READ_TOOLS = new Set(['read', 'read_file', 'view', 'open_file']);
+/**
+ * Tool names that run a shell command.
+ *
+ * dsh names the shell tool per platform: the POSIX presets mount `tool-bash`
+ * (tool name `bash`) and the Windows preset mounts `tool-pwsh` (tool name
+ * `pwsh`). An exact `toolName === 'bash'` test therefore left
+ * `no-destructive-bash`, `bash-graph-before-read` and the AI4S script tracking
+ * completely inactive on Windows while the plugin still reported `active` — the
+ * "installed, running, enforcing nothing" failure mode.
+ */
+const SHELL_TOOLS = new Set(['bash', 'pwsh', 'shell']);
+
+/**
+ * The dialect a shell command is written in.
+ *
+ * The policy parses `Get-Content x` and `cat x` with different parsers
+ * (`shellOf(input)`), and the dsh adapter never told it which one applies — so a
+ * PowerShell command was parsed as bash, where `Get-Content` is not a read verb.
+ * `pwsh` must therefore declare itself, exactly as the pi adapter does for its
+ * `powershell` tool.
+ */
+const shellDialect = (toolName) => (toolName === 'pwsh' || toolName === 'powershell' ? 'powershell' : 'bash');
 
 const isSignalTool = (toolName) =>
   SIGNAL_TOOLS.some((s) => toolName === s || toolName.endsWith(`_${s}`));
@@ -216,14 +256,37 @@ export function apply(ctx, config = {}) {
    */
   let classified = false;
 
+  /**
+   * The directory this call's relative paths resolve against.
+   *
+   * `exec.cwd` is not part of dsh's `ToolExecution`, so the previous
+   * `process.cwd()` fallback judged every relative path against the directory
+   * the Desktop app was launched from — a different project than the Session's.
+   * The Session's own directory is reachable without declaring an injection
+   * (a missing injected service would deactivate the whole gate): the
+   * `workingDirectory` service answers synchronously from a projection, and a
+   * lookup that fails falls back to the old behaviour instead of guessing.
+   */
+  const cwdOf = (exec) => {
+    if (typeof exec?.cwd === 'string' && exec.cwd) return exec.cwd;
+    const session = exec?.agent?.session;
+    const service = ctx.get?.('workingDirectory');
+    if (session !== undefined && service && typeof service.get === 'function') {
+      try {
+        const directory = service.get(session);
+        if (typeof directory === 'string' && directory) return directory;
+      } catch {
+        // A wrong cwd is worse than an explicit fallback: fall through.
+      }
+    }
+    if (typeof config.cwd === 'string' && config.cwd) return config.cwd;
+    return process.cwd();
+  };
+
   ctx.on('tools/pre-execute', async (exec, next) => {
     const toolName = String(exec?.name ?? '');
     const args = exec?.arguments;
-    const cwd = typeof exec?.cwd === 'string' && exec.cwd
-      ? exec.cwd
-      : typeof config.cwd === 'string' && config.cwd
-        ? config.cwd
-        : process.cwd();
+    const cwd = cwdOf(exec);
 
     if (!classified) {
       classified = true;
@@ -271,11 +334,11 @@ export function apply(ctx, config = {}) {
       return next();
     }
 
-    if (toolName === 'bash') {
+    if (SHELL_TOOLS.has(toolName)) {
       const command = str(args, 'command') ?? '';
       const verdict = shouldBlock({
         policy: effective,
-        input: { action: 'bash', path: null, tool: toolName, command, cwd },
+        input: { action: 'bash', path: null, tool: toolName, command, cwd, shell: shellDialect(toolName) },
         state,
         fs: realFs,
       });

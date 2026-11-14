@@ -33,6 +33,13 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// The operator's machine-local gate override carries `destructive_mode` and the
+// persistent grants, so it rewrites exactly the tiers and dialogs these tests
+// pin: on a host that set `bypass` (the documented setting for unattended runs)
+// the permission tests fail while CI stays green. Imported before any adapter so
+// the override path resolves into the throwaway home.
+import './isolate-home.js';
+
 import enforceRules from '../gates/pi/index.js';
 import { apply as applyDsh } from '../gates/dsh/index.js';
 import {
