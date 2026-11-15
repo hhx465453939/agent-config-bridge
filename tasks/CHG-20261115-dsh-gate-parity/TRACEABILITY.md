@@ -104,7 +104,26 @@
    用 `search_code` 拿到真实行号 3430 后直读 60 行确认。**索引与源码不一致时以 `search_code` 的
    raw_matches 行号为准**，不要相信 snippet 的行段。
 
-## E. 未验证点（如实声明）
+## E. 部署验证（针对落盘产物，不回仓库）
+
+仓库测试跑的是 checkout 里的文件；部署是否成功必须用**落盘的那份字节**证明，否则等于用文件时间戳自我安慰。
+
+| # | 动作 | 结果 |
+|---|---|---|
+| E-1 | `node bridge/cli.js apply` | `dsh: +0 ~2 -0 (kept 56)`，落盘 `dsh/index.js` 29293 B、`policy.json` 6547 B |
+| E-2 | 读落盘 `policy.json` | `version: 6`；10 条 checks；`graph_signal_requires_content: true`；`slack_max_continues: 2`；`reminder` 长度 1297 |
+| E-3 | 写一个临时验证器，**import 落盘的** `dsh/index.js` 并用落盘的 `policy.json` 驱动 | **9/9 通过**：五个监听器全部注册；无图谱→拒；空图谱结果→仍拒；有内容结果→放行；延期承诺→steer；pre-step 仍准入且提醒只注入一次；审批可用→`ask`；审批缺失→放行 |
+
+E-3 的两个发现（都不是代码缺陷，但会误导验收）：
+
+1. **本机 `bridge apply` 把 `destructive_mode: bypass` 合并进了安装的 `policy.json`。**
+   这是 `applyMachineOverride` 的**既定行为**（「授权必须立刻生效」），代价是安装文件里带上了机器状态。
+   因此本机 confirm 档不会询问 —— 这是主人的设置，不是门控失效。验证器改用 `destructive_mode: enforce`
+   测三档，并打印宿主实际值。
+2. **隔离 HOME 不能屏蔽 `policy.json` 里已烘焙的值。** 一开始以为隔离失败，实际是值已经写进文件了。
+   教训：验证部署产物时，机器 override 有两条生效路径（文件烘焙 + 运行时合并），只堵一条不够。
+
+## F. 未验证点（如实声明）
 
 | 项 | 状态 | 影响 | 缓解 |
 |---|---|---|---|
