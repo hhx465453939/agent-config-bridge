@@ -262,7 +262,20 @@ test('shipped policies: the strengthened values are actually in the JSON', () =>
   assert.equal(pi.config.graph_signal_requires_content, true, 'pi verifies graph results have content');
   assert.equal(pi.config.require_conventions, true, 'pi asks for the project conventions');
   assert.ok(!pi.checks.includes('index-before-read'), 'a global index has no marker, so the check is opt-in');
-  assert.equal(dsh.config.graph_signal_requires_content, false, 'dsh cannot see results; its asymmetry is documented');
+
+  // CHG-20261115: dsh gained `tools/result`, `agent/turn-stopping` and
+  // `agent/pre-step`, so the asymmetry exemption it used to carry is gone. Both
+  // adapters now judge graph evidence on the settled outcome.
+  assert.equal(
+    dsh.config.graph_signal_requires_content,
+    true,
+    'dsh verifies graph results have content too (v6 parity, not an exemption)',
+  );
+  assert.ok(dsh.checks.includes('index-freshness-before-read'), 'dsh keeps the Layer-2 checks');
+  assert.ok(dsh.checks.includes('think-before-write'), 'dsh enables the Layer-0 write rule');
+  assert.ok(dsh.checks.includes('no-blind-retry'), 'dsh enables the blind-retry rule');
+  assert.ok(dsh.checks.includes('chg-contract-before-edit'), 'dsh enables the CHG-contract rule');
+  assert.equal(dsh.config.require_conventions, true, 'dsh asks for the project conventions');
   assert.ok(dsh.checks.includes('bash-graph-before-read'), 'dsh now actually wires bash reads to the policy');
   assert.ok(dsh.checks.includes('no-destructive-bash'), 'dsh keeps the safety rule');
 });

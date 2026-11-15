@@ -105,7 +105,8 @@ bridge/gates/
 - **不猜路径**：目标路径只来自 `bridge/targets/*.json`；机器专属路径只放 `~/.config/agent-config-bridge/`。
 - **仓库零真实值**：任何提交前跑 `bash scripts/scan-secrets.sh`；邮箱仅在凭据字段旁才算风险。
 - **不要同时装两份**：门控目录只允许 `~/.pi/agent/extensions/enforce-rules/`；旧版 `graph-first-gate.ts` 若存在应删除或改名，避免双门控。
-- **dsh 不对称**：它没有结果钩子与轮次级注入，所以不启用需要结果证据的检查；不要以为「配置里写了」就等于生效。
+- **两端已对齐（v6，2026-11-15）**：dsh 现在也有结果钩子与轮次级门控 —— `tools/result` 判图谱证据是否有内容、`agent/turn-stopping` 做轮次级不偷懒（用 `agent.steer()` 表达异议）、`agent/pre-step` 每轮分类并按 `agent.inject()` 注入提醒、`tools/pre-execute` 可返回 `{kind:'ask'}` 走 `ctx.approval`。两端共用 `policy.js`，判定逻辑一字不差。
+- **仍存在的差异（是机制差异，不是能力缺失）**：① dsh 的 `agent/turn-stopping` 只给 `{agent,turn,signal}`，最终文本要从 `session/event` 增量 fold，所以**纯工具轮没有 assistant 文本时不判定**（宁可漏判，不误伤）；② `ask` 只在 `ctx.approval.effectivePolicy(session) === 'ask'` 时返回，审批关闭时按既有权衡放行并写 stderr —— 无人值守的机器不能被一个没人能答的问题焊死；③ dsh 的询问是二值（允许一次 / 拒绝），没有 pi 的「本会话允许这一类」，后者用 `/gate session <类别>` 补。
 
 ## 维护节奏
 

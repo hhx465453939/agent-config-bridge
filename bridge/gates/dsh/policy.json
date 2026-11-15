@@ -1,15 +1,19 @@
 {
   "name": "graph-first-gate",
-  "version": 5,
-  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces. v4 inherits the engine fixes that do not depend on harness hooks: the block cap is now a 30-minute sliding window of 200 instead of a lifetime 30, PowerShell/MCP-aware helpers exist in the shared engine, and a bare email is no longer treated as a credential. dsh still has no result hook and no per-turn context injection, so graph_signal_requires_content stays off and the checks that need result/read evidence (think-before-write, no-blind-retry, chg-contract-before-edit) are intentionally NOT enabled here. bash reads remain gated. v5 adds domain profiles: there is no before_agent_start hook here, so the adapter classifies lazily on the first tool event and behaves as general-dev until it has an answer. The turn-end output checks (W2, W4 log) are pi-only because dsh has no turn boundary to compare against.",
-  "reminder": "",
+  "version": 6,
+  "description": "DeepSeek Harness flavour of the same hard gate the pi adapter enforces. v6 (2026-11-15) closes the parity gap that v5 wrote into this file as a permanent limitation: the installed dsh DOES expose `tools/result` (synchronous frozen outcome), `agent/turn-stopping` (serial turn boundary that may steer another step), `agent/pre-step` (waterfall that sees the claimed user messages) and `{kind:'ask'}` from `tools/pre-execute` backed by `ctx.approval`. So the checks v5 turned off are back: graph evidence is judged on the RESULT (an empty `{\"total\":0}` no longer buys a read window), read evidence is recorded only on success, blind retry and the CHG-contract rule work, and the turn-level no-slack rule is active through `agent/turn-stopping` + `agent.steer()`. Domain classification now runs once per turn on the real user prompt instead of lazily on the first tool event with an empty prompt. The three-tier destructive policy can ask: the adapter returns `ask` only when `ctx.approval.effectivePolicy(session)` is `ask`, and otherwise proceeds and says so on stderr — a headless run must not be bricked by a question nothing can answer. v4 engine fixes are inherited unchanged (30-minute 200-block window, PowerShell/MCP-aware helpers, bare email is not a credential).",
+  "reminder": "[system-reminder · 三层代码阅读 + 动脑子 + 不偷懒 · 每轮生效]\nLayer 0 动脑子：改代码前先回答五问——项目约定？环境现状？字面背后的真实需求？任务目的？产出价值？没读过目标文件、没判根因，不要动手。\nLayer 1 图谱：read 代码文件前先用 codebase-memory MCP（search_graph / trace_path / get_code_snippet / query_graph / get_architecture / search_code）查结构与调用关系。空结果不算合规：先查 index_status / 重新索引，回图谱重查。\nLayer 2 索引：项目未索引或索引过期（代码比索引新）时，先 index_repository / detect_changes，完成后回到 Layer 1——不允许索引完直接 read。\nLayer 3 直读：仅当重索引后图谱仍无法满足（非代码文件、图谱查不到、本会话自己改动的文件）才直读。\n闸门强度：有内容的图谱查询给 10 分钟窗口；查询点名的文件/包另给 30 分钟作用域解锁。bash 的 cat / grep -r / git show / find -exec / sed -i / 重定向写文件同样受管；PowerShell 的 Get-Content / Set-Content / Remove-Item 同样受管。\n改已存在文件需要：本会话在有效期内读过它（默认 30 分钟），或图谱点名过它；改之前还要读项目约定（AGENTS.md / CLAUDE.md / CONTRIBUTING.md / .cursorrules，存在才要求）。\n破坏性命令分两档：删 $HOME / 删 cwd / 含 .. 的路径 / 磁盘格式化 / 裸设备写入是红线，任何授权都不放行；普通删除、git 历史重写、强推、DDL 等按类别授权（默认询问，主人可用 /gate grant|ask|deny 调整，agent 不能自己改授权表）；被确认卡住（尤其彻夜跑）时可提示主人 /gate mode bypass 8h 临时放开破坏性命令——到期自动回 enforce，红线仍拦，其他门控不受影响；同一条失败命令原样重试第 3 次也会被拦。\n轮次级不偷懒：一轮结束时只输出「稍后再补 / 后续再做 / 先不实现」而不动工具，会被要求继续做完；确实阻塞就写清阻塞点。\n拦截上限只作用于研究规则，且按 30 分钟窗口重置；凭据写入、越界写入、破坏性命令永远生效。门控配置读不出来时降级为安全底线并显式告警。\n\n[ai-spec 门控 · 改代码前必过]\n改任何代码文件前，本会话必须读过对应立项 CHG 的契约（tasks/CHG-*/SPEC.md 或 PRD.md）。\n五问：属于哪个 CHG？四件套齐吗？目标文件在独占清单里吗？改完哪条 AC 变绿？先判根因还是打补丁？\n开发中发现的问题当场修，不许留给「后续」；收尾必须达成该 CHG 的预定功能目标，而不是「大部分做完」。",
   "checks": [
     "no-write-outside",
     "no-secret-write",
     "no-destructive-bash",
     "no-self-grant",
+    "index-freshness-before-read",
     "graph-before-read",
-    "bash-graph-before-read"
+    "bash-graph-before-read",
+    "think-before-write",
+    "chg-contract-before-edit",
+    "no-blind-retry"
   ],
   "default_profile": "general-dev",
   "profiles": ["ai4s-dry-lab", "ai4s-quant"],
@@ -19,7 +23,7 @@
     "timeout_ms": 8000,
     "external_judge": {
       "enabled": false,
-      "note": "kept as a field only; calling an external judge is out of scope for v5"
+      "note": "kept as a field only; calling an external judge is out of scope for v6"
     }
   },
   "config": {
@@ -41,12 +45,26 @@
     "inspected_ttl_ms": 1800000,
     "bash_read_check": true,
     "index_marker": ".codebase-memory",
-    "graph_signal_requires_content": false,
+    "index_mtime_epsilon_ms": 2000,
+    "index_mtime_ttl_ms": 30000,
+    "graph_signal_requires_content": true,
     "graph_signal_min_chars": 40,
     "require_target_evidence": true,
-    "require_conventions": false,
+    "require_conventions": true,
+    "convention_files": ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", ".cursorrules"],
+    "require_chg_contract": true,
+    "chg_contract_globs": [
+      "**/tasks/CHG-*/SPEC.md",
+      "**/tasks/CHG-*/PRD.md",
+      "**/tasks/CHG-*/CHANGE.md",
+      "**/tasks/CHG-*/TRACEABILITY.md"
+    ],
+    "chg_contract_scope_globs": [],
     "max_identical_failures": 2,
     "retry_window_ms": 600000,
+    "slack_check": true,
+    "slack_max_continues": 2,
+    "slack_patterns": [],
     "destructive_allow_patterns": [],
     "destructive_confirm_mode": true,
     "destructive_grants": {

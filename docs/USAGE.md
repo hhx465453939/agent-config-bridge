@@ -299,7 +299,8 @@ node bridge/cli.js apply
 * **bash / PowerShell 写入也算写入**：`> file`、`tee`、`sed -i`、`cp/mv/rm`、`Set-Content`、`Remove-Item` 都走凭据与越界检查；`git reset --hard` / `git clean -f` / `rm -rf` 源码目录 / `Remove-Item -Recurse` / 强推等破坏性命令直接拒绝；
 * **MCP 网关不豁免**：`mcp` 代理调用会按 `input.tool` 的真实工具名解包，再走同一套判定；
 * **破坏性命令有独立模式**：`/gate mode bypass` 只放开破坏性指令的授权档（删除 / git 历史 / 强推 / DDL / 递归改权限 / 杀进程 / 裸写），红线（删 `$HOME` / 删 cwd / 含 `..` / 磁盘格式化 / 裸设备写入 / 关机）**仍然拦**；图谱、契约、AI4S、密钥、越界写入等其它规则**完全不受影响**。`/gate mode bypass 8h` 到期自动回 `enforce`；`/gate mode bypass session` 只对当前会话生效且不写盘；agent 不能自己切（写 `destructive_mode` 会被 `no-self-grant` 拒绝）；
-* **dsh 的不对称**：dsh 没有结果钩子与轮次级注入，无法验证图谱结果是否有内容，也不启用需要结果/读取证据的检查；`bash` 读取已真正接入。dsh 也没有命令通道，`destructive_mode` 由 `apply` 或机器本地 override 提供，启动时若处于 bypass 会写一行告警。
+* **dsh 与 pi 已对齐（v6）**：`tools/result` 负责判定图谱证据是否有内容、读证据与盲重试；`agent/turn-stopping` 负责轮次级不偷懒；`agent/pre-step` 负责每轮分类与提醒注入；`tools/pre-execute` 可返回 `{kind:'ask'}` 走 `ctx.approval`。判定逻辑两端共用同一个 `policy.js`。
+* **dsh 仍有的机制差异（已写清，不装作全等）**：① `agent/turn-stopping` 的 payload 不含最终文本，所以从 `session/event` 增量 fold；纯工具轮没有 assistant 文本时轮次检查不判定（宁可漏判不误伤）。② `ask` 只在审批通道可用（`effectivePolicy === 'ask'`）时返回，否则放行并向 stderr 写一行 `DESTRUCTIVE_CONFIRM auto-approved` —— 无人值守不能被没人能答的问题焊死。③ dsh 的询问是二值，没有「本会话允许这一类」，用 `/gate session <类别>` 补。④ `destructive_mode` 除 `apply` 与机器本地 override 外，也可由 dsh 的 `/gate` 斜杠命令调整（命令通道在 `agent-config-commands` 插件里，不在适配层）。
 
 ### 6.1.1 按域加载检查（v5）：同一套门控，不同工作用不同规矩
 

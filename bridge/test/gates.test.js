@@ -983,7 +983,20 @@ const fakeDshCtx = () => {
     },
     run: (name, args, next = async () => ({ kind: 'allow' })) =>
       handlers.get('tools/pre-execute')({ name, arguments: args }, next),
+    /**
+     * Settle one tool result the way dsh's registry does on `tools/result`.
+     *
+     * v6 needs this: the graph evidence that opens Layer 1 comes from the settled
+     * outcome, not from the call being admitted.
+     */
+    result: (name, args, outcome) => handlers.get('tools/result')({ name, arguments: args }, outcome),
   };
+};
+
+/** A graph result that actually carries content — the only thing that opens Layer 1. */
+const GRAPH_EVIDENCE = {
+  isError: false,
+  content: [{ type: 'text', text: '{"total":2,"results":[{"name":"alpha"},{"name":"beta"}]}' }],
 };
 
 test('dsh adapter: denies with the dsh decision shape', async () => {
@@ -997,11 +1010,19 @@ test('dsh adapter: denies with the dsh decision shape', async () => {
   assert.deepEqual(await run('read', { file_path: abs('/repo/README.md') }), { kind: 'allow' });
 });
 
-test('dsh adapter: a graph query opens the gate for subsequent reads', async () => {
-  const { ctx, run } = fakeDshCtx();
+test('dsh adapter: a graph query opens the gate only after a result with content', async () => {
+  const { ctx, run, result } = fakeDshCtx();
   dshApply(ctx, { policy: TEST_POLICY });
 
-  await run('search_graph', { name_pattern: '.*' });
+  const query = { name_pattern: '.*' };
+  assert.deepEqual(await run('search_graph', query), { kind: 'allow' }, 'the graph call itself is never blocked');
+
+  // v6: admission is not evidence. Until the outcome is known the model has
+  // learned nothing, so the read stays blocked (the v5 hole this CHG closes).
+  const still = await run('read', { file_path: abs('/repo/src/a.ts') });
+  assert.equal(still.kind, 'deny', 'calling the tool is not the same as learning from it');
+
+  result('search_graph', query, GRAPH_EVIDENCE);
   assert.deepEqual(await run('read', { file_path: abs('/repo/src/a.ts') }), { kind: 'allow' });
 });
 
@@ -1307,8 +1328,8 @@ test('pi adapter: repeated failed shell commands are gated until investigation',
   assert.equal(await call('tool_call', { toolName: 'bash', input: { command } }), undefined);
 });
 
-test('dsh adapter: bash reads are actually gated now, and a graph query opens them', async () => {
-  const { ctx, run } = fakeDshCtx();
+test('dsh adapter: bash reads are actually gated now, and a graph result opens them', async () => {
+  const { ctx, run, result } = fakeDshCtx();
   dshApply(ctx, {
     policy: adapterPolicy({ checks: ['graph-before-read', 'bash-graph-before-read'] }),
   });
@@ -1317,6 +1338,14 @@ test('dsh adapter: bash reads are actually gated now, and a graph query opens th
   assert.equal(denied.kind, 'deny');
   assert.match(denied.reason, /Layer 1/);
 
-  await run('search_graph', { name_pattern: '.*' });
+  const query = { name_pattern: '.*' };
+  await run('search_graph', query);
+  assert.equal(
+    (await run('bash', { command })).kind,
+    'deny',
+    'a graph call with no settled result proves nothing — bash reads obey the same rule as `read`',
+  );
+
+  result('search_graph', query, GRAPH_EVIDENCE);
   assert.deepEqual(await run('bash', { command }), { kind: 'allow' });
 });

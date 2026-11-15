@@ -119,11 +119,12 @@ Claude Code 的产品结构比较完整，这类约束能靠它自己的机制�
 ```
 bridge/gates/
   policy.js        规则本身（纯逻辑，不知道自己在哪个 harness 里跑）
-  pi/              pi 的适配层：pi.on('tool_call') → policy → { block, reason }
-  dsh/             dsh 的适配层：ctx.on('tools/pre-execute') → policy → { kind: 'deny' }
+  pi/              pi 的适配层：pi.on('tool_call' / 'tool_result' / 'turn_end' / 'before_agent_start') → policy
+  dsh/             dsh 的适配层：ctx.on('tools/pre-execute' / 'tools/result' / 'agent/pre-step' / 'agent/turn-stopping') → policy
 ```
 
-换个 harness 只需要再写一个几十行的翻译层，规则本身不用动。也不会出现"pi 管、dsh 不管"这类静默不一致。
+换个 harness 只需要再写一个几十行的翻译层，规则本身不用动。也不会出现"pi 管、dsh 不管"这类静默不一致——
+两端现在把 `policy.js` 的**同一份**判定跑在**语义相同**的钩子上（v6 起 dsh 也有结果钩子与轮次级门控）。
 
 ### 目前支持情况
 
@@ -181,8 +182,8 @@ bridge/gates/
 | 项 | 值 |
 |---|---|
 | 适配的 skill 体系 | **[VitaForge](https://github.com/PancrePal-xiaoyibao/VitaForge)**（生命工坊——通用医学与大生命科学领域的 AI4S 干实验引擎）。本门控适配它的 Worklog / 脚本日志 / 结果说明三项工作流约定 |
-| 适配的 agent | **pi**。策略引擎由 dsh 共用，但域检查与轮末产物检查目前只在 pi 生效（dsh 没有 `before_agent_start` 与轮结束钩子） |
-| 策略版本 | `policy.json` **v5**；`bridge/gates/profiles/ai4s-dry-lab.json` **v1** |
+| 适配的 agent | **pi 与 dsh 两端对齐**（v6）。dsh 侧经 `tools/result` 判图谱/读证据与盲重试、`agent/turn-stopping` 做轮次级不偷懒、`agent/pre-step` 做每轮分类与提醒注入。残留的只是机制差异（dsh 的轮次钩子不带最终文本，靠 `session/event` 增量 fold；纯工具轮不判定），见 `docs/ADR/014-dsh-hook-parity.md` |
+| 策略版本 | `policy.json`：pi 端 **v5** / dsh 端 **v6**（同一套 `policy.js` 规则；dsh 的 v6 是钩子接入，不是新规则）；`bridge/gates/profiles/ai4s-dry-lab.json` **v1** |
 | 决策记录 | `docs/ADR/011-ai4s-domain-gates.md`；设计说明 `tasks/CHG-20261104-ai4s-domain-gates/DESIGN.md` |
 | 本机验证环境 | pi **1.2.0** |
 | 落地的检查 | W1 跑脚本前 Worklog 需新鲜（硬拦）、W4 脚本要带日志初始化且留下 `.log`（run 前硬拦 / run 后提醒）、W2 结果子目录要有 `README_*`（提醒） |

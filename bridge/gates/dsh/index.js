@@ -2,12 +2,9 @@
  * DeepSeek Harness (dsh) adapter for the hard-gate policy.
  *
  * dsh is "everything is a plugin": a plugin is a module exporting `apply(ctx)`,
- * and the reorderable policy layer is the `tools/pre-execute` waterfall. A
- * listener returns `{ kind: 'deny', reason }` to stop a call, or delegates with
- * `return next()`.
- *
- * So this file is the same shape as the pi adapter: translate the harness event
- * into the normalized question, ask ../policy.js, translate the answer back.
+ * and policy is expressed as listeners on documented extension points. This file
+ * is the same shape as the pi adapter: translate the harness event into the
+ * normalized question, ask ../policy.js, translate the answer back.
  *
  * Configure through the cordis plugin row, e.g.
  *
@@ -22,17 +19,41 @@
  *           # policyPath is read with a plain fs call, so it must be absolute.
  *           policyPath: '/absolute/path/to/agent-config-gates/policy.json'
  *
- * Differences from the pi adapter (both are deliberate, both are documented
- * rather than hidden):
+ * ---------------------------------------------------------------------------
+ * Hook parity with the pi adapter (CHG-20261115-dsh-gate-parity)
+ * ---------------------------------------------------------------------------
  *
- *   - The "I consulted the graph" signal is recorded when a graph query is
- *     allowed through, not when it returns successfully. dsh's result-shape is
- *     more involved and a wrong assumption there would silently disable the
- *     gate; erring toward opening the gate is the safe direction.
- *   - There is no per-turn reminder injection here. Enforcement and the
- *     explanation carried by a denial are the whole mechanism on this harness.
- *     The batch is published as a reusable cordis package, which already has a
- *     documented way to contribute prompt text.
+ * The previous revision recorded "dsh has no result hook and no turn-level
+ * injection" and turned three checks off in policy.json because of it. That was
+ * true of the dsh version it was written against and is FALSE of the installed
+ * one, so the checks are back:
+ *
+ *   pi `tool_call`        -> `tools/pre-execute`   waterfall, deny/ask/next
+ *   pi `tool_result`      -> `tools/result`        synchronous, frozen outcome
+ *   pi `turn_end`         -> `agent/turn-stopping` serial; object by steering
+ *   pi `before_agent_start` -> `agent/pre-step`    waterfall; sees claimed messages
+ *   pi `context` (reminder) -> `agent.inject(message)`
+ *   pi `ctx.ui.confirm`     -> `{ kind: 'ask' }` + `ctx.approval`
+ *
+ * Sources (installed version, read 2026-11-15):
+ *   docs/user/develop/framework/events.md            tools/result signature
+ *   docs/tool-execution-pipeline.md                  pipeline order
+ *   docs/subsystems/tools.md                         PreToolDecision, ToolExecutionResult
+ *   docs/subsystems/core.md                          agent/pre-step, agent/turn-stopping
+ *   docs/subsystems/approval.md                      ctx.approval.effectivePolicy
+ *   docs/subsystems/practices.md                     incremental-fold performance rule
+ *
+ * Two deliberate asymmetries REMAIN and are documented rather than hidden:
+ *
+ *   - `agent/turn-stopping` hands over `{agent, turn, signal}` and no text, so
+ *     the turn's final assistant text is folded incrementally from
+ *     `session/event` (practices.md forbids rescanning the whole log there).
+ *   - Steering and injection take a `UserMessage`, which this adapter cannot
+ *     construct through the typed factory (`@deepseek-ai/dsh-llm` is not a
+ *     declared dependency of this plugin). It therefore tries the documented
+ *     shapes in order and, if every one is rejected, writes one stderr line
+ *     instead of throwing: a gate that breaks a turn is worse than a gate that
+ *     reports it could not act.
  *
  * Two harness details are matched here rather than assumed, because both were
  * silent failures on Windows Desktop (2026-11-14):
@@ -53,19 +74,31 @@ import { fileURLToPath } from 'node:url';
 import {
   analysisScriptTargets,
   applyMachineOverride,
+  graphResultIsEvidence,
+  isChgContract,
+  isConventionDoc,
   isDestructiveBypass,
   loadPolicy,
   newSessionState,
   normalizePath,
+  outputArtifactFindings,
   policyFromObject,
   profilePolicy,
+  recordCommandResult,
+  recordDocRead,
+  recordIndexRefresh,
   recordInspection,
   recordInvestigation,
   recordScriptRun,
   recordSignal,
   recordUnlocks,
   recordWrite,
+  reminderFor,
+  resetMtimeCache,
+  shellReadTargets,
   shouldBlock,
+  slackFinding,
+  unlockTokensFromQualifiedName,
   unlockTokensFromText,
 } from '../policy.js';
 import { classify } from '../classifier.js';
@@ -167,8 +200,7 @@ const SHELL_TOOLS = new Set(['bash', 'pwsh', 'shell']);
  */
 const shellDialect = (toolName) => (toolName === 'pwsh' || toolName === 'powershell' ? 'powershell' : 'bash');
 
-const isSignalTool = (toolName) =>
-  SIGNAL_TOOLS.some((s) => toolName === s || toolName.endsWith(`_${s}`));
+const isSignalTool = (toolName) => SIGNAL_TOOLS.some((s) => toolName === s || toolName.endsWith(`_${s}`));
 
 /** Read one field out of an `unknown` args object without trusting its shape. */
 const str = (args, key) => {
@@ -181,6 +213,119 @@ const argContent = (args) =>
   ['content', 'new_string', 'newText', 'patch', 'text']
     .map((key) => str(args, key))
     .find((value) => value !== null) ?? null;
+
+/** All string leaves of a tool input, so a query's arguments become unlocks. */
+const inputStrings = (value, out = []) => {
+  if (typeof value === 'string') out.push(value);
+  else if (Array.isArray(value)) for (const item of value) inputStrings(item, out);
+  else if (value && typeof value === 'object') for (const item of Object.values(value)) inputStrings(item, out);
+  return out;
+};
+
+/**
+ * Model-facing text of a settled tool result.
+ *
+ * `ToolExecutionResult` is `{ isError, content, value? }` (docs/subsystems/tools.md).
+ * Only `content` is the projection the model saw; `value` is execution-local and
+ * deliberately omitted from durable events, so evidence is judged on `content` —
+ * the thing the model actually learned from.
+ */
+const resultText = (result) => {
+  if (!result || typeof result !== 'object') return '';
+  const blocks = Array.isArray(result.content) ? result.content : [];
+  return blocks
+    .map((block) => (typeof block === 'string' ? block : typeof block?.text === 'string' ? block.text : ''))
+    .join('\n');
+};
+
+/**
+ * Visible assistant text carried by one `assistant/message` session event.
+ *
+ * The event wraps the model stream (`expandAssistantStream` is the typed reader,
+ * but `@deepseek-ai/dsh-llm` is not a declared dependency here). Rather than
+ * depend on an unowned package the adapter collects the visible text blocks by
+ * shape: only `text` / `text-delta` count, so reasoning content never satisfies
+ * the anti-slack rule. Bounded in depth and length so a pathological event
+ * cannot stall a turn boundary.
+ */
+const assistantTextOf = (event) => {
+  const parts = [];
+  let budget = 20000;
+  const walk = (value, depth) => {
+    if (budget <= 0 || depth > 8 || parts.length > 400) return;
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, depth + 1);
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    const kind = value.type;
+    if ((kind === 'text' || kind === 'text-delta') && typeof value.text === 'string') {
+      parts.push(value.text);
+      budget -= value.text.length;
+      return;
+    }
+    for (const item of Object.values(value)) walk(item, depth + 1);
+  };
+  walk(event?.data, 0);
+  return parts.join('');
+};
+
+/** Concatenated text of the messages a pre-step has already claimed for entry. */
+const messagesText = (messages) => {
+  if (!Array.isArray(messages)) return '';
+  const parts = [];
+  for (const message of messages) {
+    if (typeof message?.content === 'string') {
+      parts.push(message.content);
+      continue;
+    }
+    if (!Array.isArray(message?.content)) continue;
+    for (const block of message.content) {
+      if (typeof block === 'string') parts.push(block);
+      else if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text);
+    }
+  }
+  return parts.join('\n');
+};
+
+let messageSeq = 0;
+const newMessageId = () => `enforce-rules-${Date.now().toString(36)}-${(messageSeq += 1).toString(36)}`;
+
+/**
+ * Candidate `UserMessage` shapes for `agent.inject` / `agent.steer`.
+ *
+ * `session.md` says a message is "one identified, immutable role/source/content
+ * value", and `MessageSourceMap` is a merge-extensible sum type where "each
+ * producer declares its own kind" and consumers "fall through unknown kinds" —
+ * so `{ kind: 'enforce-rules' }` is the semantically correct source; the extra
+ * shapes exist only because the exact id requirement is not verifiable from the
+ * documents alone. First one that the harness accepts wins.
+ */
+const messageCandidates = (text) => [
+  { role: 'user', messageId: newMessageId(), content: [{ type: 'text', text }], source: { kind: 'enforce-rules' } },
+  { role: 'user', content: [{ type: 'text', text }], source: { kind: 'enforce-rules' } },
+  { role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } },
+];
+
+/**
+ * Deliver one message through `agent[method]`, trying the documented shapes.
+ *
+ * Never throws: this runs inside `agent/turn-stopping`, which is awaited on the
+ * turn boundary — a throw there would fail the turn. Returning `false` lets the
+ * caller report that the gate could not act, which is the honest outcome.
+ */
+const deliver = (agent, method, text) => {
+  if (!agent || typeof agent[method] !== 'function' || typeof text !== 'string' || text === '') return false;
+  for (const message of messageCandidates(text)) {
+    try {
+      agent[method](message);
+      return true;
+    } catch {
+      // Try the next documented shape; report only if all of them fail.
+    }
+  }
+  return false;
+};
 
 export function apply(ctx, config = {}) {
   // An inline `policy` object lets a host inject configuration; `policyPath`
@@ -228,9 +373,7 @@ export function apply(ctx, config = {}) {
   /**
    * ADR-013: the destructive gate's mode is read from the same config both paths
    * already share, so dsh needs no command channel to obey it. It does need to
-   * SAY it, because a silent bypass on this harness (no reminder, no UI) is
-   * invisible. Note the scope: only destructive commands are affected; every
-   * other check keeps running.
+   * SAY it, because a silent bypass on this harness is invisible.
    */
   if (isDestructiveBypass(policy.config, state)) {
     const line =
@@ -240,21 +383,28 @@ export function apply(ctx, config = {}) {
     ctx.logger?.warn?.(line);
     process.stderr.write(`${line}\n`);
   }
+
   /**
    * v5: classify lazily, on the first tool event.
    *
-   * dsh has no `before_agent_start` hook, so there is no "a user turn just
-   * started" moment to hang the classifier on. Until the first tool event the
-   * adapter therefore behaves exactly like v4 (`general-dev` / base checks), and
-   * the classification happens as part of the same call it will affect — never
-   * later, so no tool call is ever judged under the wrong profile after it.
-   *
-   * What dsh can decide is limited by what it receives: it sees the working
-   * directory but NOT the user's prompt, so T1 (keywords) and T2 (model) have
-   * nothing to read. Fingerprints still work, which is the strongest signal
-   * anyway. The asymmetry is documented rather than papered over.
+   * Kept as a fallback for harness builds without `agent/pre-step`; when that
+   * hook is present the classification happens at the turn start with the real
+   * user prompt (see that listener), which is the accurate moment.
    */
   let classified = false;
+
+  /** The last `agent/pre-step` prompt we classified, and the turn it belonged to. */
+  let lastPreStepKey = null;
+
+  /**
+   * The final assistant text of each session, folded incrementally.
+   *
+   * `agent/turn-stopping` receives `{agent, turn, signal}` only, so the text the
+   * anti-slack rule needs is not in the hook payload. `docs/subsystems/practices.md`
+   * forbids rescanning `session.events` on `session/event`, and an incremental
+   * fold is exactly the allowed alternative: one map write per assistant message.
+   */
+  const lastAssistantText = new Map();
 
   /**
    * The directory this call's relative paths resolve against.
@@ -262,10 +412,6 @@ export function apply(ctx, config = {}) {
    * `exec.cwd` is not part of dsh's `ToolExecution`, so the previous
    * `process.cwd()` fallback judged every relative path against the directory
    * the Desktop app was launched from — a different project than the Session's.
-   * The Session's own directory is reachable without declaring an injection
-   * (a missing injected service would deactivate the whole gate): the
-   * `workingDirectory` service answers synchronously from a projection, and a
-   * lookup that fails falls back to the old behaviour instead of guessing.
    */
   const cwdOf = (exec) => {
     if (typeof exec?.cwd === 'string' && exec.cwd) return exec.cwd;
@@ -283,12 +429,223 @@ export function apply(ctx, config = {}) {
     return process.cwd();
   };
 
+  /**
+   * Whether returning `ask` would actually reach a human.
+   *
+   * `PreToolDecision.ask` runs the call only after `ctx.approval` answers
+   * `allowed-once`; a `never` policy or a missing service means "deny". Turning
+   * every recoverable delete into a hard denial because approvals happen to be
+   * disabled is the "gate bricks the agent" failure this design avoids, so the
+   * question is only asked when it can be answered.
+   */
+  const approvalUsable = (exec) => {
+    const service = ctx.get?.('approval');
+    const session = exec?.agent?.session;
+    if (!service || session === undefined || typeof service.effectivePolicy !== 'function') return false;
+    try {
+      return service.effectivePolicy(session) === 'ask';
+    } catch {
+      return false;
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Turn boundary: fold the assistant text the anti-slack rule will read.
+  // -------------------------------------------------------------------------
+  ctx.on('session/event', (session, event) => {
+    try {
+      if (!event || event.type !== 'assistant/message') return;
+      const text = assistantTextOf(event);
+      if (text) lastAssistantText.set(session, text);
+    } catch {
+      // An observation listener must never break the session.
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Turn start: turnStart, domain classification, per-turn reminder.
+  // -------------------------------------------------------------------------
+  ctx.on('agent/pre-step', async (payload, next) => {
+    try {
+      const agent = payload?.agent;
+      const cwd = cwdOf({ agent });
+      const turn = payload?.turn;
+      const key = `${cwd}\u0000${turn}`;
+      const firstOfTurn = key !== lastPreStepKey;
+
+      if (firstOfTurn) {
+        lastPreStepKey = key;
+        // A new turn is the boundary the output checks (W2) compare mtimes to.
+        state.turnStart = Date.now();
+      }
+
+      if (!classified) {
+        classified = true;
+        const result = await classify({
+          cwd,
+          prompt: messagesText(payload?.messages),
+          fs: realFs,
+          policy,
+          modelHint: typeof config.modelHint === 'function' ? config.modelHint : null,
+        });
+        state.profile = result.profile;
+        state.profileSource = result.source;
+      }
+
+      if (firstOfTurn) {
+        const reminder = reminderFor(policy, state);
+        if (reminder && !deliver(agent, 'inject', reminder)) {
+          process.stderr.write('[enforce-rules] 提醒注入失败：agent.inject 拒绝所有已知消息形状\n');
+        }
+      }
+    } catch (err) {
+      process.stderr.write(`[enforce-rules] agent/pre-step observer failed: ${err?.message ?? err}\n`);
+    }
+    return next();
+  });
+
+  // -------------------------------------------------------------------------
+  // Tool result: the only truthful source of "what the model learned".
+  // -------------------------------------------------------------------------
+  ctx.on('tools/result', (exec, result) => {
+    try {
+      const toolName = String(exec?.name ?? '');
+      const args = exec?.arguments;
+      const cwd = cwdOf(exec);
+      const command = str(args, 'command') ?? '';
+      const failed = result?.isError === true;
+
+      if (failed) {
+        // A failed shell command feeds the blind-retry rule. A failed graph query
+        // must not record a signal — the model has learned nothing yet.
+        if (SHELL_TOOLS.has(toolName)) recordCommandResult(state, command, true);
+        return;
+      }
+
+      // A successful read is evidence about the exact file, which is what Layer 0
+      // needs before an edit. Convention documents additionally satisfy the
+      // "project conventions" question.
+      const path = normalizePath(argPath(args), cwd);
+      if (READ_TOOLS.has(toolName) && path) {
+        recordInspection(state, path);
+        if (isConventionDoc(path, policy.config) || isChgContract(path, policy.config)) {
+          recordDocRead(state, path);
+        }
+      }
+
+      if (SHELL_TOOLS.has(toolName)) {
+        recordCommandResult(state, command, false);
+        const shell = shellDialect(toolName);
+        for (const target of shellReadTargets(
+          { command, shell },
+          { config: policy.config, cwd, isFile: realFs.isFile, exists: realFs.exists },
+        )) {
+          recordInspection(state, normalizePath(target));
+        }
+        // `cat CONTRIBUTING.md` satisfies the convention rule just like `read`.
+        for (const token of command.match(/"[^"]+"|'[^']+'|[^\s;&|]+/g) ?? []) {
+          const candidate = normalizePath(token.replace(/^["']|["']$/g, ''), cwd);
+          if (
+            candidate &&
+            (isConventionDoc(candidate, policy.config) || isChgContract(candidate, policy.config)) &&
+            realFs.isFile(candidate)
+          ) {
+            recordDocRead(state, candidate);
+          }
+        }
+      }
+
+      // A successful index refresh is Layer-2 evidence that works even when the
+      // index lives in a global data directory (no repo-local marker). Re-indexing
+      // also changes a marker's mtime, so a cached value must be dropped.
+      if (/(?:^|_)index_repository$/.test(toolName) || /(?:^|_)detect_changes$/.test(toolName)) {
+        resetMtimeCache();
+        recordIndexRefresh(state);
+      }
+
+      if (!isSignalTool(toolName)) return;
+
+      // A successful call is not enough: an empty result ("total":0) used to buy
+      // a full read window without telling the model anything. Only evidence counts.
+      const body = resultText(result);
+      if (!graphResultIsEvidence(body, policy.config)) return;
+
+      const now = Date.now();
+      recordSignal(state, now);
+      // …and remember *what the query was about*: arguments plus the result text
+      // become scoped unlocks, so a query about one file never buys a free pass
+      // for the whole repository.
+      recordUnlocks(state, unlockTokensFromText(inputStrings(args).join('\n')), now);
+      if (typeof args?.qualified_name === 'string') {
+        recordUnlocks(state, unlockTokensFromQualifiedName(args.qualified_name), now);
+      }
+      recordUnlocks(state, unlockTokensFromText(body), now);
+    } catch (err) {
+      process.stderr.write(`[enforce-rules] tools/result observer failed: ${err?.message ?? err}\n`);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Turn close: the anti-slack gate. A promise is not a delivery.
+  // -------------------------------------------------------------------------
+  ctx.on('agent/turn-stopping', async (payload) => {
+    try {
+      const max = policy.config.slack_max_continues ?? 0;
+      if (max <= 0 || state.slackContinues >= max) return;
+
+      const agent = payload?.agent;
+      if (!agent || typeof agent.steer !== 'function') return;
+
+      const effective = profilePolicy(policy, state.profile);
+
+      // AI4S output artifacts (W4 log file / W2 result README). Both are
+      // discovered after the computation has finished, and one more turn is
+      // enough to fix them — `outputArtifactFindings` returns [] for a
+      // general-dev session, so ordinary work pays one Map lookup.
+      const artifacts = outputArtifactFindings({
+        policy: effective,
+        state,
+        fs: realFs,
+        cwd: cwdOf({ agent }),
+      });
+      if (artifacts.length > 0) {
+        if (deliver(agent, 'steer', artifacts.map((f) => f.reason).join('\n\n'))) {
+          state.slackContinues += 1;
+        } else {
+          process.stderr.write('[enforce-rules] AI4S 产出物缺失，但 agent.steer 不可用，本轮放弃续跑\n');
+        }
+        return;
+      }
+
+      if (policy.config.slack_check === false) return;
+
+      const text = lastAssistantText.get(agent.session);
+      if (!text) return;
+      const finding = slackFinding(text, policy.config);
+      if (!finding) return;
+
+      if (deliver(agent, 'steer', finding.reason)) {
+        state.slackContinues += 1;
+      } else {
+        process.stderr.write('[enforce-rules] 检测到拖延承诺，但 agent.steer 不可用，本轮放弃续跑\n');
+      }
+    } catch (err) {
+      // `agent/turn-stopping` is awaited on the boundary: never throw from here.
+      process.stderr.write(`[enforce-rules] agent/turn-stopping observer failed: ${err?.message ?? err}\n`);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Pre-execute: allow / deny / ask. Never records a graph signal.
+  // -------------------------------------------------------------------------
   ctx.on('tools/pre-execute', async (exec, next) => {
     const toolName = String(exec?.name ?? '');
     const args = exec?.arguments;
     const cwd = cwdOf(exec);
 
     if (!classified) {
+      // Fallback only: `agent/pre-step` normally classifies with the real prompt
+      // before any tool runs. This keeps the profile sane on builds without it.
       classified = true;
       const result = await classify({
         cwd,
@@ -328,8 +685,11 @@ export function apply(ctx, config = {}) {
         fs: realFs,
       });
       if (verdict.block) return { kind: 'deny', reason: verdict.reason };
-      // dsh's pre-execute cannot see the result. Recording the inspection here
-      // errs toward opening Layer 0; the denial path above is still exact.
+      // Layer 0 only: "did this session read before editing". Recorded at
+      // admission on purpose — a file the gate let through has been inspected
+      // for the purposes of the edit rule, and keeping it here means Layer 0
+      // still works if the result hook is ever unavailable. Layer 1 (the graph
+      //通行证) is NOT recorded here; see `tools/result`.
       recordInspection(state, path);
       return next();
     }
@@ -343,11 +703,23 @@ export function apply(ctx, config = {}) {
         fs: realFs,
       });
       if (verdict.block) return { kind: 'deny', reason: verdict.reason };
+
       // Three-tier destructive policy (CHG-20261105): a `confirm` finding is not
-      // a refusal. dsh's pre-execute exposes only `deny` and `next` - there is
-      // no UI channel to ask through - so a recoverable delete degrades to
-      // "run it". The `high` tier above still denies, which is why this is a
-      // capability difference between harnesses and not a hole in the rule.
+      // a refusal. dsh can ask — `{kind:'ask'}` routes through `ctx.approval` —
+      // but only when an approval channel can actually answer; otherwise the
+      // call proceeds exactly as before and says so on stderr. That keeps a
+      // recoverable delete working in headless/unattended runs without
+      // pretending it was reviewed. The `high` tier above still denies.
+      if (verdict.confirm) {
+        const why = verdict.confirmReason ?? '破坏性命令需要确认';
+        if (approvalUsable(exec)) {
+          return { kind: 'ask', reason: why, displayReason: { en: why, 'zh-CN': why } };
+        }
+        process.stderr.write(
+          `[enforce-rules] DESTRUCTIVE_CONFIRM auto-approved (no approval channel): ${command.slice(0, 200)}\n`,
+        );
+      }
+
       // AI4S: remember the script this call runs (W1 first-run test, W4 log date).
       for (const script of analysisScriptTargets(command, {
         config: effective.config,
@@ -359,15 +731,10 @@ export function apply(ctx, config = {}) {
       return next();
     }
 
-    if (isSignalTool(toolName)) {
-      // Recorded on the way in; see the file header for why success is not
-      // awaited on this harness. Arguments still become scoped unlocks, which
-      // is the best evidence available without a result hook.
-      const now = Date.now();
-      recordSignal(state, now);
-      recordUnlocks(state, unlockTokensFromText(JSON.stringify(args ?? {})), now);
-    }
-
+    // NOTE: a graph query is deliberately NOT recorded here. `recordSignal` now
+    // lives in the `tools/result` listener, where the outcome can be judged — an
+    // admission-time signal lets `{"total":0}` buy a read window, which is the
+    // hole ADR-006 recorded.
     return next();
   });
 }
