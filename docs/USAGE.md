@@ -295,6 +295,7 @@ node bridge/cli.js apply
 * 检查按 **安全规则 → Layer 2（索引）→ Layer 1（图谱）→ Layer 0（动脑子）** 的次序级联，次序就是 `policy.json` 里 `checks` 数组的顺序；
 * **空图谱结果不算合规**：查了但没查到，要先查索引 / 重新索引 / 重查，不能直接 read；
 * **改已存在文件前必须有证据且证据会过期**：本会话在有效期内（默认 30 分钟）读过该文件，或图谱查询点名过它；改新文件不强制；如果有 `AGENTS.md` / `CLAUDE.md` / `CONTRIBUTING.md` / `.cursorrules`，还要先读其中一个；
+* **CHG 契约必须「成立」，不只是「读过一份」**（pi v6 / dsh v7）：改代码前，**本项目**必须有一份 `tasks/CHG-<id>/` 契约，且同时满足 ① `SPEC.md` + `PRD.md` + `TRACEABILITY.md` 三件齐全；② SPEC 写明验收判据（`验收` / `AC-` / `断言` / `可判定`）；③ 若声明了 `status`，不得是 `draft`。只写一个 `SPEC.md` 就开工会被拦（码 `CHG_CONTRACT_INCOMPLETE`，逐条列出缺哪件）；读**别的仓库**的 CHG 不给本仓库解锁（码 `CHG_CONTRACT`）。没 `tasks/` 或没 `CHG-*` 子目录的仓库不启用这条；`status` 字段缺失不拦（格式差异不制造死锁）；
 * **轮次级不偷懒**：一轮结束时只输出「稍后再补 / 后续再做 / 先不实现」而不动工具，会被要求继续做完；确实阻塞就写清阻塞点；
 * **bash / PowerShell 写入也算写入**：`> file`、`tee`、`sed -i`、`cp/mv/rm`、`Set-Content`、`Remove-Item` 都走凭据与越界检查；`git reset --hard` / `git clean -f` / `rm -rf` 源码目录 / `Remove-Item -Recurse` / 强推等破坏性命令直接拒绝；
 * **MCP 网关不豁免**：`mcp` 代理调用会按 `input.tool` 的真实工具名解包，再走同一套判定；

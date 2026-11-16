@@ -268,8 +268,15 @@ export const DEFAULT_CONFIG = {
    * 先合并的 CHG 用「全局状态断言」把后合并的合法改动判红——全部源于
    * 「没先核对契约就动手」。
    *
-   * 判定只看一件事：`state.docReads` 里是否有一条落在 `chg_contract_globs`。
-   * 只约束代码文件（isCodeFile），文档与数据文件不拦。
+   * 判定分三层（v6 起），只约束代码文件（isCodeFile），文档与数据文件不拦：
+   *   1) `state.docReads` 里有没有落在 `chg_contract_globs` 的路径；
+   *   2) 那条路径必须属于**当前项目**（读别的仓库的 CHG 不算数）；
+   *   3) 它所在的 `tasks/CHG-<id>/` 必须是一份**成立的契约** —— 四件套齐全、
+   *      SPEC 有验收判据、status 不是草稿态。
+   *
+   * 为什么第 3 层必须存在：v5 只看第 1 层，于是「写一个 SPEC.md → 读它 → 改代码」
+   * 全流程畅通。实测（2026-11-16）agent 反复走这条路，PRD 与 TRACEABILITY
+   * 根本不存在。读过一份文件不等于立过项。
    */
   require_chg_contract: true,
   // 大小写不敏感（`isChgContract` 对两侧统一小写化），可写成自然的大写形态。
@@ -287,6 +294,29 @@ export const DEFAULT_CONFIG = {
    * whole tree gated forever.
    */
   chg_contract_scope_globs: [],
+
+  // -------------------------------------------------------------------------
+  // v6: a CHG contract must be STANDING, not merely touched
+  // -------------------------------------------------------------------------
+  /** Files that must all exist before a CHG counts as a usable contract. */
+  chg_contract_required_files: ['SPEC.md', 'PRD.md', 'TRACEABILITY.md'],
+  /**
+   * Markers that prove the SPEC names a checkable end state. Empty = no check.
+   *
+   * A SPEC without one of these is a wish, not a contract: after the code is
+   * written nobody can say whether the change succeeded.
+   */
+  chg_acceptance_markers: ['验收', 'AC-', '断言', '可判定', 'Acceptance'],
+  /**
+   * Status values that permit development. Empty = status is not checked.
+   *
+   * A MISSING status field is never a refusal: frontmatter conventions differ
+   * between repositories, and punishing format variety turns a rule into a
+   * deadlock. Only an explicitly declared draft-ish value blocks.
+   */
+  chg_status_allow: ['approved', 'executing', 'active', 'in-progress', 'in_progress'],
+  /** Frontmatter keys accepted as the status field. */
+  chg_status_fields: ['status', 'state'],
 
   /**
    * Layer 0: retrying an identical failing command is the mechanical loop the
@@ -1121,6 +1151,92 @@ export const isChgContract = (path, config = DEFAULT_CONFIG) => {
   if (typeof path !== 'string' || path === '') return false;
   const globs = (config.chg_contract_globs ?? []).map((g) => String(g).toLowerCase());
   return matchesAnyGlob(toPosix(path).toLowerCase(), globs);
+};
+
+/**
+ * The `tasks/CHG-<id>/` directory a contract file belongs to, or null.
+ *
+ * Reading `SPEC.md` only means something if the PRD and TRACEABILITY that turn
+ * it into a *contract* exist beside it — that is a property of the directory,
+ * not of the file that was opened.
+ */
+export const chgDirOf = (path, config = DEFAULT_CONFIG) =>
+  isChgContract(path, config) ? dirname(toPosix(path)) : null;
+
+/**
+ * Declared status of a CHG, or null when the document declares none.
+ *
+ * `null` is deliberately distinct from "invalid": only an explicit draft value
+ * is a refusal, so a repository without frontmatter is never blocked for it.
+ */
+export const chgStatusOf = (text, config = DEFAULT_CONFIG) => {
+  if (typeof text !== 'string' || text === '') return null;
+  const fields = config.chg_status_fields ?? DEFAULT_CONFIG.chg_status_fields;
+  const close = text.startsWith('---') ? text.indexOf('\n---', 3) : -1;
+  const scope = close >= 0 ? text.slice(0, close + 1) : text.slice(0, 2000);
+  for (const field of fields) {
+    const hit = new RegExp(`^\\s*${String(field)}\\s*:\\s*(.+)$`, 'im').exec(scope);
+    if (hit) {
+      // `status: approved  # 用户批准…` → `approved`. Trailing prose is common.
+      return hit[1].trim().replace(/^["']|["']$/g, '').split(/\s+/)[0].toLowerCase();
+    }
+  }
+  return null;
+};
+
+/** Does the SPEC name a checkable acceptance condition? */
+export const chgSpecHasAcceptance = (text, config = DEFAULT_CONFIG) => {
+  const markers = config.chg_acceptance_markers ?? DEFAULT_CONFIG.chg_acceptance_markers;
+  if (!Array.isArray(markers) || markers.length === 0) return true;
+  if (typeof text !== 'string' || text === '') return false;
+  const lower = text.toLowerCase();
+  return markers.some((m) => lower.includes(String(m).toLowerCase()));
+};
+
+/**
+ * Is this CHG directory a *standing* contract — complete, verifiable, started?
+ *
+ * Three independent questions, because "the model opened one file" answers none
+ * of them:
+ *   complete?   SPEC + PRD + TRACEABILITY all exist
+ *   checkable?  the SPEC names an acceptance condition
+ *   started?    a declared status is not a draft value
+ *
+ * Repository binding is the caller's job: it needs the edit target, not the
+ * contract directory. Returns the problem list rather than a boolean so the
+ * denial can name the exact file to create.
+ */
+export const auditChgContract = (dir, config = DEFAULT_CONFIG, deps = {}) => {
+  const exists = deps.exists ?? (() => false);
+  const isFile = typeof deps.isFile === 'function' ? deps.isFile : null;
+  const problems = [];
+
+  const required = config.chg_contract_required_files ?? DEFAULT_CONFIG.chg_contract_required_files;
+  for (const name of Array.isArray(required) ? required : []) {
+    const file = join(dir, name);
+    if (!(exists(file) && (isFile ? isFile(file) : true))) problems.push(`${name} 不存在`);
+  }
+
+  // Without a reader this is a breadth-only audit. Abstaining is better than
+  // failing an edit because a harness (or a test double) cannot read bytes.
+  if (typeof deps.readText !== 'function') {
+    return { ok: problems.length === 0, problems };
+  }
+
+  const text = deps.readText(join(dir, 'SPEC.md'));
+  if (typeof text !== 'string') {
+    if (!problems.includes('SPEC.md 不存在')) problems.push('SPEC.md 读不出内容');
+    return { ok: false, problems };
+  }
+  if (!chgSpecHasAcceptance(text, config)) {
+    problems.push('SPEC.md 没有可判定的验收判据（验收 / AC / 断言 / 可判定）');
+  }
+  const status = chgStatusOf(text, config);
+  const allow = config.chg_status_allow ?? DEFAULT_CONFIG.chg_status_allow;
+  if (status !== null && Array.isArray(allow) && allow.length > 0 && !allow.includes(status)) {
+    problems.push(`SPEC.md status=${status} 不是可开工状态（允许：${allow.join(' / ')}）`);
+  }
+  return { ok: problems.length === 0, problems };
 };
 
 /** Record a file the session wrote. The caller passes the normalized spelling. */
@@ -2626,42 +2742,85 @@ const CHECKS = {
     // 项目适用性：不用 CHG 体系的项目（如以 ADR 管理的仓库）不该被这条拦死。
     // 判据取文件系统事实：`tasks/` 存在且含 `CHG-*` 子目录，才认为本项目采纳了 CHG。
     // 不跳过的后果：任何不用 CHG 的仓库都改不了代码 —— 死锁。
-    const tasksDir = join(scope.projectRoot ?? scope.root, 'tasks');
+    const projectRoot = scope.projectRoot ?? scope.root;
+    const tasksDir = join(projectRoot, 'tasks');
     if (!deps.exists(tasksDir)) return null;
     if (typeof deps.listDir === 'function') {
       const entries = deps.listDir(tasksDir) ?? [];
       if (!entries.some((name) => /^CHG-/i.test(String(name)))) return null;
     }
 
-    const read = [...deps.state.docReads].some((p) =>
-      isChgContract(normalizePath(p), config),
-    );
-    if (read) return null;
+    // 本会话读过的契约，且必须属于**当前项目**：读别的仓库的 CHG 不算数。
+    // v5 少了这层过滤 —— 读 A 仓库的 SPEC.md 可以解锁 B 仓库的代码改动。
+    const dirs = new Set();
+    for (const p of deps.state.docReads ?? []) {
+      const read = normalizePath(p);
+      if (!withinRoot(projectRoot, read)) continue;
+      const dir = chgDirOf(read, config);
+      if (dir) dirs.add(dir);
+    }
+    if (dirs.size === 0) {
+      return {
+        code: 'CHG_CONTRACT',
+        reason: [
+          '⛔ ai-spec 门控：改代码前没有核对**本项目**的立项 CHG 契约。',
+          `  目标：${norm}`,
+          `  项目：${projectRoot}`,
+          '  缺口：本会话没有读过本项目 tasks/CHG-*/ 下的任何 SPEC / PRD / TRACEABILITY。',
+          '',
+          '先做（按序，缺一不可）：',
+          '  1) 定位本次开发属于哪个 CHG：ls tasks/CHG-*/（按 date-slug 判定）',
+          '  2) 读它的四件套（至少 SPEC + PRD）：',
+          '     read tasks/CHG-<id>/SPEC.md          # 目标 / 独占文件 / 验收断言 / 绝不做什么',
+          '     read tasks/CHG-<id>/PRD.md           # 承诺什么、不承诺什么',
+          '     read tasks/CHG-<id>/TRACEABILITY.md  # 每条 AC 的证据在哪',
+          '  3) 五问自检再动手：',
+          '     · 这个改动属于哪个 CHG？（答不出 = 不许改）',
+          '     · 该 CHG 四件套齐全吗？（缺哪件就先补，缺料不许开工）',
+          '     · 目标文件在该 CHG 的「独占文件」清单里吗？（不在 = 可能越界）',
+          '     · 改完哪条 AC 会从红变绿？（答不出 = 没有验收目标）',
+          '     · 是先用第一性原理判了根因，还是照症状打补丁？',
+          '',
+          '注意：读别的仓库的 CHG 不算数，本规则按项目绑定。',
+          '',
+          '开发中发现的问题必须当场修，不许留给「后续」；',
+          '收尾必须让该 CHG 的预定功能目标达成，而不是「大部分做完」。',
+          '',
+          '这条不是建议：未核对契约的代码改动一律拒绝。',
+        ].join('\n'),
+      };
+    }
 
+    // 读过 ≠ 契约成立。缺 PRD / 缺 TRACEABILITY / SPEC 塞的是空壳 / 还是 draft，
+    // 都不能支撑开工。v5 只看「碰过文件」，于是「写一个 SPEC.md → 读它 → 改代码」
+    // 全流程畅通，而 PRD 与 TRACEABILITY 根本不存在。
+    const gaps = [];
+    for (const dir of dirs) {
+      const audit = auditChgContract(dir, config, deps);
+      if (audit.ok) return null;
+      gaps.push({ dir, problems: audit.problems });
+    }
+
+    const prefix = `${toPosix(projectRoot)}/`;
     return {
-      code: 'CHG_CONTRACT',
+      code: 'CHG_CONTRACT_INCOMPLETE',
       reason: [
-        '⛔ ai-spec 门控：改代码前没有核对立项 CHG 的契约。',
+        '⛔ ai-spec 门控：本次改动对应的 CHG 契约**不成立**。',
         `  目标：${norm}`,
-        '  缺口：本会话没有读过任何 tasks/CHG-*/ 下的 SPEC / PRD / CHANGE / TRACEABILITY。',
         '',
-        '先做（按序，缺一不可）：',
-        '  1) 定位本次开发属于哪个 CHG：ls tasks/CHG-*/（按 date-slug 判定）',
-        '  2) 读它的四件套（至少 SPEC）：',
-        '     read tasks/CHG-<id>/SPEC.md          # 目标 / 独占文件 / 验收断言 / 绝不做什么',
-        '     read tasks/CHG-<id>/PRD.md           # 承诺什么、不承诺什么',
-        '     read tasks/CHG-<id>/TRACEABILITY.md  # 每条 AC 的证据在哪',
-        '  3) 五问自检再动手：',
-        '     · 这个改动属于哪个 CHG？（答不出 = 不许改）',
-        '     · 该 CHG 四件套齐全吗？（缺哪件就先补，缺料不许开工）',
-        '     · 目标文件在该 CHG 的「独占文件」清单里吗？（不在 = 可能越界）',
-        '     · 改完哪条 AC 会从红变绿？（答不出 = 没有验收目标）',
-        '     · 是先用第一性原理判了根因，还是照症状打补丁？',
+        '本会话读过的契约，没有一个能支撑开工：',
+        ...gaps.flatMap(({ dir, problems }) => [
+          `  · ${toPosix(dir).replace(prefix, '')}`,
+          ...problems.map((p) => `      ✗ ${p}`),
+        ]),
         '',
-        '开发中发现的问题必须当场修，不许留给「后续」；',
-        '收尾必须让该 CHG 的预定功能目标达成，而不是「大部分做完」。',
+        '「读过一份文件」不等于「立项完成」。补齐后再改代码：',
+        '  1) 缺 PRD.md → 写清承诺什么、不承诺什么、判定口径',
+        '  2) 缺 TRACEABILITY.md → 每条验收断言对应哪个产物、怎么验',
+        '  3) SPEC.md 没有验收判据 → 至少写一节「验收断言 / AC」',
+        '  4) status 是 draft → 先把 SPEC 改到 approved，或确认这不是本次要做的 CHG',
         '',
-        '这条不是建议：未核对契约的代码改动一律拒绝。',
+        '这条不是建议：契约不成立时，代码改动一律拒绝。',
       ].join('\n'),
     };
   },

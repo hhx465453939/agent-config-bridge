@@ -94,6 +94,59 @@ const conventionFs = {
   isFile: (p) => normalizePath(p) === normalizePath(AGENTS) || fs.isFile(p),
 };
 
+// --- v6 CHG-contract fixtures ---------------------------------------------
+// A CHG directory is only a *contract* when the three documents exist and the
+// SPEC states an acceptance condition. `contractFs()` builds that shape and
+// exposes the two axes the rule actually judges: which files are present, and
+// what the SPEC says.
+const chgFile = (name) => normalizePath(join(CHG_DIR, name));
+const SPEC_OK = [
+  '---',
+  'change_id: CHG-001-foo',
+  'status: approved',
+  '---',
+  '',
+  '## 2. 验收断言',
+  '',
+  '| AC-1 | 行为可判定 | 测试 |',
+].join('\n');
+
+const contractFs = ({ missing = [], spec = SPEC_OK } = {}) => {
+  const gone = new Set(missing.map(chgFile));
+  const files = new Set(
+    ['SPEC.md', 'PRD.md', 'TRACEABILITY.md'].map(chgFile).filter((f) => !gone.has(f)),
+  );
+  return {
+    ...fs,
+    exists: (p) => files.has(normalizePath(p)) || fs.exists(p),
+    isFile: (p) => files.has(normalizePath(p)) || fs.isFile(p),
+    readText: (p) => (normalizePath(p) === chgFile('SPEC.md') ? spec : null),
+  };
+};
+
+const chgPolicy = (overrides = {}) =>
+  policyFromObject({
+    name: 'chg-gate',
+    checks: ['chg-contract-before-edit'],
+    config: {
+      project_roots: [ROOT],
+      require_chg_contract: true,
+      require_target_evidence: false,
+      require_conventions: false,
+      max_blocks_per_session: 10,
+      ...overrides,
+    },
+  }).policy;
+
+const chgWrite = (p, state, probe = contractFs(), path = FILE) =>
+  shouldBlock({
+    policy: p,
+    state,
+    input: { action: 'write', path, tool: 'edit', content: 'x' },
+    fs: probe,
+    now: 1_000_000,
+  });
+
 const readVerdict = (path, state = newSessionState(), now = Date.now(), p = policy()) =>
   shouldBlock({ policy: p, state, input: { action: 'read', path, tool: 'read' }, fs, now });
 
@@ -318,27 +371,9 @@ test('cap: safety checks keep running after the research cap', () => {
   );
 });
 
-test('ai-spec: 改代码前未读 CHG 契约则拦，读过 SPEC 才放行', () => {
-  const p = policyFromObject({
-    name: 'chg-gate',
-    checks: ['chg-contract-before-edit'],
-    config: {
-      project_roots: [ROOT],
-      require_chg_contract: true,
-      require_target_evidence: false,
-      require_conventions: false,
-      max_blocks_per_session: 10,
-      chg_contract_globs: ['**/tasks/chg-*/spec.md'],
-    },
-  }).policy;
-  const w = (state, path = FILE) =>
-    shouldBlock({
-      policy: p,
-      state,
-      input: { action: 'write', path, tool: 'edit', content: 'x' },
-      fs,
-      now: 1_000_000,
-    });
+test('ai-spec: 改代码前未读 CHG 契约则拦，契约成立才放行', () => {
+  const p = chgPolicy();
+  const w = (state, path = FILE, probe = contractFs()) => chgWrite(p, state, probe, path);
 
   const bare = w(newSessionState());
   assert.equal(bare.block, true, '未读 CHG 契约必须拦');
@@ -349,10 +384,10 @@ test('ai-spec: 改代码前未读 CHG 契约则拦，读过 SPEC 才放行', () 
   recordDocRead(docs, AGENTS, 1_000_000);
   assert.equal(w(docs).code, 'CHG_CONTRACT', '读 AGENTS.md ≠ 读 CHG 契约');
 
-  // 读了该 CHG 的 SPEC 才放行
+  // 读了该 CHG 的 SPEC，且契约齐全、有验收判据、status 可开工 → 放行
   const ok = newSessionState();
-  recordDocRead(ok, join(ROOT, 'tasks', 'CHG-001-foo', 'SPEC.md'), 1_000_000);
-  assert.equal(w(ok).block, false, '读过 SPEC 即放行');
+  recordDocRead(ok, chgFile('SPEC.md'), 1_000_000);
+  assert.equal(w(ok).block, false, '契约成立才放行');
 
   // 非代码文件不受约束：改 notes.txt 不要求 CHG 契约
   const note = w(newSessionState(), NOTE);
@@ -368,7 +403,7 @@ test('ai-spec: 改代码前未读 CHG 契约则拦，读过 SPEC 才放行', () 
     policy: off,
     state: newSessionState(),
     input: { action: 'write', path: FILE, tool: 'edit', content: 'x' },
-    fs,
+    fs: contractFs(),
     now: 1_000_000,
   });
   assert.equal(offRes.block, false, 'require_chg_contract=false 时不拦');
@@ -393,7 +428,7 @@ test('ai-spec: glob 大小写不敏感（大写 / 混写 / 全大写都生效）
       policy: p,
       state,
       input: { action: 'write', path: FILE, tool: 'edit', content: 'x' },
-      fs,
+      fs: contractFs(),
       now: 1_000_000,
     });
 
@@ -414,6 +449,82 @@ test('ai-spec: glob 大小写不敏感（大写 / 混写 / 全大写都生效）
   // 小写配置大小写也生效（向后兼容）
   const lower = mk(['**/tasks/chg-*/spec.md']);
   assert.equal(write(lower).code, 'CHG_CONTRACT', '小写 glob 与混写路径仍生效');
+});
+
+// ---------------------------------------------------------------------------
+// v6: "read one file" is not "the contract stands"
+// ---------------------------------------------------------------------------
+
+test('ai-spec v6: 只写一个 SPEC.md 不许开工（缺 PRD / TRACEABILITY）', () => {
+  const p = chgPolicy();
+  const state = newSessionState();
+  recordDocRead(state, chgFile('SPEC.md'), 1_000_000);
+
+  const verdict = chgWrite(p, state, contractFs({ missing: ['PRD.md', 'TRACEABILITY.md'] }));
+  assert.equal(verdict.block, true, '契约不齐必须拦');
+  assert.equal(verdict.code, 'CHG_CONTRACT_INCOMPLETE');
+  assert.match(verdict.reason, /PRD\.md 不存在/, '必须点名缺哪一件');
+  assert.match(verdict.reason, /TRACEABILITY\.md 不存在/, '必须点名缺哪一件');
+});
+
+test('ai-spec v6: SPEC 没有验收判据要拦', () => {
+  const p = chgPolicy();
+  const state = newSessionState();
+  recordDocRead(state, chgFile('SPEC.md'), 1_000_000);
+
+  const verdict = chgWrite(
+    p,
+    state,
+    contractFs({ spec: '---\nstatus: approved\n---\n\n# 标题\n\n想做点什么。\n' }),
+  );
+  assert.equal(verdict.block, true, '没有验收判据 = 没法定终态');
+  assert.equal(verdict.code, 'CHG_CONTRACT_INCOMPLETE');
+  assert.match(verdict.reason, /验收判据/);
+});
+
+test('ai-spec v6: draft 状态不许开工', () => {
+  const p = chgPolicy();
+  const state = newSessionState();
+  recordDocRead(state, chgFile('SPEC.md'), 1_000_000);
+
+  const verdict = chgWrite(p, state, contractFs({ spec: SPEC_OK.replace('status: approved', 'status: draft') }));
+  assert.equal(verdict.block, true, 'draft 不许开工');
+  assert.equal(verdict.code, 'CHG_CONTRACT_INCOMPLETE');
+  assert.match(verdict.reason, /status=draft/);
+});
+
+test('ai-spec v6: 缺 status 字段不拦（格式差异不是死锁）', () => {
+  const p = chgPolicy();
+  const state = newSessionState();
+  recordDocRead(state, chgFile('SPEC.md'), 1_000_000);
+
+  const noStatus = SPEC_OK.replace('status: approved\n', '');
+  const verdict = chgWrite(p, state, contractFs({ spec: noStatus }));
+  assert.equal(verdict.block, false, '没有 status 字段的仓库不该被拦');
+});
+
+test('ai-spec v6: 读别的仓库的 CHG 契约不给本项目解锁', () => {
+  const p = chgPolicy();
+  const sibling = normalizePath(WIN32 ? 'C:\\other-repo' : '/other-repo');
+  const state = newSessionState();
+  recordDocRead(state, join(sibling, 'tasks', 'CHG-009-bar', 'SPEC.md'), 1_000_000);
+
+  const verdict = chgWrite(p, state, contractFs());
+  assert.equal(verdict.block, true, '跨仓库契约不算数');
+  assert.equal(verdict.code, 'CHG_CONTRACT', '跨仓库 = 等于没读本项目契约');
+});
+
+test('ai-spec v6: 三项配置清空 → 回退旧语义（读过即放行）', () => {
+  const p = chgPolicy({
+    chg_contract_required_files: [],
+    chg_acceptance_markers: [],
+    chg_status_allow: [],
+  });
+  const state = newSessionState();
+  recordDocRead(state, chgFile('SPEC.md'), 1_000_000);
+
+  // 连 SPEC.md 都不在：齐全性不校验，所以旧行为恢复。
+  assert.equal(chgWrite(p, state, fs).block, false, '清空配置应退回「读过即放行」');
 });
 
 test('ai-spec: 不用 CHG 体系的仓库不被拦（项目适用性）', () => {
