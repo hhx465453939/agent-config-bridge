@@ -813,3 +813,97 @@ test('no-blind-retry: the third identical failure needs investigation first', ()
     false,
   );
 });
+
+// ---------------------------------------------------------------------------
+// CHG-20261124-gate-path-resolution
+//
+// These pin the three misreads that made an already-whitelisted write look like
+// an escape: `~` resolving to a POSIX-shaped home, an arrow function read as an
+// output redirection, and `/dev/null` surviving the sink filter. The fixture home
+// paths are built at runtime on purpose - the secret scanner matches the literal
+// shapes, and a made-up user name is no exception (CONTRIBUTING.md, pitfall 1).
+// ---------------------------------------------------------------------------
+
+const SEP = String.fromCharCode(92);
+const PROBE_USER = 'gate-probe-user';
+const driveHome = ['C:', 'Users', PROBE_USER].join(SEP);
+const posixHome = ['', 'c', 'Users', PROBE_USER].join('/');
+
+const withHomeEnv = (env, fn) => {
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  const put = (key) => {
+    if (env[key] === undefined) delete process.env[key];
+    else process.env[key] = env[key];
+  };
+  const restore = (key) => {
+    if (saved[key] === undefined) delete process.env[key];
+    else process.env[key] = saved[key];
+  };
+  try {
+    put('HOME');
+    put('USERPROFILE');
+    return fn();
+  } finally {
+    restore('HOME');
+    restore('USERPROFILE');
+  }
+};
+
+test('resolveShellPath: ~ takes the drive-form home so a whitelisted home write matches (AC-1/AC-2)', () => {
+  const opts = { config: DEFAULT_CONFIG, cwd: ROOT };
+  // The Git Bash shape that broke it: HOME is POSIX, USERPROFILE is drive-form.
+  const writes = withHomeEnv({ HOME: posixHome, USERPROFILE: driveHome }, () =>
+    bashWriteTargets('echo x > ~/probe.txt', opts),
+  );
+  assert.equal(writes.length, 1, 'exactly one write target');
+  assert.ok(
+    normalizePath(writes[0]).startsWith(normalizePath(driveHome)),
+    `expected the drive-form home, got ${writes[0]}`,
+  );
+  assert.ok(!writes[0].startsWith(`${SEP}c${SEP}`), 'must not stay in the POSIX drive shape');
+});
+
+test('resolveShellPath: a POSIX-shaped home alone is converted to drive form (AC-1)', () => {
+  const opts = { config: DEFAULT_CONFIG, cwd: ROOT };
+  const writes = withHomeEnv({ HOME: posixHome, USERPROFILE: undefined }, () =>
+    bashWriteTargets('echo x > ~/probe.txt', opts),
+  );
+  assert.equal(writes.length, 1, 'exactly one write target');
+  assert.ok(
+    normalizePath(writes[0]).startsWith(normalizePath(driveHome)),
+    `expected the drive-form home, got ${writes[0]}`,
+  );
+});
+
+test('bashWriteTargets: an arrow function is not an output redirection (AC-3)', () => {
+  const opts = { config: DEFAULT_CONFIG, cwd: ROOT };
+  const out = join(ROOT, 'out.txt');
+  const writes = bashWriteTargets(`node -e 'const f=(a)=>{return a}' > ${out}`, opts);
+  assert.equal(writes.length, 1, 'only the real redirection target');
+  assert.equal(normalizePath(writes[0]), normalizePath(out));
+  assert.ok(!writes.some((p) => p.includes('{')), 'code fragments must never become paths');
+});
+
+test('bashWriteTargets: /dev/null and its friends are not write targets (AC-4)', () => {
+  const opts = { config: DEFAULT_CONFIG, cwd: ROOT };
+  assert.deepEqual(bashWriteTargets('echo hi 2>/dev/null', opts), []);
+  assert.deepEqual(bashWriteTargets('echo hi > /dev/null', opts), []);
+  assert.deepEqual(bashWriteTargets('echo hi 2>/dev/stdout', opts), []);
+});
+
+test('no-write-outside: a real escape is still blocked after the path fixes (AC-5)', () => {
+  // `..` must survive as a segment: join() would normalise it away (pitfall 2).
+  const escaped = `${ROOT}${SEP}..${SEP}escaped.txt`;
+  const outside = shouldBlock({
+    policy: policyFromObject({
+      name: 'w',
+      checks: ['no-write-outside'],
+      config: { write_roots: [ROOT] },
+    }).policy,
+    state: newSessionState(),
+    input: { action: 'bash', command: `echo x > ${escaped}`, cwd: ROOT, tool: 'bash' },
+    fs: { isFile: () => false, exists: () => false },
+    now: 1,
+  });
+  assert.equal(outside.code, 'WRITE_OUTSIDE', 'the fix must not loosen the gate');
+});

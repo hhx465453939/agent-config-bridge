@@ -1541,15 +1541,31 @@ const defaultIsFile = (p) => {
 };
 
 /** Resolve a shell path token, or null when it is not knowable statically. */
+// `~` 必须解析成「盘符形式」的家目录。Git Bash 把 HOME 设成 POSIX 形状
+// （/c/Users/<user>），Node 的 win32 解析器会把它变成 \c\Users\<user>
+// （反斜杠开头、无盘符），与 write_roots 里的 C:\Users\<user>\... 永不相等，
+// 于是「已经加进白名单」的家目录写入仍然被判越界。
+// 优先取盘符形状的家目录；只拿到 POSIX 形状时转换过去；真正的 POSIX 家目录
+// （如 /home/<user>，首段不是单字母盘符）保持原样，不改变非 Windows 行为。
+const driveFormHome = () => {
+  for (const raw of [process.env.USERPROFILE, process.env.HOME]) {
+    if (typeof raw !== 'string' || raw === '') continue;
+    if (/^[a-zA-Z]:[\\/]/.test(raw)) return raw;
+    const posixDrive = raw.match(/^\/([a-zA-Z])\/(.+)$/);
+    if (posixDrive) return `${posixDrive[1].toUpperCase()}:\\${posixDrive[2].replace(/\//g, '\\')}`;
+  }
+  return process.env.HOME ?? process.env.USERPROFILE ?? null;
+};
+
 const resolveShellPath = (raw, cwd) => {
   const cleaned = String(raw).replace(/^["']|["']$/g, '');
   if (!cleaned || cleaned.startsWith('-')) return null;
   if (/^[a-z]+:\/\//i.test(cleaned)) return null; // URL
   if (cleaned === '{' || cleaned === '}' || cleaned === '{}' || cleaned === '\\;') return null;
   if (/^\$/.test(cleaned)) return null; // $VAR / ${VAR}: unknowable here
-  if (cleaned === '~') return process.env.HOME ?? process.env.USERPROFILE ?? null;
+  if (cleaned === '~') return driveFormHome();
   if (/^~[\\/]/.test(cleaned)) {
-    const home = process.env.HOME ?? process.env.USERPROFILE;
+    const home = driveFormHome();
     return home ? normalize(join(home, cleaned.slice(2))) : null;
   }
   return normalize(isAbsolute(cleaned) ? cleaned : join(cwd ?? process.cwd(), cleaned));
@@ -1622,8 +1638,17 @@ const parseBashCommand = (command, { config = DEFAULT_CONFIG, cwd = null, isFile
   const pushWrite = (raw) => {
     const candidate = resolveShellPath(raw, activeCwd);
     if (!candidate) return;
-    const base = candidate.replace(/\\/g, '/').split('/').pop()?.toLowerCase();
-    if (['/dev/null', 'nul', '/dev/stdout', '/dev/stderr'].includes(base) || candidate.endsWith('/dev/null')) return;
+    // `base` is only the last path segment (`null`), so comparing it against the
+    // whole string `/dev/null` never matched and that half of the filter was dead.
+    // Device names are matched on the basename; /dev/* sinks on the full path.
+    const normalized = candidate.replace(/\\/g, '/').toLowerCase();
+    const base = normalized.split('/').pop() ?? '';
+    const deviceName = base === 'nul' || base === 'null';
+    const noiseSink =
+      normalized.endsWith('/dev/null') ||
+      normalized.endsWith('/dev/stdout') ||
+      normalized.endsWith('/dev/stderr');
+    if (deviceName || noiseSink) return;
     writes.push(candidate);
   };
 
@@ -1649,7 +1674,11 @@ const parseBashCommand = (command, { config = DEFAULT_CONFIG, cwd = null, isFile
     }
 
     // Output redirection is a write. `2>&1` and `>/dev/null` are noise.
-    for (const match of segment.matchAll(/(?:^|[^<])(?:\d?>>?)\s*("(?:[^"]*)"|'(?:[^']*)'|[^\s;&|]+)/g)) {
+    // The character before the operator must not be one that turns `>` into a
+    // different operator: `=>` (arrow function), `>=`, `->` and `-->` are not
+    // redirections. Matching those made the code following an arrow function look
+    // like a write target (`{if (a) return`), which is not a path at all.
+    for (const match of segment.matchAll(/(?:^|[^<=>-])(?:\d?>>?)\s*("(?:[^"]*)"|'(?:[^']*)'|[^\s;&|]+)/g)) {
       const target = match[1];
       if (target.startsWith('&') || target === '>&1' || target === '>&2') continue;
       pushWrite(target);
@@ -2303,8 +2332,16 @@ const parsePowerShell = (
   const pushWrite = (raw) => {
     const candidate = resolveShellPath(raw, activeCwd);
     if (!candidate) return;
-    const base = candidate.replace(/\\/g, '/').split('/').pop()?.toLowerCase();
-    if (['/dev/null', 'nul', '/dev/stdout', '/dev/stderr'].includes(base)) return;
+    // Same basename-vs-full-path mistake as the bash side: `base` is `null`, never
+    // `/dev/null`, so the whole-string comparison could not fire.
+    const normalized = candidate.replace(/\\/g, '/').toLowerCase();
+    const base = normalized.split('/').pop() ?? '';
+    const deviceName = base === 'nul' || base === 'null';
+    const noiseSink =
+      normalized.endsWith('/dev/null') ||
+      normalized.endsWith('/dev/stdout') ||
+      normalized.endsWith('/dev/stderr');
+    if (deviceName || noiseSink) return;
     writes.push(candidate);
   };
 
