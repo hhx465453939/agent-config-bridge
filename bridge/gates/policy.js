@@ -1575,6 +1575,17 @@ const resolveShellPath = (raw, cwd) => {
 const quotedPaths = (script) =>
   [...String(script).matchAll(/'([^']+)'|"([^"]+)"/g)].map((m) => m[1] ?? m[2]).filter(Boolean);
 
+/**
+ * 引号里的字面量只有在「长得像路径」时才算读/写目标。
+ *
+ * 少了这层判断，任何带写操作的 node -e / python -c 脚本都会把里面每一个字符串
+ * 当成写入目标：require("fs") 的 fs、writeFileSync(p, s, "utf8") 的 utf8
+ * 都会被 join 到 cwd 上，报成一个越界写入的假目标（cwd 加 fs），
+ * 于是一条完全合法的命令被拦死。判据取两个必要条件：含路径分隔符，或带扩展名。
+ */
+const looksLikePath = (s) =>
+  typeof s === 'string' && s !== '' && (/[\\/]/.test(s) || /\.[A-Za-z0-9]{1,8}$/.test(s));
+
 /** Read-call patterns that hide a path inside a one-liner script. */
 const BASH_READ_CALL = /\b(?:open|read_text|read_text_sync|readFileSync|readFile|readFileSync|read_text)\s*\(/;
 /** Write-call patterns; `open(..., 'w')` is a write, not a read. */
@@ -1754,7 +1765,7 @@ const parseBashCommand = (command, { config = DEFAULT_CONFIG, cwd = null, isFile
       const flagAt = values.findIndex((v) => ['-c', '-e', '--eval', '-Command', '-command'].includes(v));
       const script = flagAt >= 0 ? values.slice(flagAt + 1).join(' ') : '';
       if (script) {
-        const paths = quotedPaths(script);
+        const paths = quotedPaths(script).filter(looksLikePath);
         const reads = BASH_READ_CALL.test(script);
         const writesCall = BASH_WRITE_CALL.test(script);
         for (const p of paths) {

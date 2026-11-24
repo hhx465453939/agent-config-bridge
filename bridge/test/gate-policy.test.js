@@ -911,3 +911,19 @@ test('no-write-outside: a real escape is still blocked after the path fixes (AC-
   });
   assert.equal(outside.code, 'WRITE_OUTSIDE', 'the fix must not loosen the gate');
 });
+
+test('bashWriteTargets: string literals in an interpreter script are not write targets (AC-6)', () => {
+  const opts = { config: DEFAULT_CONFIG, cwd: ROOT };
+  const out = join(ROOT, 'out.txt');
+  // 脚本里既有写操作，也有非路径字面量（fs / utf8）。旧实现把每一个引号内容都
+  // 当成写入目标，于是 "fs" 被 join 到 cwd 上，报出一个越界写入的假目标。
+  const writes = bashWriteTargets(
+    `node -e 'const fs=require("fs");fs.writeFileSync("${out}","x","utf8")'`,
+    opts,
+  );
+  assert.deepEqual(writes.map((p) => normalizePath(p)), [normalizePath(out)]);
+  assert.ok(
+    !writes.some((p) => /(^|[\\/])(fs|utf8)$/.test(p)),
+    'string literals that are not paths must not become write targets',
+  );
+});
