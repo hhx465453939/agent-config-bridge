@@ -436,14 +436,18 @@ test('ai-spec: glob 大小写不敏感（大写 / 混写 / 全大写都生效）
   const upper = mk(['**/tasks/CHG-*/SPEC.md']);
   assert.equal(write(upper).code, 'CHG_CONTRACT', '大写 glob 必须生效');
 
-  // 路径大小写混写也应命中
+  // 路径大小写混写也应命中。但目录名必须保持真实大小写：POSIX 文件系统是
+  // 大小写敏感的，把目录名换个大小写指的是**另一个目录**，那里的 PRD /
+  // TRACEABILITY 并不存在，契约自然不成立（Windows 曾因 normalizePath 把小写化
+  // 抹平了差异，掩盖了这个平台假设）。这里让文件名混写，验的仍是
+  // 「glob 与路径的文本匹配大小写不敏感」这个意图。
   const mixed = newSessionState();
-  recordDocRead(mixed, join(ROOT, 'tasks', 'Chg-001-Foo', 'Spec.md'), 1_000_000);
+  recordDocRead(mixed, join(CHG_DIR, 'Spec.md'), 1_000_000);
   assert.equal(write(upper, mixed).block, false, '路径大小写混写也应匹配');
 
-  // 全大写路径同样解锁
+  // 全大写文件名同样解锁
   const allUpper = newSessionState();
-  recordDocRead(allUpper, join(ROOT, 'TASKS', 'CHG-001-FOO', 'SPEC.MD'), 1_000_000);
+  recordDocRead(allUpper, join(CHG_DIR, 'SPEC.MD'), 1_000_000);
   assert.equal(write(upper, allUpper).block, false, '全大写路径也应匹配');
 
   // 小写配置大小写也生效（向后兼容）
