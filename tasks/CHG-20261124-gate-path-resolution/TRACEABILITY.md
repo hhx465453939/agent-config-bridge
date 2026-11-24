@@ -16,6 +16,7 @@ owner: Owner
 | P2 箭头函数不被当作重定向（AC-3） | `bridge/gates/policy.js` · `parseBashCommand` 输出重定向正则 | 单测：`node -e '...=>(...)' > out.txt` 只得到 out.txt |
 | P3 特殊设备不产生写入目标（AC-4） | `bridge/gates/policy.js` · `parseBashCommand.pushWrite` | 单测：`2>/dev/null` 的 writes 为空 |
 | 不放松真正的越界拦截（AC-5） | 未改动 `withinRoot` 与 `no-write-outside` | 单测：越界样例仍返回 `WRITE_OUTSIDE` |
+| P4 非路径字面量不当写入目标（AC-6） | `bridge/gates/policy.js` · 新增 `looksLikePath`，解释器分支 `quotedPaths(script).filter(looksLikePath)` | 单测：含写操作的 node -e 脚本只产出 `out.txt`，不含 `fs` / `utf8` |
 | 无回归（AC-6） | 全仓库 | `node --check` + `node --test` + `scan-secrets.sh --history` |
 
 ## 部署
