@@ -1,7 +1,9 @@
 {
   "name": "dsh",
   "display": "DeepSeek Harness (dsh)",
-  "detect": [".dsh"],
+  "detect": [
+    ".dsh"
+  ],
   "home_hint": "~/.dsh",
   "verified": true,
   "notes": "VERIFIED 2026-11-14 against DeepSeek Harness Desktop 0.2.2-rc.3 on Windows 11, from dsh's own installed documentation and sources plus a live session. (1) USER-GLOBAL RULES: dsh-agent-instructions composes the user-global chain as $DSH_HOME/AGENTS.md first, then <agentsHome>/AGENTS.md ($DSH_AGENTS_HOME or ~/.agents) — the standard preset mounts it with maxBytes 65536 — so .dsh/AGENTS.md is the managed target, and ~/.agents/AGENTS.md is the user-owned overlay slot for machine-specific additions (editing the managed file is what `apply` reverts). (2) SKILLS: ~/.agents/skills is a native user skill root; project .agents/skills overrides it and the packaged preset skill overrides both, so the same link pi uses is enough — this manifest declares no skill dimension on purpose. (3) PLUGINS: dsh does NOT auto-load an extensions directory; a row has to be mounted through the Cordis composition, which is why gates/commands declare auto_load false and carry a verified patch row. An installed plugin directory also needs package.json {\"type\":\"module\"} because these plugins are ES modules (bridge/lib/gates.js and bridge/lib/commands.js write it). (4) COMMANDS: dsh registers slash commands from plugins (`ctx.commands.register`), and ships no prompt-template directory, so Claude's command files are only reachable through the plugin this target installs (dsh/commands/), which copies them into prompts/*.md and injects one as the user's next prompt through `agent.followup()`. (5) MCP: dsh has NO global mcp.json equivalent — live servers are either the profile composition's `mcp-manager` row (a settings surface the GUI also writes) or registrations a plugin contributes at runtime. Rewriting the profile is off the table (never_touch), so this target splits the problem. `bridge apply` owns ONE generated document (~/.dsh/agent-config-bridge/mcp.json, Claude-shaped, mode 600 because entries may carry credentials), and `dsh/mcp/` is a reader plugin installed by `scripts/install-dsh.js --only mcp` that registers every entry with ctx.mcpManager.register() and reconciles on change — a running dsh therefore picks up a `bridge apply` without a restart. The reader needs one mount row (`auto_load: false`), and `/mcp` + `/mcp restart <name>` from the sibling commands plugin operate on exactly these registrations. Credentials stay literal in that document: Claude's .claude.json carries literal values and ~/.dsh/.credentials.yaml is never_touch, so the `${credential:NAME}` template route mcp-manager supports would require writing the credentials store — refused on purpose.",
@@ -29,17 +31,11 @@
     }
   ],
   "gates": {
-    "supported": true,
+    "supported": false,
+    "reason": "Hard gates moved to ShipGate (assets/gates + `shipgate policy`). agent-config-bridge keeps only skills / commands / rules-doc / MCP.",
     "adapter": "dsh",
     "install_as": "agent-config-gates",
-    "extension_dir": ".dsh/plugins",
-    "auto_load": false,
-    "mount_hint": "dsh mounts plugins through a Cordis composition, so an installed directory takes effect only when a row points at it. Add this to the profile patch (~/.dsh/profiles/<profile>/cordis.patch.yml; `node scripts/install-dsh.js --yes` writes it and prints this snippet):\n\n- insert:\n    - id: enforce-rules\n      # relative specifier, anchored beside the patch file; a file:// URL also works\n      name: '../../plugins/agent-config-gates/dsh/index.js'\n      config:\n        policyPath: '<absolute>/.dsh/plugins/agent-config-gates/policy.json'\n\nstatus reports whether the gate directory is installed; whether it is mounted is visible only in the composition file, which this project deliberately does not edit.",
-    "policy": {
-      "config": {
-        "project_roots": []
-      }
-    }
+    "extension_dir": ".dsh/plugins"
   },
   "commands": {
     "supported": true,

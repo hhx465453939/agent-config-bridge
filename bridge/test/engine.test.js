@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
 import * as api from '../lib/api.js';
-import { withSandbox, write, makeDirLink } from './sandbox.js';
+import { withSandbox, write, makeDirLink, enableSandboxGates } from './sandbox.js';
 import { listFiles } from '../lib/fs-ops.js';
 import { readState, STATUS, writeState } from '../lib/state.js';
 import { hashFile } from '../lib/fs-ops.js';
@@ -451,6 +451,7 @@ test('revoke: still removes everything after intervening applies', async () => {
 
 test('revoke: also removes the installed gate after an intervening apply', async () => {
   await withSandbox({ install: ['pi'] }, (sb) => {
+    enableSandboxGates(sb, ['pi']);
     const gateDir = sb.path('.pi/agent/extensions/enforce-rules');
     const before = treeSnapshot(sb.home);
 
@@ -956,6 +957,7 @@ test('state: an unknown format version is refused rather than reinterpreted', as
 
 test('gates: adopt installs the gate and revoke removes it again', async () => {
   await withSandbox({ install: ['pi'] }, (sb) => {
+    enableSandboxGates(sb, ['pi']);
     const before = treeSnapshot(sb.home);
     const gateDir = sb.path('.pi/agent/extensions/enforce-rules');
 
@@ -982,6 +984,7 @@ test('gates: adopt installs the gate and revoke removes it again', async () => {
 
 test('gates: installation is idempotent', async () => {
   await withSandbox({ install: ['pi'] }, (sb) => {
+    enableSandboxGates(sb, ['pi']);
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
     const first = api.diff({ repo: sb.repo, home: sb.home });
     assert.equal(
@@ -994,6 +997,7 @@ test('gates: installation is idempotent', async () => {
 
 test('gates: an edited policy file is restored by adopt-time drift repair', async () => {
   await withSandbox({ install: ['pi'] }, (sb) => {
+    enableSandboxGates(sb, ['pi']);
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
     const policyFile = sb.path('.pi/agent/extensions/enforce-rules/policy.json');
     write(policyFile, '{"name":"tampered"}\n');
@@ -1026,6 +1030,7 @@ test('gates: a harness that does not auto-load says so, in both plan and status'
   // not enough. The warning is the only thing standing between the user and a
   // gate they believe is live but which nothing ever loads.
   await withSandbox({ install: ['dsh'] }, (sb) => {
+    enableSandboxGates(sb, ['dsh']);
     api.adopt({ repo: sb.repo, home: sb.home, names: ['dsh'], log: quiet });
 
     const plan = api.plan({ repo: sb.repo, home: sb.home, targets: ['dsh'] });
@@ -1047,6 +1052,7 @@ test('gates: a harness that auto-loads must NOT be reported as needing a manual 
   // A false statement on the one line that answers "is my gate live?" is worse
   // than saying nothing.
   await withSandbox({ install: ['pi'] }, (sb) => {
+    enableSandboxGates(sb, ['pi']);
     api.adopt({ repo: sb.repo, home: sb.home, names: ['pi'], log: quiet });
 
     const plan = api.plan({ repo: sb.repo, home: sb.home, targets: ['pi'] });

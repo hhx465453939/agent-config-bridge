@@ -379,7 +379,12 @@ export const planGateInstall = ({ repo, home, manifest }) => {
 /** Where the gate lives, for `status` and `doctor`. */
 export const gateStatus = ({ repo, home, manifest }) => {
   if (!manifest.gates || manifest.gates.supported === false) {
-    return { supported: false, reason: 'this harness has no extension mechanism' };
+    // Carry the manifest's own reason (e.g. "moved to ShipGate") so status can
+    // distinguish "moved out" from "this harness never had hooks".
+    return {
+      supported: false,
+      reason: manifest.gates?.reason ?? 'this harness has no extension mechanism',
+    };
   }
   const dir = gateInstallDir(manifest, home);
   const policyFile = join(dir, 'policy.json');

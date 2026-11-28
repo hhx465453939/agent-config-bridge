@@ -58,17 +58,11 @@
     "note": "pi supersedes the built-in MCP client in two independent ways: settings.json `extensions` may contain \"-builtin:mcp\" (built-in support disabled), and an installed extension that registers /mcp - pi-mcp-adapter is the known one - replaces it outright, after which pi does not read mcp.json at all (docs/mcp.md). Either way the file this target generates is on disk, correct, and read by nobody, which is the failure this block lets `doctor` name. settings.json is never_touch, so the finding is a warn with the fix, never a rewrite."
   },
   "gates": {
-    "supported": true,
+    "supported": false,
+    "reason": "Hard gates moved to ShipGate (assets/gates + `shipgate policy`). agent-config-bridge keeps only skills / commands / rules-doc / MCP.",
     "adapter": "pi",
     "install_as": "enforce-rules",
-    "extension_dir": ".pi/agent/extensions",
-    "auto_load": true,
-    "mount_hint": "pi loads ~/.pi/agent/extensions/*.ts and subdirectories containing index.ts or index.js, so no manual mount is needed",
-    "policy": {
-      "config": {
-        "project_roots": []
-      }
-    }
+    "extension_dir": ".pi/agent/extensions"
   },
   "never_touch": [
     ".pi/agent/settings.json",

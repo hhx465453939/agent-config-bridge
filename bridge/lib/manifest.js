@@ -372,6 +372,10 @@ const validateGates = (raw, file, targetName) => {
     policy: raw.policy ?? {},
     mountHint: raw.mount_hint ?? null,
     autoLoad: raw.auto_load !== false,
+    // Emitted on both branches: `gateStatus` reads it to explain why a harness has
+    // no live gate. Producing it only for `supported: false` would make the
+    // contract test fail for a manifest that declares gates but carries a note.
+    reason: raw.reason ?? null,
   };
 };
 

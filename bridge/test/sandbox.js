@@ -202,3 +202,38 @@ export const withSandbox = async (options, fn) => {
     sandbox.cleanup();
   }
 };
+
+/**
+ * The real manifests declare `gates.supported: false`: hard gates moved to
+ * ShipGate. The gate ENGINE still lives here (frozen), so tests that exercise it
+ * re-enable the dimension explicitly in their own sandbox copy instead of
+ * depending on a real manifest that no longer declares it.
+ *
+ * Relative paths only — never a literal home directory (see CONTRIBUTING).
+ */
+export const GATE_FIXTURES = {
+  pi: {
+    supported: true,
+    adapter: 'pi',
+    install_as: 'enforce-rules',
+    extension_dir: '.pi/agent/extensions',
+    auto_load: true,
+    mount_hint: 'pi auto-loads its extensions directory, so no manual mount is needed',
+    policy: { config: { project_roots: [] } },
+  },
+  dsh: {
+    supported: true,
+    adapter: 'dsh',
+    install_as: 'agent-config-gates',
+    extension_dir: '.dsh/plugins',
+    auto_load: false,
+    mount_hint: 'dsh mounts plugins through a Cordis composition, so the gate must be mounted by hand',
+    policy: { config: { project_roots: [] } },
+  },
+};
+
+export const enableSandboxGates = (sandbox, names = ['pi', 'dsh']) => {
+  sandbox.findAndReplaceManifests((manifest, name) =>
+    names.includes(name) ? { ...manifest, gates: GATE_FIXTURES[name] } : null,
+  );
+};

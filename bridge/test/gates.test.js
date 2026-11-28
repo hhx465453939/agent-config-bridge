@@ -1137,15 +1137,37 @@ test('gates: every key the code reads is a key the validator produces', () => {
   assert.ok(readers.size > 0, 'sanity check: the scan should find readers at all');
 
   for (const target of ['pi', 'dsh']) {
-    const produced = new Set(Object.keys(loadManifest(join(BRIDGE_DIR, '..'), target).gates));
-    for (const [key, where] of readers) {
-      assert.ok(
-        produced.has(key),
-        `the code reads gates.${key} (${[...where].join(', ')}) but the validator for "${target}" ` +
-          `does not produce it.\n` +
-          `  produced: ${[...produced].sort().join(', ')}\n` +
-          `  snake_case is the manifest JSON spelling; camelCase is what the rest of the code uses.`,
-      );
+    // Gates are frozen in agent-config-bridge (moved to ShipGate), so the real
+    // manifests declare only `supported: false`. This guard is about the gate
+    // ENGINE, which is still present, so validate against a fixture that
+    // re-enables the full gate key set — otherwise the scan would pass by
+    // checking a manifest the engine never sees in production.
+    const raw = JSON.parse(readFileSync(join(BRIDGE_DIR, '..', 'bridge', 'targets', `${target}.json`), 'utf8'));
+    raw.gates = {
+      supported: true,
+      adapter: target,
+      install_as: target === 'pi' ? 'enforce-rules' : 'agent-config-gates',
+      extension_dir: target === 'pi' ? '.pi/agent/extensions' : '.dsh/plugins',
+      auto_load: target === 'pi',
+      mount_hint: 'fixture',
+      policy: { config: { project_roots: [] } },
+    };
+    const fixtureRepo = mkdtempSync(join(tmpdir(), `gates-keys-${target}-`));
+    try {
+      mkdirSync(join(fixtureRepo, 'bridge', 'targets'), { recursive: true });
+      writeFileSync(join(fixtureRepo, 'bridge', 'targets', `${target}.json`), JSON.stringify(raw));
+      const produced = new Set(Object.keys(loadManifest(fixtureRepo, target).gates));
+      for (const [key, where] of readers) {
+        assert.ok(
+          produced.has(key),
+          `the code reads gates.${key} (${[...where].join(', ')}) but the validator for "${target}" ` +
+            `does not produce it.\n` +
+            `  produced: ${[...produced].sort().join(', ')}\n` +
+            `  snake_case is the manifest JSON spelling; camelCase is what the rest of the code uses.`,
+        );
+      }
+    } finally {
+      rmSync(fixtureRepo, { recursive: true, force: true });
     }
   }
 });

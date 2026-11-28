@@ -134,7 +134,12 @@ export const formatStatus = (report) => {
         }
       }
     } else if (row.status === STATUS.BRIDGED) {
-      lines.push(`      gate        : not available on this harness (its rules stay advisory)`);
+      // `gates.supported: false` means the dimension was intentionally moved
+      // out (to ShipGate) or never existed (harness without hooks). Say which,
+      // so an operator does not read "advisory" and assume nothing will ever
+      // enforce these rules.
+      const moved = row.gate?.reason ? ` — ${row.gate.reason}` : '';
+      lines.push(`      gate        : owned elsewhere${moved}`);
     }
     if (row.adoptedAt) lines.push(`      adopted     : ${row.adoptedAt}`);
     if (row.lastApply) lines.push(`      last apply  : ${row.lastApply}`);

@@ -28,6 +28,16 @@ const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifestPath = join(repo, "bridge", "targets", "pi.json");
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
 
+// Hard gates and continuation extensions moved to ShipGate. Kept until the next
+// major version so existing automation does not break on a silent disappearance.
+if (manifest?.gates?.supported === false) {
+  console.error(
+    "⚠ deprecated：硬门控与续跑扩展已迁至 ShipGate。\n" +
+      "  推荐：shipgate install --with-goal-mode\n" +
+      "  本脚本仅保留到下一个大版本。",
+  );
+}
+
 const relDir = manifest?.gates?.extension_dir;
 if (!relDir) {
   console.error(

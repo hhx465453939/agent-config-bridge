@@ -6,7 +6,7 @@
  *   1. 探测本机是否安装了 pi（`<home>/.pi`）；
  *   2. 未桥接 → `bridge/cli.js adopt pi --yes`（会先快照）；
  *   3. `bridge/cli.js apply --yes`（写入门控与受管内容）；
- *   4. 校验门控文件存在、policy JSON 可解析、checks 含 graph-before-read；
+ *   4. 校验受管产物（门控已迁至 ShipGate：gates.supported=false 时跳过门控校验）；
  *   5. 安装全局技能 `agent-hard-gates`（Claude 与 pi 共享）；
  *   6. 机器本地 `gate-policy.json` 不存在时，生成一份**建议**（只含已存在的开发根）。
  *
@@ -58,10 +58,13 @@ if (!existsSync(piDir)) {
 const manifestFile = join(repo, 'bridge', 'targets', 'pi.json');
 if (!existsSync(manifestFile)) fail(`缺少 pi manifest：${manifestFile}`);
 const manifest = JSON.parse(readFileSync(manifestFile, 'utf8'));
-const gateDirRel = manifest?.gates?.extension_dir && manifest?.gates?.install_as
+const gateEnabled = manifest?.gates?.supported !== false;
+const gateDirRel = gateEnabled && manifest?.gates?.extension_dir && manifest?.gates?.install_as
   ? `${manifest.gates.extension_dir}/${manifest.gates.install_as}`
   : null;
-if (!gateDirRel) fail('pi manifest 未声明 gates.extension_dir / gates.install_as；不猜路径。');
+// Gates moved to ShipGate: `supported: false` is the new normal, not a broken
+// checkout. Fail only when gates ARE declared but the paths to verify are absent.
+if (gateEnabled && !gateDirRel) fail('pi manifest 声明了 gates 但未给出 gates.extension_dir / gates.install_as；不猜路径。');
 
 const stateFile = join(repo, '.bridge', 'state.json');
 let state = null;
@@ -105,7 +108,7 @@ const willCreateMachine = !existsSync(machineFile) && rootsToWrite.length > 0;
 
 say('\n计划：');
 steps.forEach((s, i) => say(`  ${i + 1}. ${s.label}`));
-say(`  ${steps.length + 1}. 校验门控文件与 policy.json`);
+say(`  ${steps.length + 1}. 校验受管产物（门控已迁至 ShipGate，跳过门控校验）`);
 say(`  ${steps.length + 2}. 安装共享技能 agent-hard-gates`);
 if (missingRoots.length > 0) say(`  注意：以下 --root 不存在，将忽略：${missingRoots.join(', ')}`);
 if (willCreateMachine) {
@@ -148,6 +151,10 @@ for (const step of steps) {
 
 // --- 6. verify --------------------------------------------------------------
 
+if (!gateDirRel) {
+  say('\n⏭ 门控已迁至 ShipGate（gates.supported=false），跳过门控产物校验。');
+  say('  安装：shipgate install --harness pi；体检：shipgate doctor');
+} else {
 const gateDir = join(home, ...gateDirRel.split('/'));
 const policyFile = join(gateDir, 'policy.json');
 const adapterFile = join(gateDir, 'pi', 'index.js');
@@ -167,6 +174,7 @@ if (missing.length > 0) fail(`policy.json 缺少必需检查：${missing.join(',
 
 say(`\n✔ 门控已安装：${gateDir}`);
 say(`  checks: ${checks.join(', ')}`);
+}
 
 // --- 7. shared skill --------------------------------------------------------
 

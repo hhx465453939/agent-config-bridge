@@ -155,6 +155,9 @@ test('dsh manifest: the profile tree and the credential store are off limits', (
     !target.never_touch.includes('.dsh/plugins'),
     'the gate is installed under .dsh/plugins, so that directory cannot be never_touch',
   );
-  assert.equal(target.gates.auto_load, false, 'dsh does not auto-load an extensions directory');
-  assert.equal(target.gates.extension_dir, '.dsh/plugins');
+  // Gates moved to ShipGate: the dsh manifest now declares `supported: false`
+  // with a reason. The never_touch coverage above is the real subject of this
+  // test and is unaffected.
+  assert.equal(target.gates.supported, false, 'hard gates are owned by ShipGate now');
+  assert.ok(target.gates.reason, 'the reason must be reported, not silently omitted');
 });

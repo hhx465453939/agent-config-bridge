@@ -60,7 +60,13 @@ if (!existsSync(join(home, '.dsh'))) {
   fail(`本机没有 ${join(home, '.dsh')} —— 没装 dsh，或缺 --home。`);
 }
 
-const wants = (kind) => only === null || only === kind;
+const gatesLive = manifest?.gates?.supported !== false;
+if (only === 'gates' && !gatesLive) {
+  say('⏭ 硬门控已迁至 ShipGate（gates.supported=false）。');
+  say('  安装：shipgate install --harness dsh；体检：shipgate doctor');
+  process.exit(0);
+}
+const wants = (kind) => (only === null || only === kind) && (kind !== 'gates' || gatesLive);
 const actions = [];
 if (wants('gates')) actions.push(...planGateInstall({ repo, home, manifest }));
 if (wants('commands')) actions.push(...planCommandsInstall({ repo, home, manifest }));

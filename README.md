@@ -108,7 +108,37 @@ node bridge/cli.js revoke kimi
 
 完整的受管路径清单见 `bridge/targets/*.json` —— **清单是唯一的结构知识来源**，代码里没有"猜路径"的逻辑。清单里没有的东西，本项目一律不碰。
 
-## 硬闸门：让规则文档真的被遵守
+## 硬闸门 / 续跑扩展：已迁至 ShipGate
+
+> **自 2026-11-27 起，硬门控与 pi 续跑扩展不再由本项目安装。**
+> 权威源：`ShipGate/assets/gates/` 与 `ShipGate/assets/pi-extensions/`；策略真源：`~/.config/shipgate/gate-policy.json`。
+> 迁移后的 `bridge/targets/{pi,dsh}.json` 已声明 `gates.supported: false`，`bridge apply` 不会再装门控。
+
+### 职责边界
+
+| 维度 | 归属 |
+|---|---|
+| skills 目录桥接 | **agent-config-bridge** |
+| slash command / 提示词桥接 | **agent-config-bridge** |
+| 规则文档（CLAUDE.md → 各端镜像） | **agent-config-bridge** |
+| MCP server 声明跨格式转换 | **agent-config-bridge** |
+| 硬门控（破坏性命令 / 图谱优先 / 思考前置 / 密钥与越界写入 / AI4S 域） | **ShipGate** |
+| slop 清理（`quality` 闸） | **ShipGate** |
+| debug 审计（`code-debugger` / `debug-ui`） | **ShipGate** |
+| 长任务续跑扩展（goal-mode / auto-continue） | **ShipGate** |
+
+迁移命令：
+
+```bash
+shipgate install --harness pi,dsh      # 装门控
+shipgate install --with-goal-mode      # 装续跑扩展（与 --with-auto-continue 二选一）
+shipgate doctor                        # 会报告本机残留的 bridge 旧门控并给出停用命令
+```
+
+`bridge/gates/` 保留为冻结的历史快照（见其中 `DEPRECATED.md`），下个大版本删除。
+下面保留原始设计说明作历史记录。
+
+---
 
 规则文档是**建议**。你会读它、通常会照做 —— 但"通常会"不够。有些规则的收益只有在**真的执行**时才成立，例如「读源码之前先查代码图谱」：一旦跳过，图谱就用不上了。
 
@@ -296,8 +326,11 @@ node scripts/install-dsh.js --only market     # 干跑：源码完整性 + 每�
 
 市场清单、推荐插件与边界见 [`docs/DSH-PLUGIN-MARKET.md`](docs/DSH-PLUGIN-MARKET.md)，插件源码在 [`dsh/market-links/`](dsh/market-links/)。
 
-## 可选能力：长任务续跑（pi）
+## 可选能力：长任务续跑（pi）—— 已迁至 ShipGate
 
+> **自 2026-11-27 起推荐用 `shipgate install --with-goal-mode` / `--with-auto-continue`。**
+> 本节的脚本保留到下一个大版本，运行时会在 stderr 打印 deprecation 提示。
+>
 > 与桥接无关，**默认不装**，不影响 adopt / revoke / rollback。
 
 pi 每一轮回复结束都会把控制权交回用户 —— 这是对话协议的边界，不是配置项。
